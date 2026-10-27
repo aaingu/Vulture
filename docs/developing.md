@@ -376,3 +376,15 @@ about a second.
 the sun is where it should be closes the time uniform, the rotation order and the model-view
 matrix. It does not close the sun position uniform, because the pack recomputes its own direction.
 Saying so is what stops the next reader treating it as covered.
+# Shader-pack smoke test
+
+To check that a shader-pack ZIP can be read and that its program entry points and includes resolve,
+pass its path to the common test task:
+
+```sh
+./gradlew :common:test -Dvulture.test.shaderPack=/path/to/ComplementaryReimagined.zip
+```
+
+This optional test does not distribute the pack and does not start Minecraft, create a Vulkan device,
+or prove that a GPU rendered a frame. A visual runtime test still needs a Minecraft installation with
+Vulkan, Sodium, Vulture, and the shader pack installed.

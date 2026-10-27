@@ -19,13 +19,6 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
         minecraft: ['26.2', '26.3']
-        include:
-          - os: macos-latest
-            shell: bash
-            gradle: ./gradlew
-          - os: windows-latest
-            shell: pwsh
-            gradle: .\gradlew.bat
 
     steps:
       - uses: actions/checkout@v4
@@ -38,5 +31,5 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Build and run unit tests
-        shell: ${{ matrix.shell }}
-        run: ${{ matrix.gradle }} build -Pminecraft=${{ matrix.minecraft }}
+        shell: bash
+        run: ./gradlew build -Pminecraft=${{ matrix.minecraft }}

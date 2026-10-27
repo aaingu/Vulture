@@ -6,10 +6,10 @@ The renderer in Minecraft 26.2 and 26.3 is experimental. On macOS, Minecraft rou
 
 ## Platform targets
 
-| Platform | Target | Verified in this checkout |
+| Platform | Target | Verification |
 | --- | --- | --- |
-| macOS | Apple Silicon M1 to M5, macOS 15 Sequoia through macOS 27 Golden Gate, where Apple supports that OS on the device | Apple Silicon M4 on macOS 27.0.1 |
-| Windows | Windows 10/11 with a Vulkan-capable GPU and driver | Build verification is provided by GitHub Actions; runtime GPU coverage depends on the machine |
+| macOS | Apple Silicon M1 to M5, macOS 15 Sequoia through macOS 27 Golden Gate, where Apple supports that OS on the device | M4 / macOS 27.0.1 builds and Complementary archive smoke test passed; GPU rendering was not verified |
+| Windows | Windows 10/11 with a Vulkan-capable GPU and driver | CI is configured; the first corrected Windows run is pending |
 
 The source does not contain chip-specific shader code; it uses Minecraft's Vulkan renderer and MoltenVK on macOS. M1, M2, M3, M4, and M5 Macs and every OS/device pairing are not individually available for local runtime testing. Apple's supported-device list determines which macOS releases a given Mac can install.
 
