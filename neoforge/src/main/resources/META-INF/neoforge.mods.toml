@@ -12,7 +12,7 @@ logoFile = "vulture.png"
 # The same square image under the key current NeoForge reads, which it asks for beside logoFile: a
 # development client that finds logoFile alone stops on a warning screen before the title screen.
 iconFile = "vulture.png"
-authors = "avpbynf"
+authors = "aaingu, avpbynf"
 displayTest = "IGNORE_ALL_VERSION"
 description = '''OptiFine-format shader packs, on Minecraft's native Vulkan renderer'''
 

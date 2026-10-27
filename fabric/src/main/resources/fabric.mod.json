@@ -5,8 +5,10 @@
 	"name": "Vulture",
 	"description": "OptiFine-format shader packs, on Minecraft's native Vulkan renderer",
 	"authors": [
+		"aaingu",
 		"avpbynf"
 	],
+	"credits": "Based on Vitrail Shaders by avpbynf",
 	"contact": {
 		"homepage": "https://github.com/aaingu/Vulture",
 		"sources": "https://github.com/aaingu/Vulture",
