@@ -1,0 +1,552 @@
+# Pack compatibility
+
+## The packs this engine is measured against
+
+These are the packs I run against, and this table says what I have actually seen with each rather
+than what is expected of it. **A pack that is not here is not thereby unsupported**: it is a pack I
+have not loaded, and the format is the format. Nothing in this table is a judgement of the pack;
+every line is a note about this engine.
+
+**A row that says I have not looked means exactly that, and never means it works.** Rewriting this
+table is one of the steps of cutting a release, which is the only thing that keeps it from going
+quietly stale.
+
+Every pack below was drawn in one scene of real terrain by this engine and by Iris on the same
+machine, the same world, the same window and the same settings, each pack at its own defaults, and
+the two pictures compared. "Close" means the two differ by about as much as one engine differs from
+itself between two captures of that scene, most of which is foliage sway, clouds and a pack's own
+temporal filter; where a row names a difference, it is one that stands above that.
+
+| Pack | What I have seen |
+| --- | --- |
+| AstraLex V93.0 | Drawn. Further from the reference than most on the test scene, and what differs has not been named yet. |
+| Bliss v2.1.2 | Drawn, water included, and close to the reference. It reads the light map raw where BSL and Complementary multiply the matrix in, which is why the far terrain's pair is served normalised. With Distant Horizons, its distant water shows white plates the reference does not. |
+| Body Camera v1.6.1 | Drawn. The ground at the camera's feet comes out nearly twice as bright as the reference's while the sky and the trees match. It branches on the star flag in the sky, so it is worth reading [the sky goes flat](#the-sky-goes-flat) alongside. |
+| BSL v10.1.5 | Drawn whole, and the one watched most closely: terrain, water, shadow map, sky, clouds, weather, particles, mobs, block entities and the held hand all go through it. Its sky differs from the reference's, the ground and the trees being close. |
+| BVS 1.9.3 | Drawn and close to the reference. |
+| Clarity 1.1.3 | Drawn. Its sky differs from the reference's, the terrain matching. |
+| Complementary Reimagined r5.9 | Drawn whole and close to the reference. Its two top profiles draw with their colored lighting on: the voxel pipe they ask for is served, and [the pack asks for Iris](#the-pack-asks-for-iris) says how to read a pack that asks for something else. |
+| Complementary Unbound r5.9 | Drawn whole and close to the reference, its colour targets, deferred chain and shadow map all coming up; the log prints how many targets it allocated and at what size. Its two top profiles draw the same way as Reimagined's. |
+| Complementary Unbound r5.8.1 with EuphoriaPatches 1.9.3 | Drawn and close to the reference, like the release above. |
+| Cursed Fog v1.0.9 | Drawn and close to the reference. |
+| E-LITE 5.1.1 | Drawn. The whole picture comes out brighter than the reference's, sky, ground and trees together. |
+| I Like Vanilla v1.4.4 | Drawn and close to the reference. |
+| iterationT 3.2.0 | Drawn. Its volumetric clouds come out in the same colour and light as the reference's but sit elsewhere in the sky. |
+| Lux v1.2 | Drawn and close to the reference. |
+| MakeUp UltraFast 9.5e | Drawn. The whole picture comes out brighter than the reference's, the same way as E-LITE. |
+| Mellow v3.4 | Drawn and close to the reference. It ships a three-dimensional volume as a raw blob and asks for a single-channel shadow buffer. |
+| miniature 2.19 | Drawn and close to the reference. |
+| Noble v1.9.7 | Drawn. Its sky differs from the reference's, the ground and the trees being close. |
+| Pegasus v0.4 | Drawn. Its foliage comes out about a third darker than the reference's while the ground matches. |
+| Photon v1.3b | Drawn and close to the reference. It exercises a clamped volume of half floats as its atmosphere table, reads its volumes through macros standing for the sampler's name, and lays a volume over the name of a colour target that the same stage also reads as a plain `sampler2D`. |
+| RedHat v34.3.1 | Drawn. Further from the reference than most on the test scene, and what differs has not been named yet. |
+| RenderPearl v2.8.0-beta.4 | Drawn and close to the reference. The background behind a name plate or a text display comes out opaque black where the reference's is translucent grey, on a Mac as here. |
+| Reverie Beta v0.9 | Drawn, at its shipped profile, and close to the reference. It is the pack that exercises the storage buffers hardest: its exposure is an average brightness that a compute writes into one and every later pass reads back, and a compute of its cloud pass reads the depth. It declares the uniforms of the Voxy mod beside those of Distant Horizons and reads them only under a `VOXY` define that mod sets and nothing here does, so the seven `vx` names the log reports as zeros are handed as zeros by Iris too without that mod, and the misspelt `previouscameraPositionFract` beside them is read by no program of the pack. Two of its passes read more textures at once than Apple's hardware hands a pass one by one, so on a Mac they are given them as one table, which [the pack was refused](#the-pack-was-refused) describes. |
+| Sildur's Vibrant Extreme v2.01 | Drawn, water included, and sunlit dirt comes out duller than the reference's. It is the pack that exercises the paths least travelled: it keeps the overworld's programs at the root of `shaders/` and gives the other two dimensions folders of their own, several families reach its textured program through the fallback tree rather than shipping one, and the target its terrain writes first is not target zero. |
+| Solas V3.7b | Drawn and close to the reference. |
+| Spooklementary v2.0.4 | Drawn and close to the reference. |
+
+On Apple Silicon, every pack in the table draws on the same code as the rows above: each one
+compiles and draws without an error, and Noble, Photon, RenderPearl and Reverie were looked at on
+screen. That is not yet a comparison with the reference on that machine.
+
+Start from what you are seeing. Each symptom below names its cause, and says how to confirm it
+rather than guess.
+
+| What you see | Go to |
+| --- | --- |
+| Nothing of the pack is drawn, the world looks vanilla | [The pack was refused](#the-pack-was-refused), or a game that came up on OpenGL, which [INSTALL](../INSTALL.md#switching-the-graphics-backend-to-vulkan) answers |
+| A red full-screen message tells you to install Iris | [The pack asks for Iris](#the-pack-asks-for-iris) |
+| An effect does nothing at all | [The effect never ran](#the-effect-never-ran) |
+| Blocks have no relief, however smooth the pack promises | [Everything is flat](#everything-is-flat) |
+| Water is missing, or looks like the game's | [The water](#the-water) |
+| A hard straight line across the sky near the horizon | [The horizon line](#the-horizon-line) |
+| Something that moves looks flat, unlit, or the wrong colour | [Anything that moves](#anything-that-moves) |
+| The sky turns into a flat grey sheet at sunrise | [The sky goes flat](#the-sky-goes-flat) |
+| Grass or leaves skip while swaying | [The waving grass jumps](#the-waving-grass-jumps) |
+| Blocks wave, glow or cast wrong shadows after switching packs | [You just changed packs](#you-just-changed-packs) |
+| The terrain is uniformly too dark | [Terrain that is too dark](#terrain-that-is-too-dark) |
+| Distant land is there but reads as sky: no fog, wrong focus | [The far terrain is flat](#the-far-terrain-is-flat) |
+
+**Before anything else, read the log.** The engine announces what it refused, what it could not
+serve, and which program it chose for each pass. Most of what follows is already printed there in
+words at the moment it happened.
+
+## The pack was refused
+
+The engine refuses a pack rather than drawing something wrong with it, and it names the reason.
+
+**A pack can be refused for using a graphics feature this backend does not have.** The game's own
+compiler closes several of them by name, not by missing effort here, and
+[translation](translation.md) carries which. Storage images, storage buffers and a pack's shadow
+compute are no longer on that list: they are served beside that compiler rather than through it,
+which is what `IRIS_FEATURE_CUSTOM_IMAGES` and `IRIS_FEATURE_SSBO` announce and why voxel lighting
+draws. The full-screen shadow composites are a different family and are still skipped, the log
+naming them at load.
+
+A pack can declare the features it cannot be drawn without, and Reverie declares several. That
+line is read before any of its programs is translated, so a refusal names what the pack asked for
+and did not get, the log listing them, rather than the symptom that would have come later. Every
+name Reverie declares is served now, so it is no longer refused there.
+
+**Any name this engine has not built refuses the declaration.** The names built and served today
+are `BLOCK_EMISSION_ATTRIBUTE`, `COMPUTE_SHADERS`, `CUSTOM_IMAGES`, `ENTITY_TRANSLUCENT`,
+`HIGHER_SHADOWCOLOR`, `PER_BUFFER_BLENDING`, `SEPARATE_HARDWARE_SAMPLERS` and `SSBO`, so a pack
+that requires those alone loads, and every other name still refuses the pack, with the list in the
+log. The served flags are also the only `IRIS_FEATURE_` defines a pack finds: a capability define
+is a promise, so each appears the day its feature is served and not before, and the optional
+declarations keep reading the truth.
+
+One of those names is the device's answer rather than the engine's. `PER_BUFFER_BLENDING` lets a
+pack give one of the targets a pass writes a different blend function from the others, and Vulkan
+allows two attachments of one pass to differ only where the driver has `independentBlend`. Where it
+has not, the name is refused and the whole-program function stands on every target the pass writes.
+Iris withholds the name where its own API cannot part the targets either, its driver needing
+`ARB_draw_buffers_blend` or OpenGL 4.0. Same rule, asked of a different API: one is a Vulkan device
+feature and the other a GL extension, and a machine can be told yes by one and no by the other, so
+a pack refused here is not for that reason refused there.
+
+Iris refuses a required flag only when the name is unknown to it or the hardware cannot serve
+it, and it has built every one of the ones Reverie asks for: some outright, some wherever the
+driver supports them.
+
+**On a Mac, a pass that reads more than sixteen textures at once is handed them as one table.**
+Apple gives one pass sixteen slots for textures handed over one at a time, which is how the game
+hands over every texture. The engine numbers a pass off the textures its two shader stages actually
+read between them, which is as tight as the numbering can be made, so a pass over that line
+genuinely reads more: two of Reverie's passes read seventeen and eighteen between their stages, and
+Apple refused them with `'sampler' attribute parameter is out of bounds: must be between 0 and 15`.
+A pass past that count is given its textures through a Metal argument buffer, one table a stage
+reads far more than sixteen textures out of, while every other pass, and every pass on any other
+machine, is handed them the way the game hands them. Such a table needs macOS 11 and a graphics card
+in Apple's second tier of argument buffers, which every Apple Silicon Mac is: on an older Mac, or
+with MoltenVK's argument buffers turned off, the pass is still handed its textures one by one and
+refused. A pass the card refuses stops the pack:
+the world goes back to the game's own look and the settings screen says an error stopped it, which
+is what the reference does with a pack that fails the same way.
+
+**On a Mac, a compute step that shares more memory between its threads than Metal allows is given a
+buffer instead.** Metal lets the threads of one compute step share 32768 bytes, and Photon's sky
+light asks for 36864, so the step was refused and the ground the sky lights came out dark. Where
+the step runs as a single group of threads, which is how Photon runs it, that memory is now a buffer
+and the step computes the same light. A step past the limit that runs as several groups is still
+refused, and the log names it. How is in
+[the game's graphics API](internals/game-graphics-api.md#compute-and-storage-images-the-facade-vs-the-backend).
+
+**A full-screen pass that fails to compile takes the whole pack with it**, and the log names the
+program. One shape of that was a `const` whose initialiser Vulkan will not take as a constant,
+which OpenGL drivers accepted as merely immutable; that spelling is now rewritten, see
+[Translation](translation.md). Other compile failures still refuse the pack.
+
+**A single pass can be refused without the pack being refused.** If a program's fragment stage
+genuinely *reads* an input its vertex stage does not provide, that one program fails to link and the
+engine falls back to the game's rendering for that surface. You get the game's version of that one
+thing, not a hole.
+
+Declaring one is not enough to cost the pass. An input the fragment body never reads is struck from
+the stage before it is compiled, precisely so that a declaration alone does not refuse a program
+that would have worked. What is left after that is a real mismatch.
+
+It usually comes from a body shared between programs, so that a fragment stage ends up reading a
+varying the vertex stage it was actually paired with never wrote. Where that lands on a full-screen
+pass the cut above handles it, since a quad reads none of them; where it lands on a geometry program
+that really does read one, the pass is refused. **The log names which program was refused and which
+inputs did not match**: that line, not this page, is what tells you whether a given pack is
+affected today, and it is the only thing that will.
+
+## The pack asks for Iris
+
+The image dims and a red message of the pack's own says the feature you turned on is not supported
+and asks you to switch to Iris. This is not the engine refusing anything: the pack is running, the
+message is one of its passes, and it is drawn because a capability test in its code came out false.
+
+The test reads capability defines. This engine announces itself the way Iris does, but a capability
+define is a promise, so it defines only what the backend actually serves, which today is
+`IRIS_FEATURE_BLOCK_EMISSION_ATTRIBUTE`, `IRIS_FEATURE_COMPUTE_SHADERS`,
+`IRIS_FEATURE_CUSTOM_IMAGES`, `IRIS_FEATURE_ENTITY_TRANSLUCENT`,
+`IRIS_FEATURE_HIGHER_SHADOWCOLOR`, `IRIS_FEATURE_SEPARATE_HARDWARE_SAMPLERS`,
+`IRIS_FEATURE_SSBO` and, where the driver parts the blend state of one attachment from the next,
+`IRIS_FEATURE_PER_BUFFER_BLENDING`, and nothing else.
+The section above says why the features behind the other names are closed. A pack that finds the
+announcement without the capability it wants concludes it is running on OptiFine, the only
+renderer in that position when the pack was written, and words its message for it. Read "OptiFine"
+as "not Iris" and the message is accurate.
+
+Complementary was the pack of the test set that did this, and it is why the define exists. Its
+colored lighting, which its two top profiles Very High and Ultra turn on, is voxel lighting:
+storage images filled by the geometry passes and a compute pass that spreads the light, all
+behind `IRIS_FEATURE_CUSTOM_IMAGES`. That pipe is served now and the define with it, so those
+profiles draw with their colored lighting instead of switching it off behind the message. A pack
+testing for a name still unserved keeps drawing its own overlay, and the paragraph above keeps
+being how to read it.
+
+## The effect never ran
+
+This is the most common false alarm, and it is worth checking before anything else.
+
+**Packs ship their showcase effects switched off.** Depth of field, motion blur, custom sun discs
+and auto exposure are routinely off in a pack's default settings. Judging "the blur is broken" at
+default settings is judging a pass that never executed.
+
+Two examples from the test packs: BSL gates both depth of field and motion blur off by default, and
+its own sun and moon disc and its exposure path are behind settings it ships commented out. So a
+full-screen darkening on BSL is not exposure, and the sun disc you see is the game's.
+
+**How to confirm:** turn the pack's own setting on, and check the pass appears in the chain listing
+the engine prints when the pack loads. If forcing a setting changes nothing in that listing,
+settings have stopped reaching the pack, which is a different and more serious problem.
+
+## Everything is flat
+
+**Blocks that should have relief are perfectly smooth, and turning the pack's advanced materials on
+changes nothing.** Relief does not come from the shader pack. It comes from the **resource pack**,
+which has to ship a `bricks_n.png` beside its `bricks.png`, and most resource packs ship none. A
+pack asking for a normal map that nobody supplies reads a perfectly valid flat one and never
+complains.
+
+**How to confirm:** the engine names what it found **at every resource load** (at startup, and
+again after F3+T), one line per atlas and per map, saying how many of its sprites answered. Look
+near the top of the log rather than around world load. No line means either that no resource pack in
+the stack ships a map, or that building them failed, and the failure says so on its own line just
+above.
+
+**A mob and a piece of armour are named one at a time, and later.** Their maps are not stitched into
+an atlas, so they are read the first time the skin is drawn rather than at the resource load: expect
+those lines around the moment a mob first comes on screen, one per texture, naming the texture
+itself. A line is printed at the top of a frame and the mob wears its relief in that same frame, so
+what a player sees is one flat frame: the one the mob first appeared in.
+
+One place relief still goes missing even with a material pack installed: **an animated block's map
+does not animate**. It is named work not done, with what it costs, in
+[Material maps](internals/material-maps.md#what-is-not-done), which is also where the rest of the
+mechanism lives.
+
+## The water
+
+Water has two distinct failure shapes, and they look nothing alike.
+
+**Water missing entirely: you see the lake bed through an empty surface.** Some packs sample a
+colour target before shading the water and discard the fragment when that sample fails a test. If
+the read lands on a buffer that still holds the clear, every water fragment is discarded. BSL does
+this, which is why the translucent chunk pass is run on the buffers the pack's own deferred stage
+wrote rather than on the ones it was given.
+
+**Water that looks like the game's.** That is the fallback working: the pack's water program was
+refused for a stage mismatch, so the game drew its own. The log names it.
+
+## The horizon line
+
+**A straight edge across the sky, with a paler band under it, wherever the distant horizon is
+clear.** This is a property of the game rather than of your pack.
+
+The game builds its sky as two discs, one above the camera and one below, with a fixed radius. That
+leaves a wedge near the horizon covered by nothing, and above sea level the lower disc is not drawn
+at all, so *everything* below the upper disc's rim is uncovered. Whatever fills that wedge is what
+you see, and a straight rim makes a straight line. It does not take a mountain: anywhere the terrain
+does not stand in the way will do.
+
+Vulture fills it the way the reference implementation does, by drawing geometry the game does not
+have: an inverted octagonal cone between the two planes, drawn with the pack's own basic sky
+program. If you see the line, that geometry is not reaching your pack's shader.
+
+There are two cases where it is deliberately not drawn, and the log says so in the second: a pack
+that wrote `sky=false` has said it draws the sky itself and is not handed a cone it did not ask for,
+and a frame where the world's own geometry has not marked the pixels it wrote gets no cone, because
+one drawn there would cut the ground out of the picture instead.
+
+The full mechanism is in [Sky and shadows](sky-and-shadows.md#the-horizon-gap).
+
+## Anything that moves
+
+**Something that moves looks flat, unlit, and out of place against the terrain.** It is one of the
+families still drawn by the game and composited in, already tone mapped, carrying the game's own
+lighting rather than the pack's. Which families those are has shrunk milestone by milestone, and the
+engine names the ones left in the log when a place first draws rather than on this page, which would
+go out of date between two of them. What follows is what each family that IS served costs.
+
+**The rain, the snow and the quad particles are no longer among them.** They go through the pack's
+own programs out of the box, both halves of the particles, and `weather=off` or `particles=off` in
+`vulture/options.txt` hands either family back to the game if you need to compare.
+
+**The mobs and the block entities go through the pack out of the box, both halves of them.** The
+body of a mob, a chest, a conduit, an armour piece and everything that blends over one of those is
+drawn with the pack's own program: they are lit as the pack lights the world, and the shadows the
+terrain casts fall on them. The player's own body in third person is drawn by the same rows, so it
+is the pack's too. `entities=off` in `vulture/options.txt` hands the whole family back to the game
+if you need to compare, and with it the glint an enchantment puts over what a mob holds or wears.
+What is left is named in the log rather than on this page, by the line the close of this section
+points at.
+
+**The hand you are holding has a switch of its own, and it goes through the pack out of the box
+too.** It is drawn inside the level, in two passes, served by `gbuffers_hand` and
+`gbuffers_hand_water`. With `hand=off` it goes back where the game draws it, which is after the
+whole chain has finished: not merely lit by the game but painted onto an image the pack had already
+completed, so nothing the pack does to the world reaches it and nothing it draws reaches a
+composite.
+The engine squeezes the hand's depth the way the reference does, and a pack that divides it back out
+with `MC_HAND_DEPTH` gets the same eighth it expects. What blends in the hand goes through the water
+pass with the arm, a held translucent block included, so both are the pack's.
+
+**Both passes write the pack's own draw buffers, the first one included**, which is what the
+reference does with them. The solid pass earns that the way the world's opaque geometry does, by
+writing the coverage mask that keeps the scene seed off the pixels it drew; the water pass is drawn
+after the deferred stage, onto a picture the chain has already composed, and takes the buffer
+outright. So a pack that writes a normal or a specular map from `gbuffers_hand` can light the hand
+from them, and a sleeve or any half-transparent layer blends against what stands behind it.
+
+What a `gbuffers_hand` reads as `depthtex1` is the opaque world of the frame before, which is what
+the reference hands it too: its copy is refreshed one step behind the solid hand
+(`mixin/MixinLevelRenderer.java:269-274`, `pipeline/IrisRenderingPipeline.java:1051-1063`), so every
+program drawn ahead of that step reads the frame before's under that name, the terrain and the mobs
+as much as the hand. `depthtex0` is the live scene depth there; here it answers the far plane, and
+that is a divergence: the live depth is the attachment the hand's own pass writes, which a pass
+cannot sample on this backend, and nothing older than this frame is dressed as the live depth. What
+it costs is a hand program that reads `depthtex0` rather than `depthtex1` for the scene it stands
+in, which none of the packs measured does. `depthtex2` is a real copy, taken one line before the
+pass is drawn, as there: the name a pack reads to see what the hand it is holding stands in front
+of.
+
+**The mobs and the block entities are drawn into the pack's own shadow map**, so they cast as
+well as receive, and the log names the shadow passes one by one when a place first draws. A mob's
+glowing eyes are drawn into it too and are the one thing there that casts nothing: neither pipeline
+the game gives them writes depth, so what they reach is the map's colour and not the depth a pack
+reads its shadows from. Two things take that back: a pack can ask for fewer casters than the
+default and is given what it asks for, and a draw whose pipeline this engine has no shadow row for
+is left out of the map rather than guessed at: the log says so, by name, for each one. **The rain,
+the snow, the particles, the hand and the glint of an enchantment are never in it**: they have the
+pack's light on them and nothing under them. The glint costs less than the list suggests, sitting
+on a body that fills the map on its own, so what is missing there is a tint on a shape the map
+already has; and it is the one where the reference does the same thing for its own reason,
+cancelling the foil while the map is filled. Receiving and casting are two different things here,
+and the second is the shorter list.
+
+**The game's improved transparency is turned off while a pack draws**, at the pack's load and again
+whenever the world renderer rebuilds, which is what the reference does as soon as shaders are
+enabled. It is a video setting of its own, which the Fabulous preset turns on everywhere except
+macOS. With it on, the game draws the rain, the translucent particles and a handful of entity rows
+into targets of its own and composes them itself, beside an image the pack never reads, so the
+engine lowers the setting rather than hand any of them back: the video settings show it off and the
+graphics preset reads Custom afterwards, and a hand that turns it back on is undone at the next
+rebuild of the world renderer.
+
+Two consequences follow from how that geometry reaches the pack, and both are worth recognising
+rather than reporting as separate bugs:
+
+- **The values a pack reads off a polygon are this piece's own, and the ones that describe a BLOCK
+  are constants.** The middle of the sprite a face is mapped to and the tangent of that mapping are
+  worked out over each polygon and handed over on its corners, which is what a normal map on a mob
+  or on a piece of armour is read through; so are the three a pack compares against a kind of mob,
+  the block a block entity stands in and the item being drawn. What stays constant is the material
+  id and the offset to the middle of a block, and there the reference does the same: an entity is
+  not a block and has neither. The held hand shows whatever the mobs show, arriving by the same door
+  and in the same vertex format.
+- A pack can allocate a colour target for a family that is not drawn through it. BSL allocates one
+  for glowing entities alone, and its deferred pass samples that target, so the chain reads a clear
+  across a whole target.
+
+The engine names the families that still come from the game, in the log, when a place first draws.
+That line is the authority; this page does not duplicate it. A place drawn without a seed does not
+print it, and says so on a line of its own instead.
+
+What can still send one of these families back to the game for the seed's sake is narrower than it
+was, and the log names it by program: a fragment stage the translation could not place the coverage
+mask in falls back on the game's target, and there its own first draw buffer has to be the one the
+seed paints, or the game keeps its shader for that half rather than carry the pack's albedo into a
+target it never asked for.
+
+## The waving grass jumps
+
+**A jump in the sway, not a tremble in the pixels.** Under BSL, grass and leaves used to skip
+forward or snap back while the camera stood still. That was this engine's goldberg hash under
+SPIR-V, not the pack: the reference never jumped, and Complementary was already smooth here because
+it never writes the idiom. The hash is rewritten now. Reading a remaining jump as a shimmer still
+sends you to the pack's temporal anti-aliasing, which has nothing to do with it: giving another
+pack BSL's exact jitter table, index and amplitude leaves that pack smooth.
+
+**Some of what looks like the defect is BSL's own wave.** Its interpolation has a zero derivative at
+every lattice crossing, roughly once a second, so the foliage can sit nearly still for a couple of
+dozen frames, at irregular intervals, entirely by design. Those stillnesses are in the pack and are
+there under any implementation. What is worth reporting is a jump on top of them.
+
+**The goldberg hash is rewritten.** BSL (and any pack that copies
+`fract(sin(dot(p, K)) * 43758.5453)` with a constant `K`) hashes with a sine of a huge argument. Iris leaves that as
+written and the GL driver computes it. This backend compiles through shaderc to SPIR-V; the same
+idiom, even after a Cody-Waite reduction, still skips in game. A time-only waving pack that keeps
+the hash jumps here and is smooth on the reference; the same pack with `sin` in place of the hash
+is smooth on both. Complementary never writes the idiom and was already smooth here.
+
+So the call becomes a hash of the argument's bits. The interpolation around the lattice, and the
+amplitude the pack asked for, stay the pack's. The gusts are not Iris's field.
+
+**None of these is the cause of a jump that remains:** the frame rate, capped or free running; the
+clock this engine hands the pack, which advances once per presented frame, never repeats and never
+goes backwards; the rounding of that clock to the millisecond; the world position, which cancels
+exactly against the camera position; the write into the terrain's uniform block; and the moment a
+frame is handed to the swapchain against the moment its content is dated.
+
+A report about a jump that remains is only useful if it carries something none of those explain:
+another pack that still does it, a machine or a driver where it stops, or a setting that changes
+its rhythm.
+
+## The sky goes flat
+
+**A flat grey or white sheet across the sky, typically at sunrise or sunset.**
+
+Several packs recognise the game's stars by a vertex colour whose three channels are equal and
+non-zero. Hand such a pack a plain white vertex colour on a sky pass and it takes its star branch,
+painting the whole disc flat. Sildur's and Body Camera both do this.
+
+The engine multiplies the draw's colour modulator into the value the pack reads rather than
+substituting white, precisely so that branch is not taken by accident. All of the sunrise band's
+colour lives in that modulator (its mesh is white fading to transparent), so substituting white
+would both flatten the band and trip the star test.
+
+**So if you do see this, the modulator is not reaching the pack.** That is the thing to check, and
+it is not something a pack setting can cause.
+
+## You just changed packs
+
+**Blocks wave when they should not, glow, or cast a shadow that spills past them, and placing then
+breaking a block fixes that spot.**
+
+Block numbers travel on the vertex, and no two packs number blocks alike. Chunk sections meshed
+while the previous pack was loaded keep the numbers they were built with, so a stone wall can land
+inside the new pack's waving-foliage range. Breaking a block rebuilds that section, which is why it
+appears to fix it.
+
+The engine rebuilds the world when the table moves and says so in the log. **No image diagnosis
+after a hot pack change is worth anything until that rebuild has happened**: check for that line
+before investigating anything else.
+
+## Terrain that is too dark
+
+One cause worth naming, because it used to be the answer here and is no longer. Packs can set a
+directive asking that ambient occlusion be delivered separately from vertex colour. Left unread it
+puts occlusion inside the albedo, which the whole chain then reflects, exposes and moves: a
+plausible image that is uniformly too dark, and Bliss was the pack it showed on. **The directive is
+read now**, and the mesh keeps occlusion out of the colour where a pack asks for it.
+
+So terrain that is still uniformly too dark is worth reporting rather than attributing to this. It
+is diagnosed by comparing two builds at the same camera and the same world time on a corner where
+occlusion is strong, not by toggling settings: switching shadows off makes it worse rather than
+better.
+
+## The far terrain is flat
+
+**Distant Horizons is drawing its distant land, you can see it, and the pack treats it as though it
+were sky.** No fog on it, a depth of field focused past it, water that does not know it is behind
+it. It looks like a pack fault and it is not one.
+
+That mod draws its far terrain into images of its own and paints only the colour back onto the
+picture: nothing of it reaches a pack by itself. Vulture hands the geometry to the pack instead,
+drawn with the pack's own `dh_terrain` and `dh_water` programs into the pack's own targets, and
+serves its depth beside the world's under the `dhDepthTex` names, which is the arrangement packs
+are written against. The pack's own distant-land code does the rest: everything it works out on
+screen, the fog, the shadows it computes from the LOD depth, the occlusion, runs on the far
+terrain from there.
+
+**The log says whether that happened**, and there are three things to look for. Two `Distant
+Horizons found` lines, on the first frames a pack is drawn with that mod running, one for its
+volume and one for its geometry. The two far terrain passes being drawn with the pack's programs,
+one line each the first time they draw. And the far terrain's depth being converted into the
+pack's window, whenever those two images are allocated, so the line comes back after a resize.
+When the far terrain goes back to that mod instead, the engine says so and names the reason on the
+same line: a pack serving nothing for it is the common one, and every other refusal has a line of
+its own shape.
+
+**The far terrain also enters the pack's shadow map**, where the pack ships a `dh_shadow` program
+and has not turned it off. Two things follow from a pack shipping one, and they are not the same
+thing: a far hill lays a shadow on the ground in front of it, and the far terrain is shaded by the
+map like everything else instead of only by what the pack computes from its own depth. Most packs
+ship none and write `dhShadow.enabled=false`, and the engine says so on its own line at load; one
+of them ships the program behind a setting it leaves switched off, so the setting has to be turned
+on before there is anything to see.
+
+What lands in the map is the distant land the CAMERA can see. Under Iris the mod builds a second
+list of its far terrain for the light, so a hill behind the camera lays a shadow on the ground in
+front of it there and does not here: the mod hands its geometry over once a frame, on its own pass,
+and there is no second list to ask for.
+
+**Its far water stands behind the world**, which is worth saying because it takes an extra image
+to be true. That mod draws its water half after the entities, the block entities and the hand,
+against a depth image holding the far terrain and nothing else, so left alone it paints over all
+three and over the player in third person. Vulture carries the world's own depth into that mod's
+volume before the water is drawn and lets the depth test hold it back. What a pack reads under the
+`dhDepthTex` names is untouched by that and is still the far terrain alone, with one thing given
+up: where the near world hides far water outright, that name answers with the far terrain behind
+the water rather than with the water, on a texel where neither is visible.
+
+**With none of it in view, those names still answer at every texel.** Looking at the sky from above
+the world's build height is such a frame: that mod culls every tile, and the far terrain is there
+with nothing of it drawn. The pack is then served the far plane in the same two full-screen images,
+which is what the mod's own emptied image answers under Iris. It used to be served one texel of
+it instead. A pack that fetches its distant depth by texel, as Photon does, read past that texel as
+far terrain standing at the camera, and painted the whole sky over in one flat pink.
+
+One limit stays whatever the log says: past Distant Horizons' own far plane there is nothing drawn,
+and the picture there is the pack's sky, exactly as without the mod.
+
+## What packs ask for that is unusual
+
+A short reference, if you are writing a pack or wondering why yours is treated differently.
+
+- **Where a pack keeps its programs is not fixed, and it need not be uniform inside one pack.**
+  Sildur's keeps the overworld's at the root of `shaders/` and gives the Nether and the End folders
+  of their own. A dimension folder *replaces* the base set rather than layering over it: the full
+  rule, including what an empty folder means, is in [the pack format](pack-format.md).
+- **A pack need not ship the program a family asks for.** Sildur's ships no terrain, lit-textured,
+  entity or hand program; those reach its textured program through the fallback tree, several
+  levels deep. BSL ships no lit-textured, particle, item, line or lightning program.
+- **Target zero is not special to every pack.** The target the game's image is seeded into is the
+  first draw buffer of whatever program ends up drawing the terrain, and for Sildur's that is the
+  textured gbuffers program, whose draw buffers start at the fifth target. Anything that assumes
+  target zero is wrong for it.
+- **A pack can supply its own textures**, including a three-dimensional volume as a raw blob, as
+  Mellow does with its noise and Photon with its atmosphere table. Since the backend refuses a
+  declared three-dimensional sampler, the volume is laid flat onto a two-dimensional atlas and
+  reads are rewritten to interpolate two slices, whether the volume repeats or clamps and whether
+  it holds unsigned bytes, unsigned shorts or floats of either width a channel. A blob that is a
+  plain two-dimensional table, as RenderPearl's edge-blending tables are, is uploaded at the size
+  the declaration gives.
+- **A pack can ask for an unusual shadow buffer format.** Mellow asks for a single-channel one,
+  which is why the shadow pipeline's colour state is built from the attachment rather than
+  hardcoded.
+- **How far a pack may count its shadow colour buffers is the pack's own answer.** Two,
+  `shadowcolor0` and `shadowcolor1`, unless it declares `HIGHER_SHADOWCOLOR` on an `iris.features`
+  line, which takes it to eight: that is where the reference reads it from as well, and it is that
+  declaration which decides, never an `IRIS_FEATURE_HIGHER_SHADOWCOLOR` the GLSL may find defined.
+  A shadow program is given the buffers its own draw buffers name, and a directive naming a buffer
+  past the ceiling is thrown away whole and answered with the pair, which is again what the
+  reference does, the log naming the program it happened to. **Of those, only the ones some program
+  of the place writes or samples are allocated**, so a pack whose light never names `shadowcolor1`
+  is not charged an image at the shadow map's own resolution for it.
+  `shadowcolor0` stands whatever the pack writes, which is the reference's own floor: it builds
+  that buffer before a program has asked for anything, for the framebuffer its depth copy is taken
+  through. **Where a program names none, or names more buffers than it writes outputs, it is
+  given only as many as it writes**: a buffer short of the reference. That is deliberate: Vulkan
+  leaves an attachment no fragment writes undefined for the whole draw, where the GL these packs
+  were written against leaves it standing, and what a pack reads out of an untouched shadow buffer
+  is the white a coloured shadow multiplies by. The second buffer is not decoration: one pack of the
+  corpus writes the tint of its light shafts there and reads it back for every ray that reaches
+  through something translucent, so a buffer it could not write filled every body of water with
+  white.
+- **A pack can ask the engine not to draw a piece of the sky** because it draws that piece itself,
+  inside one of its own programs. Four such requests are read, and two of them take a piece away:
+  the sun and the moon, which is where both references stand. `stars=false` takes nothing, the
+  game's star field being drawn with the pack's own `gbuffers_skybasic` in the first place, and
+  `sky=false` costs the horizon cone alone rather than the game's disc, which is again what the
+  references do, and the NOTICE says so. The fifth request in that family is not one of those four
+  and reads the other way round: `clouds` takes `off`, `fast` or `fancy` rather than a boolean, and it overrules
+  the user's own cloud setting so that the pack's cloud program is handed the geometry it was
+  written for. It is honoured only where this engine really draws the clouds, because with the
+  game's own shader behind it `off` would take the clouds away and put nothing in their place.
+- **Most packs write `clouds=off`**, and it is not a refusal of clouds
+  but a redirection: they draw their own, volumetric, inside a composite. Complementary goes further
+  and ships a `gbuffers_clouds` that discards outright unless its own cloud style is set to the
+  vanilla one. So a pack whose clouds visibly change when the engine starts drawing them is the
+  exception rather than the rule, and a pack whose vanilla clouds vanish is usually doing what it
+  meant to.
+- **Settings are declared in the GLSL, not in a manifest**, and packs disable whole programs from
+  their properties file using preprocessor conditions on their own settings. Both Complementary
+  packs do this, which is why a flat read of that file reports passes as active that the pack
+  switched off.

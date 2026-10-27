@@ -1,0 +1,653 @@
+package dev.vulture.pack.texture;
+
+import dev.vulture.pack.model.PackTexture;
+import dev.vulture.pack.model.PixelFormat;
+import dev.vulture.pack.model.PixelType;
+import dev.vulture.pack.model.TargetFormat;
+import dev.vulture.pack.model.TargetName;
+import dev.vulture.pack.model.TextureStage;
+import dev.vulture.pack.source.ShaderPackSource;
+import dev.vulture.pack.source.ShaderProperties;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.Set;
+
+/**
+ * What a pack supplies as a texture of its own, read out of {@code shaders.properties} and
+ * checked against the files behind it.
+ * <p>
+ * The grammar is short and has one trap in it. What a value means is decided by HOW MANY words it
+ * holds, not by what they say: one word is the path of an image, six a one dimensional blob, seven
+ * a two dimensional one, eight a three dimensional one. Any other count is a line nothing can
+ * honour, and nothing is read out of it. Iris takes the sampler name from it anyway, leaves the
+ * type null and meets that null much later while translating.
+ * <p>
+ * <strong>The KEY is what decides whether a name is taken over, and the value only whether
+ * anything can be put behind it.</strong> A key that names a stage and a sampler has said which
+ * name the pack is claiming, and no word further along the line unsays it: a misspelt pixel type
+ * leaves the sampler black and named in the log, where handing the name back would leave a deferred
+ * reading the scene as a lookup table. Only a key this cannot read that far takes nothing, because
+ * there is no name in it to take.
+ * <p>
+ * One case is the exception, and it is Iris's rule rather than a softening of that one. A
+ * declaration naming a file the pack DOES NOT SHIP, or a picture whose header the game's reader
+ * refuses, is dropped whole, its name with it: Iris never puts such a sampler in the stage's map,
+ * so the name goes on meaning what it meant, which for a colour target is that target. A declaration
+ * naming a file OUTSIDE the pack keeps its name and reads black, because that path is not a mistake
+ * of the author's.
+ * <p>
+ * A picture with a sound header and pixels that do not decode keeps its name and reads black, where
+ * Iris drops it like the others. Telling it apart here would decode every picture at every opening
+ * that reads these directives, most of which upload nothing, where the pixels are only needed at
+ * the upload and are decoded there; what it costs is black on that name where Iris reads the target.
+ * <p>
+ * A blob SHORTER than the size it announces keeps its name too, and that is a difference with Iris
+ * the other way round: Iris throws while reading such a file, nothing catches the throw, and the
+ * WHOLE pack is refused. One truncated lookup table is not worth a pack that would otherwise draw,
+ * so this refuses the line and names it. What neither engine does is upload the short blob, and for
+ * the same reason: it reads as noise, which is what most of these files hold anyway, so the picture
+ * that comes out is perfectly plausible and completely wrong.
+ */
+public final class PackTextures {
+
+	private static final String CUSTOM_PREFIX = "customTexture.";
+	private static final String STAGE_PREFIX = "texture.";
+
+	/** The word counts the format gives a meaning to. */
+	private static final int PNG_TOKENS = 1;
+	private static final int RAW_1D_TOKENS = 6;
+	private static final int RAW_2D_TOKENS = 7;
+	private static final int RAW_3D_TOKENS = 8;
+
+	/** The eight bytes a PNG opens with, read as one big endian word. */
+	private static final long PNG_SIGNATURE = 0x89504E470D0A1A0AL;
+
+	/** The length and the type of the chunk a PNG must open on, {@code IHDR}. */
+	private static final int IHDR_LENGTH = 13;
+	private static final int IHDR_TYPE = 0x49484452;
+
+	/** The signature, then the length and the type of the first chunk. */
+	private static final int PNG_HEADER_BYTES = 16;
+
+	private final List<PackTexture> supplied;
+	private final List<Refused> refused;
+	private final List<String> notes;
+	private final Map<TextureStage, Map<String, PackTexture>> overrides;
+	private final Map<TextureStage, Set<String>> diverted;
+	private final Set<String> divertedEverywhere;
+	private final Map<String, PackTexture> named;
+
+	/**
+	 * A directive this engine will not honour, with the reason in one clause for the log.
+	 *
+	 * @param stage   which stage the name is taken over in, absent both for a {@code customTexture},
+	 *                which takes it over everywhere, and for a key too broken to name one
+	 * @param sampler the name being taken over, taken over ANYWAY and left with nothing behind it,
+	 *                which is not a nicety: Complementary points {@code texture.deferred.colortex3}
+	 *                at a cloud and water lookup table, and letting one misspelled word later in
+	 *                that line hand the name back to colour target three would have its deferred
+	 *                read the scene as that table. Empty on the lines that claim nothing: a key
+	 *                that named no sampler, and a path the pack does not ship or a picture whose
+	 *                header the game's reader refuses, both of which Iris drops as well
+	 */
+	public record Refused(String key, String value, String reason, Optional<TextureStage> stage,
+			String sampler) {
+
+		private static Refused of(String key, String value, String reason) {
+			return new Refused(key, value, reason, Optional.empty(), "");
+		}
+
+		@Override
+		public String toString() {
+			return this.key + "=" + this.value + ": " + this.reason;
+		}
+	}
+
+	private PackTextures(List<PackTexture> supplied, List<Refused> refused, List<String> notes) {
+		this.supplied = List.copyOf(supplied);
+		this.refused = List.copyOf(refused);
+		this.notes = List.copyOf(notes);
+
+		Map<TextureStage, Map<String, PackTexture>> overrides = new EnumMap<>(TextureStage.class);
+		Map<String, PackTexture> named = new LinkedHashMap<>();
+		for (PackTexture texture : supplied) {
+			texture.stage().ifPresentOrElse(
+					stage -> overrides.computeIfAbsent(stage, _ -> new LinkedHashMap<>())
+							.put(texture.sampler(), texture),
+					() -> named.put(texture.sampler(), texture));
+		}
+
+		Map<TextureStage, Set<String>> diverted = new EnumMap<>(TextureStage.class);
+		Set<String> divertedEverywhere = new LinkedHashSet<>();
+		for (Refused one : refused) {
+			if (one.sampler().isEmpty()) {
+				continue;
+			}
+
+			// A refused customTexture names no stage and takes its name over in all of them, exactly
+			// as an honoured one does. Kept apart from the stage map rather than written into all
+			// seven, so that what the pack said stays readable in what is stored.
+			one.stage().ifPresentOrElse(
+					stage -> diverted.computeIfAbsent(stage, _ -> new LinkedHashSet<>())
+							.add(one.sampler()),
+					() -> divertedEverywhere.add(one.sampler()));
+		}
+
+		this.overrides = Map.copyOf(overrides);
+		this.diverted = Map.copyOf(diverted);
+		this.divertedEverywhere = Set.copyOf(divertedEverywhere);
+		this.named = Map.copyOf(named);
+	}
+
+	/**
+	 * A pack that declares none, which of the eight is Sildur's alone, and what stands in before one
+	 * is read.
+	 */
+	public static PackTextures empty() {
+		return new PackTextures(List.of(), List.of(), List.of());
+	}
+
+	/**
+	 * Reads every custom texture the pack declares, and the files behind them.
+	 *
+	 * @param defines the settings as they stand, because the lines are read through the pack's own
+	 *                conditionals and two packs put custom textures behind one
+	 */
+	public static PackTextures read(ShaderProperties properties, Map<String, String> defines,
+			ShaderPackSource source) throws IOException {
+		List<PackTexture> supplied = new ArrayList<>();
+		List<Refused> refused = new ArrayList<>();
+		List<String> notes = new ArrayList<>();
+
+		for (Map.Entry<String, String> line : properties.customTextures(defines).entrySet()) {
+			read(line.getKey(), line.getValue(), source, supplied, refused, notes);
+		}
+
+		return new PackTextures(supplied, refused, notes);
+	}
+
+	private static void read(String key, String value, ShaderPackSource source,
+			List<PackTexture> supplied, List<Refused> refused, List<String> notes)
+			throws IOException {
+		Optional<TextureStage> stage;
+		String sampler;
+
+		if (key.startsWith(CUSTOM_PREFIX)) {
+			stage = Optional.empty();
+			// Dots and all: this name belongs to nobody but the pack, so nothing may be cut off it.
+			sampler = key.substring(CUSTOM_PREFIX.length());
+		} else {
+			String rest = key.substring(STAGE_PREFIX.length());
+			int dot = rest.indexOf('.');
+			if (dot < 0) {
+				refused.add(Refused.of(key, value, "names no stage to override the sampler in"));
+				return;
+			}
+
+			stage = TextureStage.parse(rest.substring(0, dot));
+			if (stage.isEmpty()) {
+				refused.add(Refused.of(key, value,
+						"names the stage " + rest.substring(0, dot) + ", which is not one of the seven"));
+				return;
+			}
+
+			// Truncated at its first dot, as Iris truncates it. A sampler name has no dot in it, so
+			// what follows one is whatever the pack thought it was adding, and it is not part of the
+			// name being overridden.
+			String tail = rest.substring(dot + 1);
+			int inner = tail.indexOf('.');
+			sampler = inner < 0 ? tail : tail.substring(0, inner);
+		}
+
+		if (sampler.isEmpty()) {
+			refused.add(Refused.of(key, value, "names no sampler"));
+			return;
+		}
+
+		// The name is settled by the key alone, so from here on a refusal carries it and leaves it
+		// with nothing behind it. What the value SAYS about the file cannot put the name back: the
+		// pack has said which sampler it is taking over, and a word it misspelled in the rest of the
+		// line does not unsay it. Letting one typo hand colortex3 back to colour target three would
+		// have a deferred read the scene as a lookup table, which is the picture nobody questions,
+		// where black is a question. The file itself is the one thing that can, by not being there
+		// or by not opening as a PNG; those cases are at the bottom of this method.
+		// One space, the separator Iris gives the texture directives, and not a run of whitespace:
+		// the word count is what tells a PNG from a raw texture there, and an empty word between two
+		// real ones moves the value into a count the format gives no meaning to.
+		String[] parts = value.trim().split(" ", -1);
+		if (parts.length != PNG_TOKENS && (parts.length < RAW_1D_TOKENS || parts.length > RAW_3D_TOKENS)) {
+			refused.add(new Refused(key, value, "holds " + parts.length
+					+ " words, and the format gives a meaning to 1, 6, 7 and 8", stage, sampler));
+			return;
+		}
+
+		String path = parts[0];
+
+		// A namespaced path names a resource the GAME owns and hands out through its own manager,
+		// and it deliberately does NOT go through the confinement in ShaderPackSource. That is not
+		// a hole in it: the confinement exists so that a path the pack wrote cannot leave the
+		// pack's directory once normalised, and there is no path here to normalise. What the pack
+		// wrote is an identifier the game resolves for itself, out of the resource packs already
+		// loaded, exactly as it resolves the identifiers of its own textures; nothing in this
+		// engine turns it into a name on disk. PackImages is where it is looked up.
+		//
+		// Everything the rest of the line declared goes with it, as it goes with Iris: a namespaced
+		// path is served as a plain image whatever shape and format the words after it announce, no
+		// .mcmeta of the pack is consulted for it, and the defaults left standing here are the
+		// nearest and repeating pair Iris binds such a texture with.
+		if (PackTexture.gameResource(path)) {
+			supplied.add(new PackTexture(sampler, stage, path, Optional.empty(), false, false));
+			return;
+		}
+
+		Optional<PackTexture.Raw> raw = parts.length == PNG_TOKENS
+				? Optional.empty()
+				: rawOf(parts);
+		if (parts.length != PNG_TOKENS && raw.isEmpty()) {
+			refused.add(new Refused(key, value, "declares a raw texture this cannot read", stage,
+					sampler));
+			return;
+		}
+
+		Optional<Path> file = source.file(path);
+		if (file.isEmpty()) {
+			// The one refusal that hands the name back, and insidePack is what tells the two apart.
+			// A path the pack does not ship is a file the author forgot, and Iris drops the whole
+			// declaration on it: the sampler never enters the stage's map, so the name goes on
+			// meaning what it meant, which for a colour target is that target. Claiming it here
+			// instead would leave the pack reading black where Iris reads the frame, and that is a
+			// difference the pack's own author never saw.
+			//
+			// A path that leaves the pack once normalised is the other thing entirely, and it stays
+			// claimed with the rest: that one is not a mistake this engine should smooth over.
+			refused.add(source.insidePack(path)
+					? Refused.of(key, value, "points at " + path + ", which the pack does not ship, "
+							+ "so " + sampler + " reads what it read before")
+					: new Refused(key, value, "points at " + path + ", which is outside the pack",
+							stage, sampler));
+			return;
+		}
+
+		long size = source.size(file.get());
+		if (raw.isPresent()) {
+			long wanted = raw.get().bytes();
+			if (size < wanted) {
+				refused.add(new Refused(key, value, path + " holds " + size + " bytes and the "
+						+ "declaration asks for " + wanted, stage, sampler));
+				return;
+			}
+
+			if (size > wanted) {
+				notes.add(path + " holds " + size + " bytes for a declaration of " + wanted
+						+ ", and the tail is not uploaded");
+			}
+		} else {
+			// A picture Iris cannot decode leaves the stage's map exactly as a missing file does
+			// (ShaderPack.java:341-345 for the read, CustomTextureManager.java:58-64 for the
+			// decode), so the name is handed back on the same terms and every program reads what it
+			// read before, the colour target of that name included. Only the header is read here,
+			// sixteen bytes, because every opening reads these directives and most of them upload
+			// nothing; the pixels are decoded where they are uploaded.
+			Optional<String> unreadable = pngHeader(source, file.get(), size);
+			if (unreadable.isPresent()) {
+				refused.add(Refused.of(key, value, path + " is not a PNG the game reads ("
+						+ unreadable.get() + "), so " + sampler + " reads what it read before"));
+				return;
+			}
+		}
+
+		// A raw blob is filtered and clamped unless the pack says otherwise and an image is neither,
+		// which is OptiFine's rule rather than a taste: a blob carries a lookup table as often as an
+		// image, and a table read past its edge or between its entries answers with something that
+		// was never in it.
+		String meta = meta(source, path);
+		boolean sampled = raw.isPresent();
+
+		PackTexture texture = new PackTexture(sampler, stage, path, raw,
+				field(meta, "blur").orElse(sampled), field(meta, "clamp").orElse(sampled));
+
+		// A volume is served by spreading it over an atlas, so it is the atlas that has to be a
+		// texture a device would take, and the declaration says nothing about how wide that comes
+		// out: the length of the blob is checked and its shape is not. Refused by name, like the
+		// rest, so the sampler reads black.
+		if (flattenable(texture)) {
+			VolumeAtlas atlas = VolumeAtlas.of(raw.orElseThrow(), texture.clamp());
+			if (!atlas.fits()) {
+				refused.add(new Refused(key, value, path + " lays out flat as " + atlas.atlasWidth()
+						+ "x" + atlas.atlasHeight() + ", which is past what a texture can be", stage,
+						sampler));
+				return;
+			}
+		} else if (volume(texture)) {
+			// A hole rather than a rule, and one that costs the whole pack, so it is said out loud
+			// where the refusal that follows cannot say it: a channel type or order the atlas does
+			// not lay out, or an extent of nought, and the sampler3D left standing takes every
+			// program that declares it. VolumeAtlas.serves says which are laid out and why.
+			notes.add(path + " is a volume of " + raw.orElseThrow().pixelFormat() + " "
+					+ raw.orElseThrow().pixelType() + ", which is not laid out flat here, so " + sampler
+					+ " stays a sampler3D and no program declaring it can be built");
+		} else if (raw.filter(RawImage::serves).isPresent()) {
+			// The plain case, measured the same way and for the same reason. The declaration IS the
+			// size here, so there is nothing to work out: what is asked is only whether a device
+			// would take it.
+			RawImage image = RawImage.of(raw.orElseThrow());
+			if (!image.fits()) {
+				refused.add(new Refused(key, value, path + " is declared " + image.width() + "x"
+						+ image.height() + ", which is past what a texture can be", stage, sampler));
+				return;
+			}
+		}
+
+		supplied.add(texture);
+	}
+
+	/**
+	 * The blob's shape, size and format, or empty when a word of it cannot be read.
+	 * <p>
+	 * {@code parts[1]} is only ever consulted at seven words, and that is the format's doing rather
+	 * than a shortcut: six words is a 1D texture and eight a 3D one whatever the word says, so at
+	 * those two lengths it is the count that decides and the word is decoration.
+	 */
+	private static Optional<PackTexture.Raw> rawOf(String[] parts) {
+		PackTexture.Shape shape = switch (parts.length) {
+			case RAW_1D_TOKENS -> PackTexture.Shape.TEXTURE_1D;
+			case RAW_2D_TOKENS -> flat(parts[1]);
+			default -> PackTexture.Shape.TEXTURE_3D;
+		};
+
+		if (shape == null) {
+			return Optional.empty();
+		}
+
+		// The sizes always start at the fourth word and there are as many of them as the count
+		// says: one more word than a 1D texture is one more axis.
+		int dimensions = parts.length - RAW_1D_TOKENS + 1;
+		int[] size = new int[3];
+		try {
+			for (int axis = 0; axis < dimensions; axis++) {
+				size[axis] = Integer.parseInt(parts[3 + axis]);
+			}
+		} catch (NumberFormatException e) {
+			return Optional.empty();
+		}
+
+		for (int axis = 0; axis < dimensions; axis++) {
+			if (size[axis] <= 0) {
+				return Optional.empty();
+			}
+		}
+
+		Optional<PixelFormat> pixelFormat = PixelFormat.parse(parts[parts.length - 2]);
+		Optional<PixelType> pixelType = PixelType.parse(parts[parts.length - 1]);
+		if (pixelFormat.isEmpty() || pixelType.isEmpty()) {
+			return Optional.empty();
+		}
+
+		TargetFormat.Resolution internal = TargetFormat.resolve(parts[2]);
+		if (internal.reason() == TargetFormat.Reason.UNKNOWN) {
+			return Optional.empty();
+		}
+
+		return Optional.of(new PackTexture.Raw(shape, internal, size[0], size[1], size[2],
+				pixelFormat.get(), pixelType.get()));
+	}
+
+	/**
+	 * The two shapes seven words can mean. A pack naming a 1D or a 3D texture at that length has
+	 * written a size it does not have, and there is no honest way to guess which one it dropped.
+	 */
+	private static PackTexture.Shape flat(String word) {
+		String name = word.trim().toUpperCase(Locale.ROOT);
+
+		if (name.equals(PackTexture.Shape.TEXTURE_2D.name())) {
+			return PackTexture.Shape.TEXTURE_2D;
+		}
+
+		return name.equals(PackTexture.Shape.TEXTURE_RECTANGLE.name())
+				? PackTexture.Shape.TEXTURE_RECTANGLE
+				: null;
+	}
+
+	/**
+	 * Why the game's image reader would refuse a picture before decoding a pixel of it, or nothing
+	 * when it goes on to decode. The checks of {@code PngInfo.validateHeader}, in its order, which
+	 * {@code NativeImage.read} runs first and which is the reader Iris hands the bytes to: sixteen
+	 * bytes at least, the PNG signature, then a first chunk thirteen bytes long and typed
+	 * {@code IHDR}. A JPEG fails here where ImageIO would have decoded it. A file that cannot be
+	 * read at all fails too, as it does for Iris.
+	 * <p>
+	 * Nothing past the header is looked at. A picture whose header is sound and whose pixels are
+	 * not fails at the upload instead, and reads black there rather than handing its name back.
+	 */
+	private static Optional<String> pngHeader(ShaderPackSource source, Path file, long size) {
+		if (size < PNG_HEADER_BYTES) {
+			return Optional.of("PNG header missing");
+		}
+
+		ByteBuffer header;
+		try {
+			header = ByteBuffer.wrap(source.head(file, PNG_HEADER_BYTES));
+		} catch (IOException e) {
+			return Optional.of(e.getMessage());
+		}
+
+		if (header.getLong(0) != PNG_SIGNATURE) {
+			return Optional.of("bad PNG signature");
+		}
+
+		if (header.getInt(8) != IHDR_LENGTH) {
+			return Optional.of("bad length for the IHDR chunk");
+		}
+
+		return header.getInt(12) == IHDR_TYPE
+				? Optional.empty()
+				: Optional.of("bad type for the IHDR chunk");
+	}
+
+	/** The {@code .mcmeta} beside the file as one line, or nothing when the pack ships none. */
+	private static String meta(ShaderPackSource source, String path) throws IOException {
+		Optional<Path> meta = source.file(path + ".mcmeta");
+
+		return meta.isEmpty() ? "" : String.join(" ", source.readLines(meta.get()));
+	}
+
+	/**
+	 * One of the two fields a {@code .mcmeta} may carry, read by hand.
+	 * <p>
+	 * By hand rather than through a JSON reader because these files hold two booleans and nothing
+	 * else in the whole corpus, and a dependency for that would be paid on every load. A file this
+	 * cannot make sense of leaves the default standing, which is what a pack that ships no file at
+	 * all gets.
+	 */
+	private static Optional<Boolean> field(String text, String name) {
+		int at = text.indexOf('"' + name + '"');
+		if (at < 0) {
+			return Optional.empty();
+		}
+
+		int colon = text.indexOf(':', at);
+		if (colon < 0) {
+			return Optional.empty();
+		}
+
+		String tail = text.substring(colon + 1).stripLeading();
+		if (tail.startsWith("true")) {
+			return Optional.of(true);
+		}
+
+		return tail.startsWith("false") ? Optional.of(false) : Optional.empty();
+	}
+
+	/** Every declaration this engine will honour, in the order the pack wrote them. */
+	public List<PackTexture> supplied() {
+		return this.supplied;
+	}
+
+	/**
+	 * The volumes this engine can serve as a flat atlas, by the name the shaders sample them under,
+	 * each with the layout both sides have to agree on.
+	 * <p>
+	 * The stage a directive names is not consulted, and that is a difference with Iris rather than
+	 * an oversight; {@code VolumeAtlas} and the translation say why. A volume is served by rewriting
+	 * the declaration itself, so every program carrying that declaration is rewritten, and the same
+	 * atlas has to answer for all of them.
+	 * <p>
+	 * Two things have to hold and each of them is a way the picture would be wrong rather than
+	 * absent. The blob has to be three dimensional, since nothing else is laid out in slices, and
+	 * of a channel type the atlas carries as it is. How the pack asked it addressed goes into the
+	 * layout, because the repeat or the clamp is baked into the gutter and into the helper and
+	 * neither can be undone at the sampler. Everything else stays refused with its own line.
+	 */
+	public Map<String, VolumeAtlas> volumes() {
+		Map<String, VolumeAtlas> flat = new LinkedHashMap<>();
+		for (PackTexture texture : this.supplied) {
+			if (flattenable(texture)) {
+				flat.putIfAbsent(texture.sampler(),
+						VolumeAtlas.of(texture.raw().orElseThrow(), texture.clamp()));
+			}
+		}
+
+		return Collections.unmodifiableMap(flat);
+	}
+
+	private static boolean flattenable(PackTexture texture) {
+		return texture.raw().filter(VolumeAtlas::serves).isPresent();
+	}
+
+	/** A blob of the one shape this lays out flat, whatever it holds and however it is addressed. */
+	private static boolean volume(PackTexture texture) {
+		return texture.raw()
+				.filter(raw -> raw.shape() == PackTexture.Shape.TEXTURE_3D)
+				.isPresent();
+	}
+
+	/** Every declaration it will not, with the reason. Meant to be logged, one line each. */
+	public List<Refused> refused() {
+		return this.refused;
+	}
+
+	/** What was honoured with something worth saying about it. */
+	public List<String> notes() {
+		return this.notes;
+	}
+
+	/**
+	 * What a name reads from in a program of that stage, if the pack supplies anything for it.
+	 * <p>
+	 * Empty is two different answers and the caller has to keep them apart: a name
+	 * {@link #suppliedTo} does not carry means nothing was taken from it, whether the pack never
+	 * wrote it or wrote it against a file it does not ship or a picture refused at its header; a name
+	 * it carries with nothing behind it is an override this engine could not honour, which reads
+	 * black.
+	 * <p>
+	 * A stage override is asked first. Nothing in the corpus writes both forms for one name, and if
+	 * one ever does, the form that names a stage is the more precise of the two.
+	 * <p>
+	 * A volume is never the answer here, under either form. Iris renames a declaration to the
+	 * pack's texture only when the declared type matches the texture's shape
+	 * ({@code TextureTransformer.isTypeValid}), so a {@code sampler3D} of that name reads the
+	 * blob and a {@code sampler2D} of the same name in the same stage goes on reading the colour
+	 * target. Here the translation moves every {@code sampler3D} declaration onto a forged name,
+	 * and the volume answers under that name alone: Photon lays its noise over {@code colortex0}
+	 * for the composite stage and reads the scene as {@code sampler2D colortex0} in the same
+	 * stage, and served by name that scene was the noise, red and nothing else.
+	 */
+	public Optional<PackTexture> resolve(TextureStage stage, String sampler) {
+		Map<String, PackTexture> forStage = this.overrides.getOrDefault(stage, Map.of());
+		for (String spelling : spellings(sampler)) {
+			PackTexture found = forStage.get(spelling);
+			if (found != null) {
+				return Optional.of(found).filter(texture -> !volume(texture));
+			}
+		}
+
+		return Optional.ofNullable(this.named.get(sampler)).filter(texture -> !volume(texture));
+	}
+
+	/**
+	 * Every name the pack takes over in a program of that stage, whether or not anything could be
+	 * put behind it, both spellings of a colour target included.
+	 * <p>
+	 * Whether or not, because the two failures are not the same. A name the pack takes over and
+	 * this engine cannot serve reads black and is named in the log; letting it fall back to the
+	 * colour target it shares a name with would put the scene where the pack asked for a lookup
+	 * table, and that is a picture nobody would question. {@link #resolve} is what tells the two
+	 * apart. The lines that are not here at all name a file the pack does not ship or a picture
+	 * refused at its header, which are dropped where they are read, name included, as Iris drops them.
+	 * <p>
+	 * Both spellings because a colour target answers to two names and the override is written under
+	 * one of them: Complementary writes {@code texture.gbuffers.gaux4} and its gbuffers may sample
+	 * either word. Iris looks an override up under every name of the unit for the same reason.
+	 * <p>
+	 * A volume takes no name over: it is served under the forged name the translation gives a
+	 * {@code sampler3D} declaration, and a plain name of that spelling stays what it was, which is
+	 * what {@link #resolve} says too.
+	 */
+	public Set<String> suppliedTo(TextureStage stage) {
+		Set<String> names = new LinkedHashSet<>();
+		this.named.forEach((sampler, texture) -> {
+			if (!volume(texture)) {
+				names.add(sampler);
+			}
+		});
+		this.overrides.getOrDefault(stage, Map.of()).forEach((sampler, texture) -> {
+			if (!volume(texture)) {
+				names.addAll(spellings(sampler));
+			}
+		});
+		this.diverted.getOrDefault(stage, Set.of())
+				.forEach(sampler -> names.addAll(spellings(sampler)));
+		this.divertedEverywhere.forEach(sampler -> names.addAll(spellings(sampler)));
+
+		return names;
+	}
+
+	/**
+	 * The names of that stage a flat picture stands on, which are the ones a program's DEFAULT
+	 * sampler can land on rather than on the colour target.
+	 * <p>
+	 * Narrower than {@link #suppliedTo} three times over, and each is Iris's own line. The stage
+	 * form alone: {@code customTexture.NAME} names no stage and is bound by name and nothing else
+	 * ({@code samplers/IrisSamplers.java:237-239}), so it never stands where a name nothing serves
+	 * lands. The picture alone: a declaration that spells a raw blob out goes to the renaming road
+	 * ({@code ShaderProperties.java:480}), and only a picture enters the map the default sampler is
+	 * swapped out of ({@code :485-486}). And a name with nothing behind it at all is not one of
+	 * them: a picture Iris fails to read leaves its stage map without that name
+	 * ({@code pipeline/CustomTextureManager.java:56-67}), so the default sampler goes back to the
+	 * target, which is what a picture refused at its header does here.
+	 */
+	public Set<String> picturesTo(TextureStage stage) {
+		Set<String> names = new LinkedHashSet<>();
+		this.overrides.getOrDefault(stage, Map.of()).forEach((sampler, texture) -> {
+			if (texture.raw().isEmpty()) {
+				names.addAll(spellings(sampler));
+			}
+		});
+
+		return names;
+	}
+
+	/** A colour target under both its names, anything else under its own. */
+	private static List<String> spellings(String sampler) {
+		OptionalInt index = TargetName.index(sampler);
+		if (index.isEmpty()) {
+			return List.of(sampler);
+		}
+
+		return TargetName.legacyAlias(index.getAsInt())
+				.map(alias -> List.of(TargetName.canonical(index.getAsInt()), alias))
+				.orElse(List.of(TargetName.canonical(index.getAsInt())));
+	}
+}

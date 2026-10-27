@@ -1,0 +1,22 @@
+# Normalise line endings to LF, in the repository and in the working tree alike, apart from the
+# batch scripts named below.
+* text=auto eol=lf
+
+*.java   text diff=java
+*.gradle text
+*.kts    text
+*.md     text
+*.json   text
+*.glsl   text
+*.fsh    text
+*.vsh    text
+*.csh    text
+*.properties text
+
+# The Gradle wrapper scripts need the line endings their interpreter expects.
+gradlew  text eol=lf
+*.bat    text eol=crlf
+
+*.png    binary
+*.jar    binary
+*.zip    binary

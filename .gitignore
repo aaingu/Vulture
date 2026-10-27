@@ -1,0 +1,32 @@
+# Gradle and generated game/build files
+.gradle/
+build/
+*/build/
+*/run/
+runs/
+*/runs/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE and local machine files
+.idea/
+*.iml
+.vscode/
+.fleet/
+.eclipse/
+bin/
+*/bin/
+local.properties
+.DS_Store
+Thumbs.db
+
+# Crash dumps and shader compiler output
+hs_err_pid*.log
+replay_pid*.log
+*.hprof
+*.spv
+
+# Shader packs are user-provided and may not be redistributed
+*.zip
+
+# Temporary documentation drafts
+/docs/in-progress/

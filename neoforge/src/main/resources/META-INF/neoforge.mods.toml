@@ -1,0 +1,71 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "LGPL-3.0-only"
+issueTrackerURL = "https://github.com/aaingu/Vulture/issues"
+
+[[mods]]
+modId = "${mod_id}"
+version = "${mod_version}"
+displayName = "Vulture"
+displayURL = "https://github.com/aaingu/Vulture"
+logoFile = "vulture.png"
+# The same square image under the key current NeoForge reads, which it asks for beside logoFile: a
+# development client that finds logoFile alone stops on a warning screen before the title screen.
+iconFile = "vulture.png"
+authors = "avpbynf"
+displayTest = "IGNORE_ALL_VERSION"
+description = '''OptiFine-format shader packs, on Minecraft's native Vulkan renderer'''
+
+# Sodium reads this block out of every mod's own metadata and turns the named mixin off.
+# features.render.world.sky hides the whole sky pass whenever the camera is in a fluid, which with a
+# pack loaded means no sky at all: none of the six elements is drawn, so none of the pack's sky
+# programs runs. LevelRendererSkyMixin puts the same answer back where no pack draws the sky.
+[mods."sodium:options"]
+"mixin.features.render.world.sky" = false
+
+# The class Sodium builds to be handed its config builder, which is where the settings screen is put
+# into the video settings. Sodium reads it from the metadata here and from an entry point in
+# fabric.mod.json on the other side; it also offers an annotation of its own for this, and the
+# metadata is taken instead because it leaves the class free of anything either loader brings.
+# This block is the mod's own properties and is read by mod id, so it does not belong under the
+# [[mods]] entry above however much it looks like it should.
+[modproperties.${mod_id}]
+"sodium:config_api_user" = "dev.vulture.sodium.ConfigEntry"
+
+[[mixins]]
+config = "vulture.mixins.json"
+
+# The engine's mixins that differ between the games this jar can be built for. The common module
+# holds one file of this name per game, under src/mc<version>/, and a build takes the one for the
+# game it is built for, so this entry names whichever that was.
+[[mixins]]
+config = "vulture-game.mixins.json"
+
+# The engine's own mixins are in the common module and are listed above. This last config is
+# the handful that exist on this loader alone, which on 26.2 is the refusal of the early loading
+# window and on 26.3 is nothing: it names classes of NeoForge's, so it could not live where the
+# Fabric module reads.
+[[mixins]]
+config = "vulture-neoforge.mixins.json"
+
+[[dependencies.${mod_id}]]
+modId = "minecraft"
+type = "required"
+versionRange = "[${minecraft_version},${minecraft_next})"
+ordering = "NONE"
+side = "CLIENT"
+
+[[dependencies.${mod_id}]]
+modId = "neoforge"
+type = "required"
+versionRange = "[${neoforge_min_version},${minecraft_next})"
+ordering = "NONE"
+side = "CLIENT"
+
+[[dependencies.${mod_id}]]
+modId = "sodium"
+type = "required"
+reason = "Vulture renders through Sodium, which owns the Vulkan command submission."
+versionRange = "[0.9,0.10)"
+ordering = "AFTER"
+side = "CLIENT"

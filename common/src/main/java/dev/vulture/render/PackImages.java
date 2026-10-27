@@ -1,0 +1,466 @@
+package dev.vulture.render;
+
+import dev.vulture.pack.model.PackTexture;
+import dev.vulture.pack.model.PixelType;
+import dev.vulture.pack.model.TextureStage;
+import dev.vulture.pack.source.ShaderPackSource;
+import dev.vulture.pack.source.ShaderProperties;
+import dev.vulture.pack.target.SamplerPlan;
+import dev.vulture.pack.texture.PackTextures;
+import dev.vulture.pack.texture.RawImage;
+import dev.vulture.pack.texture.VolumeAtlas;
+import dev.vulture.render.pbr.PbrAtlases;
+import dev.vulture.uniform.NoiseTexture;
+
+import com.mojang.blaze3d.GpuFormat;
+import com.mojang.blaze3d.platform.NativeImage;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.texture.MissingTextureAtlasSprite;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.packs.resources.Resource;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * The textures a pack ships as files of its own, read and decoded once, ready to be uploaded.
+ * <p>
+ * Nothing here touches the device: it opens files, decodes images and lays volumes out flat, all of
+ * which happens while the client is still starting up. {@link ColorTargets} allocates and uploads
+ * what comes out of it, and answers for it at draw time. Keeping the two apart is what lets the
+ * reading be measured against the eight packs without starting a game, which is where the atlas was
+ * proved right texel by texel.
+ * <p>
+ * The game's API is named in {@link #gameResource} alone, because a pack may name a texture the
+ * game owns instead of shipping one; it is asked for defensively so that a measurement taken
+ * outside a client loses that texture rather than the whole reading.
+ * <p>
+ * A picture of the pack whose header the game's reader refuses never gets here:
+ * {@link PackTextures} drops it where the directive is read, name included, as Iris drops it, so the
+ * name keeps the binding it had. A declaration refused for anything else is kept and left with
+ * nothing behind it, a picture whose pixels fail to decode included.
+ * {@link PackTextures#suppliedTo} still carries the name, so the sampler reads one black pixel
+ * rather than falling back to the colour target it shares a name with: Complementary points
+ * {@code texture.deferred.colortex3} at a cloud and water lookup table, and a line of it this
+ * engine refused handing the name back would have its deferred read the scene as that table. A
+ * texture of the game that no loaded resource pack ships at all is bound live, as whatever the
+ * game holds under that name, which is how an atlas is served; one shipped in a form this cannot
+ * read reads the game's missing texture, as it does under Iris.
+ */
+final class PackImages {
+
+	/**
+	 * Past this the log says so once. Body Camera's lookup table alone reaches it: fifty nine
+	 * kilobytes in the zip, four thousand and ninety six square once decoded, sixty four megabytes
+	 * in memory. The ceiling on the file says nothing whatever about that.
+	 */
+	private static final long LOUD_BYTES = 32L * 1024L * 1024L;
+
+	/**
+	 * The most a resource of the game may hold before it is refused, which is the ceiling a file of
+	 * the pack gets as well: a pack naming a file the player's resource packs ship has chosen it as
+	 * directly as one it ships itself. What the decode costs past this is bounded by the dimensions
+	 * in the header rather than by the length, and {@link NoiseTexture} does that half.
+	 */
+	private static final int MAX_RESOURCE_BYTES = 8 * 1024 * 1024;
+
+	/**
+	 * One texture of the pack, decoded into the bytes that will be uploaded.
+	 *
+	 * @param pixels four channels a texel in the order the encoder wants them, which is the order
+	 *               {@link NoiseTexture} already produces for the noise image; a byte a channel for
+	 *               an image, and the blob's own channel type for a volume laid out flat. A PNG is
+	 *               read sample by sample as the file wrote it, a grey one replicated over red,
+	 *               green and blue rather than converted out of the grey colour space
+	 * @param format what the surface is allocated as, which is what the pixels are
+	 * @param shape  one clause for the log, saying what was read and how big it came out
+	 * @param live   whether this is no copy at all but a texture the GAME holds, looked up under the
+	 *               path the pack wrote every time a draw binds it: an atlas, which is stitched at
+	 *               runtime and is no file of any resource pack. Nothing is decoded, allocated or
+	 *               uploaded for one, so its sizes are nought and its pixels empty
+	 */
+	@SuppressWarnings("ArrayRecordComponent")
+	record Image(PackTexture texture, int width, int height, byte[] pixels, GpuFormat format,
+			String shape, boolean live) {
+
+		/** A copy this engine decoded and will upload, which is every image but the live ones. */
+		Image(PackTexture texture, int width, int height, byte[] pixels, GpuFormat format,
+				String shape) {
+			this(texture, width, height, pixels, format, shape, false);
+		}
+
+		long bytes() {
+			return this.pixels.length;
+		}
+	}
+
+	private final PackTextures declared;
+
+	/** In the order the pack declared them, which is the order the log reads best in. */
+	private final List<Image> images;
+
+	private final Map<PackTexture, Image> byTexture;
+
+	/** The volumes by the pack's own name, for a lookup that arrives under a forged one. */
+	private final Map<String, Image> volumes;
+
+	private final List<String> notes;
+
+	private PackImages(PackTextures declared, List<Image> images, Map<PackTexture, Image> byTexture,
+			Map<String, Image> volumes, List<String> notes) {
+		this.declared = declared;
+		this.images = List.copyOf(images);
+		this.byTexture = Map.copyOf(byTexture);
+		this.volumes = Map.copyOf(volumes);
+		this.notes = List.copyOf(notes);
+	}
+
+	/** What a pack declaring nothing comes to, and what stands in before one is read. */
+	static PackImages none() {
+		return new PackImages(PackTextures.empty(), List.of(), Map.of(), Map.of(), List.of());
+	}
+
+	/**
+	 * Reads every file the pack names, inside an opening the caller already holds.
+	 *
+	 * @param defines the settings as they stand, because two packs put a custom texture behind one
+	 */
+	static PackImages read(ShaderProperties properties, Map<String, String> defines,
+			ShaderPackSource source) throws IOException {
+		PackTextures declared = PackTextures.read(properties, defines, source);
+		Map<String, VolumeAtlas> flat = declared.volumes();
+		List<Image> images = new ArrayList<>();
+		Map<PackTexture, Image> byTexture = new LinkedHashMap<>();
+		Map<String, Image> volumes = new LinkedHashMap<>();
+		List<String> notes = new ArrayList<>(declared.notes());
+
+		declared.refused().forEach(refused -> notes.add("Dropped " + refused));
+
+		for (PackTexture texture : declared.supplied()) {
+			// The layout is this declaration's own, not the name's: iterationT points colortex8 at a
+			// volume for the sampler3D and at a PNG for the sampler2D, exactly as the reference
+			// files the two apart, and handing the atlas to the PNG would spread an image over
+			// nothing and leave six programs reading a lookup table.
+			VolumeAtlas atlas = texture.raw().filter(VolumeAtlas::serves).isPresent()
+					? flat.get(texture.sampler())
+					: null;
+
+			// The FIRST volume under that name is the one whose layout was printed into every
+			// shader, and PackTextures keeps the first too, so a second one is handed that same
+			// atlas rather than a second copy of it. A pack writing two files for one name on two
+			// stages would otherwise have the last file spread over the first one's tiles, and what
+			// comes out of that still looks like noise; writing the SAME file twice, which is what
+			// a directive per stage makes a pack do, spread iterationT's atmosphere table twice for
+			// one lookup.
+			Image already = atlas == null ? null : volumes.get(texture.sampler());
+			if (already != null) {
+				// The extents count as much as the path: the same file declared at two sizes is one
+				// of the two layouts printed into the shaders and one blob spread over the other's
+				// tiles, which comes out looking exactly like the noise it is not.
+				if (!already.texture().path().equals(texture.path())
+						|| !already.texture().raw().equals(texture.raw())) {
+					notes.add(texture.path() + " is a second volume under the name "
+							+ texture.sampler() + ", and the shaders read " + already.shape()
+							+ " of " + already.texture().path());
+				}
+
+				byTexture.put(texture, already);
+				continue;
+			}
+
+			Image image = decode(texture, atlas, source, notes);
+			if (image == null) {
+				continue;
+			}
+
+			images.add(image);
+			byTexture.put(texture, image);
+			if (atlas != null) {
+				volumes.put(texture.sampler(), image);
+			}
+		}
+
+		return new PackImages(declared, images, byTexture, volumes, notes);
+	}
+
+	/**
+	 * One texture, decoded. Null when it cannot be, with the reason in the notes, and the name then
+	 * reads black. The directive reading only checked a picture's header, so a PNG lands here when
+	 * its pixels do not decode, or when it is larger than this engine allocates for one.
+	 */
+	private static Image decode(PackTexture texture, VolumeAtlas atlas, ShaderPackSource source,
+			List<String> notes) {
+		if (texture.gameResource()) {
+			return gameResource(texture, notes);
+		}
+
+		Optional<Path> file = source.file(texture.path());
+		if (file.isEmpty()) {
+			// Looked for once already when the directive was read, so reaching this means the pack
+			// moved under us between the two openings.
+			notes.add(texture.path() + " is no longer in the pack, so " + texture.sampler()
+					+ " reads one black pixel");
+
+			return null;
+		}
+
+		try {
+			if (atlas != null) {
+				// Read to the length the declaration announces and no further, which is what lets a
+				// blob past the ceiling a shader source gets be read at all: iterationT's atmosphere
+				// table is four times that ceiling.
+				PackTexture.Raw raw = texture.raw().orElseThrow();
+
+				return new Image(texture, atlas.atlasWidth(), atlas.atlasHeight(),
+						atlas.spread(source.head(file.get(), raw.bytes())), format(atlas.type()),
+						raw.sizeX() + "x" + raw.sizeY() + "x" + raw.sizeZ() + " laid out flat as "
+								+ atlas.atlasWidth() + "x" + atlas.atlasHeight());
+			}
+
+			// A blob that is a plain two dimensional texture goes up as it stands, its channels
+			// widened to the four the engine allocates. Read to the declared length for the reason
+			// the atlas is: the ceiling above this was written for a shader source.
+			PackTexture.Raw plain = texture.raw().filter(RawImage::serves).orElse(null);
+			if (plain != null) {
+				RawImage image = RawImage.of(plain);
+
+				return new Image(texture, image.width(), image.height(),
+						image.widen(source.head(file.get(), plain.bytes())), format(image.type()),
+						image.width() + "x" + image.height());
+			}
+
+			// Any other blob means what its own format says it means, and nothing here turns one of
+			// those into an image: a shape that is neither a volume nor a plain texture, or either
+			// of those in a channel type or order nothing lays out. A one dimensional blob and a
+			// rectangle are read through samplers this backend does not bind; the corpus ships
+			// neither.
+			if (!texture.png()) {
+				PackTexture.Raw refused = texture.raw().orElseThrow();
+				notes.add(texture.path() + " is a raw " + refused.shape() + " of "
+						+ refused.pixelFormat() + " " + refused.pixelType()
+						+ ", which this engine does not lay out, so "
+						+ texture.sampler() + " reads one black pixel");
+
+				return null;
+			}
+
+			NoiseTexture.Image decoded = NoiseTexture.decode(source.bytes(file.get()));
+
+			return new Image(texture, decoded.width(), decoded.height(), decoded.rgba(), GpuFormat.RGBA8_UNORM,
+					decoded.width() + "x" + decoded.height());
+		} catch (NoiseTexture.TooLarge e) {
+			notes.add(texture.path() + " is refused, " + e.getMessage() + ", so " + texture.sampler()
+					+ " reads one black pixel");
+
+			return null;
+		} catch (IOException | RuntimeException e) {
+			notes.add(texture.path() + " could not be read: " + e.getMessage() + ", so "
+					+ texture.sampler() + " reads one black pixel");
+
+			return null;
+		}
+	}
+
+	/**
+	 * A texture the GAME owns, named by the pack as {@code namespace:path}: read out of the resource
+	 * packs the client has loaded where one of them ships a file under that name, and otherwise
+	 * bound live, as whatever the game holds under that name when a draw asks. Null only for a name
+	 * the client cannot be asked for at all. The reason is in the notes.
+	 * <p>
+	 * The one place in this class that names an API of the game, and it is asked defensively for
+	 * the reason the rest of the class avoids it: outside a running client there is no client to
+	 * ask, and reading a pack has to keep working there.
+	 * <p>
+	 * <strong>A name no file answers is bound live, and an ATLAS is why.</strong> An atlas is
+	 * stitched at runtime and is no file of any resource pack, so reading it out of one found
+	 * nothing, and the game's missing texture stood in for it. That checker is exactly what a pack
+	 * got back: Complementary Reimagined names {@code minecraft:textures/atlas/blocks.png}
+	 * ({@code shaders.properties:235}) for the blocks its world space reflections are coloured
+	 * with, and every block reflected off screen came out magenta and black. Iris asks the texture
+	 * manager at every bind ({@code pipeline/CustomTextureManager.java:156}), and a live image is
+	 * that same question, asked by {@link GameImages#held} as a draw binds it. What that answers
+	 * where the game holds nothing under the name is the game's missing texture, which is what
+	 * Iris binds then as well.
+	 * <p>
+	 * A file IS read once here, where Iris re-asks at every bind, so a resource pack swapped under a
+	 * running client is not followed until the shader pack is read again. One case Iris serves
+	 * this cannot, named rather than given something plausible: a normal or specular map reached
+	 * from a texture NAME, which is a different door from the one {@link PbrAtlases} opens. The maps
+	 * that follow the atlases are built there, off the sprites the game stitched, where this method
+	 * is asked for a path a pack wrote in its own properties.
+	 */
+	private static Image gameResource(PackTexture texture, List<String> notes) {
+		String path = texture.path();
+		Identifier location = location(path);
+		Minecraft client = Minecraft.getInstance();
+		if (location == null || client == null) {
+			notes.add(path + " is not a resource this client can be asked for, so "
+					+ texture.sampler() + " reads one black pixel");
+
+			return null;
+		}
+
+		Optional<Resource> resource = client.getResourceManager().getResource(location);
+		if (resource.isEmpty()) {
+			notes.add(path + " is no file any loaded resource pack ships, so " + texture.sampler()
+					+ " reads the texture the game holds under that name as each draw binds it,"
+					+ " which is how an atlas is served, and the game's missing texture while it"
+					+ " holds none");
+
+			return new Image(texture, 0, 0, new byte[0], GpuFormat.RGBA8_UNORM,
+					"the game's own texture, looked up at every bind", true);
+		}
+
+		try (InputStream stream = resource.get().open()) {
+			byte[] bytes = stream.readNBytes(MAX_RESOURCE_BYTES + 1);
+			if (bytes.length > MAX_RESOURCE_BYTES) {
+				return missing(texture, notes, path + " holds more than the " + MAX_RESOURCE_BYTES
+						+ " bytes a texture is read under");
+			}
+
+			NoiseTexture.Image decoded = NoiseTexture.decode(bytes);
+
+			return new Image(texture, decoded.width(), decoded.height(), decoded.rgba(), GpuFormat.RGBA8_UNORM,
+					decoded.width() + "x" + decoded.height());
+		} catch (IOException | RuntimeException e) {
+			return missing(texture, notes, path + " could not be read: " + e.getMessage());
+		}
+	}
+
+	/**
+	 * The identifier a pack's {@code namespace:path} names, or null where it names none.
+	 * <p>
+	 * Split rather than cut at the first colon: a name carrying more than one keeps its first two
+	 * parts and drops the rest, which is what Iris makes of such a name. Limit 0, the one-argument
+	 * reading. It matters which one: tryBuild accepts an empty path, so a name written
+	 * {@code minecraft:} would build an identifier under any limit that kept the empty term, and the
+	 * missing texture would be served for a name this client cannot be asked for, which reads black.
+	 */
+	static Identifier location(String path) {
+		String[] parts = path.split(":", 0);
+
+		return parts.length < 2 ? null : Identifier.tryBuild(parts[0], parts[1]);
+	}
+
+	/** The game's own missing texture, for a resource it could not hand over. */
+	private static Image missing(PackTexture texture, List<String> notes, String reason) {
+		notes.add(reason + ", so " + texture.sampler() + " reads the game's missing texture");
+
+		try (NativeImage image = MissingTextureAtlasSprite.generateMissingImage()) {
+			int[] texels = image.getPixelsABGR();
+			byte[] rgba = new byte[texels.length * 4];
+			for (int at = 0; at < texels.length; at++) {
+				rgba[at * 4] = (byte) texels[at];
+				rgba[at * 4 + 1] = (byte) (texels[at] >> 8);
+				rgba[at * 4 + 2] = (byte) (texels[at] >> 16);
+				rgba[at * 4 + 3] = (byte) (texels[at] >>> 24);
+			}
+
+			return new Image(texture, image.getWidth(), image.getHeight(), rgba, GpuFormat.RGBA8_UNORM,
+					image.getWidth() + "x" + image.getHeight() + " missing texture");
+		}
+	}
+
+	/** Every image that was read, in the order the pack declared them. */
+	List<Image> images() {
+		return this.images;
+	}
+
+	/**
+	 * Which image a sampler reads, or null when the pack takes the name over and nothing could be
+	 * put behind it.
+	 * <p>
+	 * A forged name is answered without consulting the stage, and that is the one place the stage is
+	 * ignored on purpose. The translation moves a volume's declaration in every program that carries
+	 * it, whatever stage the directive named, because the declaration is what the backend refuses;
+	 * the same file therefore has to answer wherever that declaration ended up. It invents nothing:
+	 * the pack named exactly one file for that identifier.
+	 */
+	Image find(TextureStage stage, String sampler) {
+		String name = SamplerPlan.behind(sampler);
+		if (!name.equals(sampler)) {
+			return this.volumes.get(name);
+		}
+
+		// No stage means a program no family claims, which is a program nothing runs. Answered
+		// rather than looked up: a stage override is written for one of the seven and there is no
+		// honest way to guess which one an eighth would have been.
+		return stage == null
+				? null
+				: this.declared.resolve(stage, name).map(this.byTexture::get).orElse(null);
+	}
+
+	/** One line per declaration this engine could not honour. Said once, when the pack is read. */
+	List<String> notes() {
+		return this.notes;
+	}
+
+	/**
+	 * What the log says about a texture that IS served, once it is known how big it came out.
+	 * <p>
+	 * A volume says where its addressing is done, because that is the one thing a reader could not
+	 * work out from the sampler: the atlas itself is bound clamped, and the repeat or the clamp the
+	 * pack asked for lives in the helper the translation printed.
+	 */
+	static String describe(Image image) {
+		PackTexture texture = image.texture();
+		boolean flat = texture.raw()
+				.filter(raw -> raw.shape() == PackTexture.Shape.TEXTURE_3D)
+				.isPresent();
+
+		return texture.stage().map(stage -> stage.name().toLowerCase(Locale.ROOT))
+				.orElse("every stage") + " " + texture.sampler() + " reads " + texture.path()
+				+ ", " + image.shape() + ", " + (texture.blur() ? "linear" : "nearest") + " and "
+				+ (texture.clamp() ? "clamped" : "repeating")
+				+ (flat ? ", the " + (texture.clamp() ? "clamp" : "repeat") + " done by the shader"
+						: "");
+	}
+
+	/**
+	 * What a blob is allocated as, flattened volume and plain texture alike: four channels of its
+	 * own type, so that the bytes go up as the file holds them.
+	 * <p>
+	 * The channel type decides and the internal format the declaration names does not, which is a
+	 * divergence from GL where the two disagree: GL stores what the declaration says and converts
+	 * the bytes on the way in, so a half float uploaded into a normalised sixteen bit format lands
+	 * clamped to one, where here it keeps its value. Every volume of the corpus declares the format
+	 * its bytes are in, so nothing draws differently for it today, and a pack that disagrees gets
+	 * its bytes unconverted rather than a conversion written for a case nothing exercises.
+	 */
+	private static GpuFormat format(PixelType type) {
+		return switch (type) {
+			case UNSIGNED_BYTE -> GpuFormat.RGBA8_UNORM;
+			case UNSIGNED_SHORT -> GpuFormat.RGBA16_UNORM;
+			case HALF_FLOAT -> GpuFormat.RGBA16_FLOAT;
+			case FLOAT -> GpuFormat.RGBA32_FLOAT;
+			default -> throw new IllegalStateException(type + " is not a type a blob goes up in");
+		};
+	}
+
+	/**
+	 * What the whole set costs once uploaded, which is not what it costs on disk and is the only one
+	 * of the two worth watching. Body Camera ships a 59 kilobyte lookup table that decodes to
+	 * 4096 by 4096, sixty four megabytes, and the ceiling on the file says nothing about that.
+	 */
+	long bytes() {
+		long total = 0L;
+		for (Image image : this.images) {
+			total += image.bytes();
+		}
+
+		return total;
+	}
+
+	/** Whether the set is heavy enough to be worth a line of its own in the log. */
+	boolean loud() {
+		return bytes() > LOUD_BYTES;
+	}
+}

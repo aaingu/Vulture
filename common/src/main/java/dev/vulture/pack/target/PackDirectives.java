@@ -1,0 +1,625 @@
+package dev.vulture.pack.target;
+
+import dev.vulture.pack.model.TargetFormat;
+import dev.vulture.pack.option.SettingSet;
+import dev.vulture.pack.model.ProgramNames;
+import dev.vulture.pack.program.ProgramSet;
+import dev.vulture.pack.source.DimensionSet;
+import dev.vulture.pack.source.IncludeExpander;
+import dev.vulture.pack.source.ShaderPackSource;
+
+import dev.vulture.pack.source.IncludeExpander.ExpandedUnit;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+
+/**
+ * The settings a pack declares about itself, gathered from the {@code const} lines of every one of
+ * its programs.
+ * <p>
+ * {@link ConstDirectives} reads the lines of one unit and knows no names; {@link TargetDirectives}
+ * turns them into colour targets. Neither of them carries the handful of directives that are about
+ * the pack as a whole rather than about a buffer: how fast the ground dries, how big the noise
+ * image is, how far the shadow map reaches. Those are read here, over the whole dimension, in the
+ * order Iris folds them in, and <strong>the last live declaration wins</strong>: a pack that
+ * declares one value per setting has several declarations of the same name in its text and only
+ * one of them means anything.
+ * <p>
+ * A directive that fails to parse is dropped rather than defaulted loudly, which is Iris's
+ * behaviour and therefore the packs': they ship lines like {@code const float shadowDistance =
+ * SHADOW_DISTANCE;} behind a setting that was never expanded.
+ * <p>
+ * One directive of Iris's list is missing and it is deliberate: {@code SHADOWHPL}, the older
+ * spelling of {@code shadowDistance}, is a comment directive rather than a {@code const} one and
+ * needs a second grammar. No pack of the corpus writes it.
+ */
+public final class PackDirectives {
+
+	/** The name a pack declares to be given the eight, in Iris's own spelling. */
+	public static final String HIGHER_SHADOWCOLOR = "HIGHER_SHADOWCOLOR";
+
+	/**
+	 * How many {@code shadowcolor} buffers a pack that declares {@link #HIGHER_SHADOWCOLOR} may
+	 * name ({@code shaderpack/properties/PackShadowDirectives.java:19}).
+	 * <p>
+	 * It is what a name is admitted against and not what is allocated: {@code render/ShadowTargets}
+	 * takes the memory for a buffer some program of the place writes or samples, and for no other.
+	 */
+	public static final int MAX_SHADOW_COLOURS = 8;
+
+	/**
+	 * How many a pack that does not declare it may name, the two of ShadersMod and OptiFine
+	 * ({@code shaderpack/properties/PackShadowDirectives.java:20}).
+	 * <p>
+	 * <strong>The lower number is the one most packs get, and posing the define does not raise
+	 * it.</strong> Iris sizes the array off the pack's own declaration and off nothing else
+	 * ({@code shadows/ShadowRenderTargets.java:46} asking {@code hasFeature}, which is the two
+	 * {@code iris.features} lines and no more, {@code shaderpack/ShaderPack.java:208-213}), so a
+	 * pack that never asked for the eight has to keep reaching the same two: its
+	 * {@code RENDERTARGETS:0,2} is a list past the ceiling, thrown away whole, and what it draws
+	 * into is the pair.
+	 */
+	public static final int SHADOW_COLOURS = 2;
+
+	/** The ceiling one pack is read against, which is one of the two above and nothing between. */
+	public static int shadowColours(boolean declared) {
+		return declared ? MAX_SHADOW_COLOURS : SHADOW_COLOURS;
+	}
+
+	private final float sunPathRotation;
+	private final float ambientOcclusionLevel;
+	private final float wetnessHalflife;
+	private final float eyeBrightnessHalflife;
+	private final float centerDepthHalflife;
+	private final int noiseTextureResolution;
+	private final int shadowMapResolution;
+	private final float shadowDistance;
+	private final float shadowDistanceRenderMul;
+	private final boolean forcesShadowRenderDistance;
+	private final float voxelDistance;
+	private final float entityShadowDistanceMul;
+	private final float shadowNearPlane;
+	private final float shadowFarPlane;
+	private final float shadowIntervalSize;
+	private final Map<Integer, ShadowColour> shadowColours;
+	private final List<ShadowDepth> shadowDepths;
+
+	/**
+	 * What one {@code shadowcolor} buffer asks for: the format to allocate it in, whether the shadow
+	 * stage empties it at the top of every frame, and the colour it holds where nothing wrote it.
+	 * <p>
+	 * The defaults are Iris's {@code PackShadowDirectives.SamplingSettings}: RGBA8, cleared, white.
+	 * White and not black, and it is the value a pack reads as "the shadow stage put nothing here",
+	 * which is why a coloured shadow multiplies by it.
+	 * <p>
+	 * The clear colour matters even when {@code clear} is false, as Iris says on the same line: it is
+	 * then what the buffer starts its life holding rather than what it returns to every frame.
+	 *
+	 * @param declaresClearColour whether the colour is the pack's own or the default above. Read for
+	 *                            the same reason {@link TargetDirectives#declaresClearColour(int)}
+	 *                            is: a promoted format has its default alpha corrected to one, and
+	 *                            that correction must not reach over a colour the pack wrote itself
+	 */
+	public record ShadowColour(TargetFormat.Resolution format, boolean clear,
+			TargetDirectives.Colour clearColour, boolean declaresClearColour) {
+	}
+
+	/**
+	 * What one depth image of the map asks for: how it is filtered, and whether it carries a mip
+	 * chain. {@code shadowtex0} at nought and {@code shadowtex1} at one, which is the pair Iris
+	 * carries ({@code shaderpack/properties/PackShadowDirectives.java:97}).
+	 * <p>
+	 * Both start false, which is where Iris starts too, and neither is the whole corpus: Pegasus
+	 * asks for NEAREST on both images and iterationT asks for a chain on nought.
+	 */
+	public record ShadowDepth(boolean nearest, boolean mipmap) {
+	}
+
+	private PackDirectives(Builder builder) {
+		this.sunPathRotation = builder.sunPathRotation;
+		this.ambientOcclusionLevel = builder.ambientOcclusionLevel;
+		this.wetnessHalflife = builder.wetnessHalflife;
+		this.eyeBrightnessHalflife = builder.eyeBrightnessHalflife;
+		this.centerDepthHalflife = builder.centerDepthHalflife;
+		this.noiseTextureResolution = builder.noiseTextureResolution;
+		this.shadowMapResolution = builder.shadowMapResolution;
+		this.shadowDistance = builder.shadowDistance;
+		this.shadowDistanceRenderMul = builder.shadowDistanceRenderMul;
+		this.forcesShadowRenderDistance = builder.forcesShadowRenderDistance;
+		this.voxelDistance = builder.voxelDistance;
+		this.entityShadowDistanceMul = builder.entityShadowDistanceMul;
+		this.shadowNearPlane = builder.shadowNearPlane;
+		this.shadowFarPlane = builder.shadowFarPlane;
+		this.shadowIntervalSize = builder.shadowIntervalSize;
+
+		Map<Integer, ShadowColour> colours = new TreeMap<>();
+		builder.shadowColours.forEach((index, setting) -> colours.put(index, setting.build()));
+		this.shadowColours = Collections.unmodifiableMap(colours);
+		this.shadowDepths = List.of(
+				new ShadowDepth(builder.depthNearest[0], builder.depthMipmap[0]),
+				new ShadowDepth(builder.depthNearest[1], builder.depthMipmap[1]));
+	}
+
+	/** What a pack that declares nothing gets, which is what most of the corpus gets. */
+	public static PackDirectives defaults() {
+		return builder().build();
+	}
+
+	public static Builder builder() {
+		return new Builder();
+	}
+
+	/**
+	 * Reads every fragment entry point of one dimension. A dimension directory replaces the root
+	 * rather than being layered over it, exactly as {@link TargetPlan} reads it, and on the same
+	 * condition: the directory has to EXIST, and an empty one is read as empty rather than sending
+	 * the read back to the root.
+	 */
+	public static PackDirectives read(ShaderPackSource source, SettingSet settings, String dimension)
+			throws IOException {
+		ProgramSet programs = ProgramSet.enumerate(source, DimensionSet.discover(source));
+		boolean present = !dimension.equals(ProgramSet.ROOT)
+				&& source.topLevelDirectories().contains(dimension);
+		List<ProgramSet.ProgramKey> entries =
+				programs.fragmentsOf(present ? dimension : ProgramSet.ROOT);
+
+		IncludeExpander expander = new IncludeExpander(source, settings);
+		Builder builder = builder();
+
+		for (ProgramSet.ProgramKey key : ProgramSet.sorted(entries, ProgramNames::directiveRank)) {
+			Optional<Path> file = source.file(key.file());
+			if (file.isEmpty()) {
+				continue;
+			}
+
+			try {
+				builder.accept(expander.expand(file.get()));
+			} catch (IOException | RuntimeException e) {
+				// One unreadable composite must not cost the pack every other setting it declares.
+			}
+		}
+
+		return builder.build();
+	}
+
+	public float sunPathRotation() {
+		return this.sunPathRotation;
+	}
+
+	public float ambientOcclusionLevel() {
+		return this.ambientOcclusionLevel;
+	}
+
+	/** The rise of {@code wetness}, in deciseconds. Both halflife directives land here. */
+	public float wetnessHalflife() {
+		return this.wetnessHalflife;
+	}
+
+	/**
+	 * The fall of {@code wetness}, which is always 200 deciseconds.
+	 * <p>
+	 * Iris holds it in a final field that neither directive reaches: both {@code wetnessHalflife}
+	 * and {@code drynessHalflife} are registered against the rise, so no pack can change the fall,
+	 * and packs are written against that. Reading the pack's own {@code drynessHalflife} here
+	 * instead would be more sensible and would change the look of the three packs of the corpus that
+	 * declare one, in OPPOSITE directions: BSL asks for 5 against this 200, both Complementary for
+	 * 300. See {@link dev.vulture.uniform.WorldState#drynessHalfLife()}, which carries the measure.
+	 */
+	public float drynessHalflife() {
+		return Builder.DRYNESS_HALFLIFE;
+	}
+
+	public float eyeBrightnessHalflife() {
+		return this.eyeBrightnessHalflife;
+	}
+
+	public float centerDepthHalflife() {
+		return this.centerDepthHalflife;
+	}
+
+	/**
+	 * How wide a noise image the pack asked for, square, 256 unless it says otherwise, and never
+	 * more than this engine will build. The same number reaches the texture and the uniform the
+	 * shader indexes it with, so the cap has to be applied once, here, rather than at either end.
+	 */
+	public int noiseTextureResolution() {
+		return this.noiseTextureResolution;
+	}
+
+	/**
+	 * How wide the shadow map is, in texels, square. The pack's own number and the one thing about
+	 * the shadow stage it cannot be given a default for without changing what it draws: the whole
+	 * corpus tunes its filter radius in texels of this resolution.
+	 */
+	public int shadowMapResolution() {
+		return this.shadowMapResolution;
+	}
+
+	public float shadowDistance() {
+		return this.shadowDistance;
+	}
+
+	/**
+	 * What the pack multiplies {@link #shadowDistance()} by to get how far the light still gathers
+	 * geometry, which is a different question from how far its projection reaches: the projection is
+	 * the half plane above, and this bounds the WALK that fills it.
+	 * <p>
+	 * Minus one unless the pack declares it, and a negative value is not a distance at all: it is the
+	 * pack saying it has no opinion, and the player's own setting decides instead
+	 * ({@code shadows/ShadowRenderer.java:336-339}, the {@code renderMultiplier < 0} branch). Read
+	 * beside {@link #forcesShadowRenderDistance()}, which is what tells a declared minus one from a
+	 * pack that never wrote the line.
+	 */
+	public float shadowDistanceRenderMul() {
+		return this.shadowDistanceRenderMul;
+	}
+
+	/**
+	 * Whether the pack really declared {@code shadowDistanceRenderMul} with a value it means, which
+	 * is what takes the choice away from the player.
+	 * <p>
+	 * Both halves are needed, exactly as Iris asks them
+	 * ({@code pipeline/IrisRenderingPipeline.java:285-295}): the line has to have been written AND
+	 * to carry a value that is not negative. A pack that writes a negative one has declared that it
+	 * wants the player's setting, so it forces nothing.
+	 */
+	public boolean forcesShadowRenderDistance() {
+		return this.forcesShadowRenderDistance && this.shadowDistanceRenderMul >= 0.0F;
+	}
+
+	/**
+	 * How far out the pack's own voxel grid reaches, nought unless it says otherwise, and read for
+	 * the one state that needs it: a pack asking for {@code shadow.culling=safe_zone} keeps everything
+	 * within this distance whatever the light's own frustum says of it
+	 * ({@code shaderpack/properties/PackShadowDirectives.java:66,311}).
+	 */
+	public float voxelDistance() {
+		return this.voxelDistance;
+	}
+
+	/**
+	 * How much shorter the light reaches for the casters that MOVE than for the world, one unless the
+	 * pack says otherwise.
+	 * <p>
+	 * A multiplier of the shadow distance and not a distance of its own, which is how Iris reads it
+	 * ({@code shaderpack/properties/PackShadowDirectives.java:79,313}). One and any negative value
+	 * mean the same thing there and here: the casters are measured against the light exactly as the
+	 * world is, with no second bound ({@code shadows/ShadowRenderer.java:536-541}). Four packs of the
+	 * eight tested write it, two of them behind a slider of their own.
+	 */
+	public float entityShadowDistanceMul() {
+		return this.entityShadowDistanceMul;
+	}
+
+	public float shadowNearPlane() {
+		return this.shadowNearPlane;
+	}
+
+	public float shadowFarPlane() {
+		return this.shadowFarPlane;
+	}
+
+	public float shadowIntervalSize() {
+		return this.shadowIntervalSize;
+	}
+
+	/**
+	 * What one {@code shadowcolor} buffer asks for, its defaults when the pack said nothing about it.
+	 * Two packs of the corpus say something: Mellow asks for R8 and for its buffer not to be emptied,
+	 * Reverie asks for opaque black on nought and declares two more buffers besides.
+	 */
+	public ShadowColour shadowColour(int index) {
+		ShadowColour declared = this.shadowColours.get(index);
+
+		return declared == null ? Builder.SHADOW_COLOUR_DEFAULT : declared;
+	}
+
+	/** Which {@code shadowcolor} buffers the pack named at all, which is not which ones exist. */
+	public Set<Integer> shadowColoursDeclared() {
+		return this.shadowColours.keySet();
+	}
+
+	/**
+	 * How the pack asks for one of the two depth images of the map to be read back: the filter, and
+	 * whether it carries a mip chain. {@code shadowtex0} at nought and {@code shadowtex1} at one,
+	 * which is the pair Iris carries
+	 * ({@code shaderpack/properties/PackShadowDirectives.java:147-198}).
+	 * <p>
+	 * Both false is where the two engines start, and it is not where the whole corpus stays:
+	 * Pegasus asks for NEAREST on both images, iterationT asks for a chain on nought. Several other
+	 * packs carry the names too, set to false, or inside a block comment, which is why the corpus
+	 * is asked through the reader and never through a grep:
+	 * {@code .local/harness/ShadowSampling} answers it in one command.
+	 * <p>
+	 * The colour buffers have the same two families of names and neither is read, deliberately,
+	 * because <strong>Iris parses both and then binds every {@code shadowcolor} through
+	 * {@code GlSampler.LINEAR} regardless</strong> ({@code samplers/IrisSamplers.java:156-176}). A
+	 * GL sampler object overrules the texture's own parameters, and that one's minification filter
+	 * is plain {@code GL_LINEAR}, which selects the base level whatever level of detail a lookup
+	 * asks for. Iris does still fill a chain on a shadow colour buffer, and on {@code shadowcolor0}
+	 * alone: it settles its samplers once, in the shadow renderer's constructor, and only the
+	 * buffers that exist by then are walked, the rest being built when a framebuffer or a sampler
+	 * first names them ({@code shadows/ShadowRenderer.java:238-244,280-293}, against
+	 * {@code shadows/ShadowRenderTargets.java:73,127}). Filled or not, none of it is reachable: a
+	 * pack reading {@code shadowcolor0} at a lod gets level nought there, and serving it a coarser
+	 * level here would be a divergence on the one buffer where a pack blurs light across a
+	 * penumbra. OptiFine does honour them, and that is not the engine these packs are tuned
+	 * against.
+	 */
+	public ShadowDepth shadowDepth(int index) {
+		return index >= 0 && index < this.shadowDepths.size()
+				? this.shadowDepths.get(index)
+				: new ShadowDepth(false, false);
+	}
+
+	/** Whether the pack asked for NEAREST on one depth image. See {@link #shadowDepth(int)}. */
+	public boolean shadowDepthNearest(int index) {
+		return shadowDepth(index).nearest();
+	}
+
+	/** Whether the pack asked for a mip chain on one depth image. See {@link #shadowDepth(int)}. */
+	public boolean shadowDepthMipmap(int index) {
+		return shadowDepth(index).mipmap();
+	}
+
+	public static final class Builder {
+
+		private static final float DRYNESS_HALFLIFE = 200.0F;
+
+		/**
+		 * How wide a noise image this engine will build. The field is generated in full on the heap
+		 * and uploaded through a direct buffer of the same length, so the number squares twice:
+		 * 16384 is two allocations of a gibibyte, taken outside any catch since the upload hangs off
+		 * a clear. Clamped rather than refused, like the shadow map, and here rather than at the
+		 * texture, so that the image and the {@code noiseTextureResolution} the shader is handed
+		 * cannot disagree. The corpus asks for between 32 and 512.
+		 */
+		private static final int MAX_NOISE_RESOLUTION = 4096;
+
+		private static final String SHADOW_COLOUR = "shadowcolor";
+
+		/** {@code shadowtex0} and {@code shadowtex1}, the two depth names OptiFine's model has. */
+		private static final int SHADOW_DEPTHS = 2;
+
+		private final boolean[] depthNearest = new boolean[SHADOW_DEPTHS];
+		private final boolean[] depthMipmap = new boolean[SHADOW_DEPTHS];
+
+		private static final ShadowColour SHADOW_COLOUR_DEFAULT = new ShadowColour(
+				TargetFormat.defaultFormat(), true, new TargetDirectives.Colour(1.0F, 1.0F, 1.0F, 1.0F),
+				false);
+
+		private final Map<Integer, ShadowSetting> shadowColours = new TreeMap<>();
+
+		private float sunPathRotation;
+		private float ambientOcclusionLevel = 1.0F;
+		private float wetnessHalflife = 600.0F;
+		private float eyeBrightnessHalflife = 10.0F;
+		private float centerDepthHalflife = 1.0F;
+		private int noiseTextureResolution = 256;
+		private int shadowMapResolution = 1024;
+		private float shadowDistance = 160.0F;
+		private float shadowDistanceRenderMul = -1.0F;
+		private boolean forcesShadowRenderDistance;
+		private float voxelDistance;
+		private float entityShadowDistanceMul = 1.0F;
+		private float shadowNearPlane = -100.05F;
+		private float shadowFarPlane = 156.0F;
+		private float shadowIntervalSize = 2.0F;
+
+		private Builder() {
+		}
+
+		/** Folds one program's live declarations in. Call order is the precedence order. */
+		public Builder accept(ExpandedUnit unit) {
+			for (ConstDirectives.Directive directive : ConstDirectives.read(unit)) {
+				apply(directive);
+			}
+
+			return this;
+		}
+
+		public PackDirectives build() {
+			return new PackDirectives(this);
+		}
+
+		private void apply(ConstDirectives.Directive directive) {
+			switch (directive.name()) {
+				case "sunPathRotation" -> asFloat(directive, value -> this.sunPathRotation = value);
+				case "ambientOcclusionLevel" -> asFloat(directive,
+						value -> this.ambientOcclusionLevel = Math.clamp(value, 0.0F, 1.0F));
+				case "wetnessHalflife" -> asFloat(directive, value -> this.wetnessHalflife = value);
+				// Not a typo and not ours. Iris registers the dryness directive against the rise as
+				// well, so the two names are one setting and the last one read wins. Reproduced
+				// rather than fixed, because correcting it would make our image diverge from the
+				// reference the packs were tuned against.
+				case "drynessHalflife" -> asFloat(directive, value -> this.wetnessHalflife = value);
+				case "eyeBrightnessHalflife" -> asFloat(directive, value -> this.eyeBrightnessHalflife = value);
+				case "centerDepthHalflife" -> asFloat(directive, value -> this.centerDepthHalflife = value);
+				case "noiseTextureResolution" -> asInt(directive,
+						value -> this.noiseTextureResolution = Math.clamp(value, 1, MAX_NOISE_RESOLUTION));
+				case "shadowMapResolution" -> asInt(directive, value -> this.shadowMapResolution = value);
+				case "shadowDistance" -> asFloat(directive, value -> this.shadowDistance = value);
+				// The flag is raised inside the setter and not beside it, so that it follows the
+				// value: a line whose type or number does not parse is dropped without a word here
+				// as it is in Iris, and dropped means the pack never said anything at all.
+				case "shadowDistanceRenderMul" -> asFloat(directive, value -> {
+					this.shadowDistanceRenderMul = value;
+					this.forcesShadowRenderDistance = true;
+				});
+				case "voxelDistance" -> asFloat(directive, value -> this.voxelDistance = value);
+				case "entityShadowDistanceMul" -> asFloat(directive,
+						value -> this.entityShadowDistanceMul = value);
+				case "shadowNearPlane" -> asFloat(directive, value -> this.shadowNearPlane = value);
+				case "shadowFarPlane" -> asFloat(directive, value -> this.shadowFarPlane = value);
+				case "shadowIntervalSize" -> asFloat(directive, value -> this.shadowIntervalSize = value);
+				// How the depth pair is read back. The family is folded in text order like everything
+				// else here: Iris registers one consumer per name and then walks the declarations of
+				// every fragment stage in order, so a per-image spelling wins over the blanket one
+				// only by standing after it ({@code shaderpack/programs/ProgramSet.java:255-268}).
+				//
+				// shadowtexNearest is the older spelling of shadowtex0Nearest and has no shadowtex1
+				// equivalent, which is Iris's shape as well: it hands the name to the first sampler
+				// of the list ({@code shaderpack/properties/PackShadowDirectives.java:185-187}).
+				case "shadowtexNearest", "shadowtex0Nearest", "shadow0MinMagNearest" ->
+						asBool(directive, value -> this.depthNearest[0] = value);
+				case "shadowtex1Nearest", "shadow1MinMagNearest" ->
+						asBool(directive, value -> this.depthNearest[1] = value);
+				// Whether the map carries a chain, folded the same way and with the same shape of
+				// spellings: generateShadowMipmap covers both images at once where the per-image
+				// names cover one, and shadowtexMipmap is the older spelling of shadowtex0Mipmap
+				// with no shadowtex1 equivalent (PackShadowDirectives.java:147-168). The blanket
+				// name wins or loses on where it stands and not on being the blanket, which is
+				// Iris's own shape: it registers one consumer per name and walks the declarations
+				// in text order.
+				case "generateShadowMipmap" -> asBool(directive, value -> {
+					this.depthMipmap[0] = value;
+					this.depthMipmap[1] = value;
+				});
+				case "shadowtexMipmap", "shadowtex0Mipmap" ->
+						asBool(directive, value -> this.depthMipmap[0] = value);
+				case "shadowtex1Mipmap" -> asBool(directive, value -> this.depthMipmap[1] = value);
+				default -> shadowColour(directive);
+			}
+		}
+
+		/**
+		 * {@code shadowcolorNFormat}, {@code shadowcolorNClear} and {@code shadowcolorNClearColor}.
+		 * <p>
+		 * The same three suffixes the colour targets take, with the same types and the same grammar,
+		 * on a different family of buffers. Read here rather than in {@link TargetDirectives} for one
+		 * reason and it is not tidiness: that class keys everything by a colortex index, and a shadow
+		 * buffer folded into that space would have {@code shadowcolor0Format} decide the format of
+		 * colortex0.
+		 */
+		private void shadowColour(ConstDirectives.Directive directive) {
+			String name = directive.name();
+			if (!name.startsWith(SHADOW_COLOUR)) {
+				return;
+			}
+
+			int cursor = SHADOW_COLOUR.length();
+			while (cursor < name.length() && Character.isDigit(name.charAt(cursor))) {
+				cursor++;
+			}
+
+			int digits = cursor - SHADOW_COLOUR.length();
+			if (digits < 1 || digits > 2 || cursor == name.length()) {
+				return;
+			}
+
+			int index = Integer.parseInt(name.substring(SHADOW_COLOUR.length(), cursor));
+			String suffix = name.substring(cursor);
+			String type = directive.type();
+			String value = directive.value().trim();
+
+			// The declared type is checked on every one of them, as it is on the colour targets and
+			// for the same reason: Iris ignores a directive written under the wrong type, so a pack
+			// neither of us has seen has to be ignored here too.
+			switch (suffix) {
+				case "Format" -> {
+					if (type.equals("int")) {
+						setting(index).format = TargetFormat.resolve(value);
+					}
+				}
+				case "Clear" -> {
+					if (type.equals("bool") && (value.equals("true") || value.equals("false"))) {
+						setting(index).clear = value.equals("true");
+					}
+				}
+				case "ClearColor" -> {
+					if (type.equals("vec4")) {
+						TargetDirectives.parseColour(value)
+								.ifPresent(colour -> setting(index).clearColour = colour);
+					}
+				}
+				default -> {
+				}
+			}
+		}
+
+		private ShadowSetting setting(int index) {
+			return this.shadowColours.computeIfAbsent(index, _ -> new ShadowSetting());
+		}
+
+		private static void asFloat(ConstDirectives.Directive directive, FloatSetter setter) {
+			if (!directive.type().equals("float")) {
+				return;
+			}
+
+			// A pack writes 2.0f as often as 2.0, and Float.parseFloat takes both; what it also
+			// takes is a bare name, which is why the type is checked first and the failure is
+			// silent afterwards.
+			try {
+				setter.set(Float.parseFloat(directive.value().trim().toLowerCase(Locale.ROOT)));
+			} catch (NumberFormatException e) {
+				// A directive left standing behind a setting nobody expanded. Iris drops it too.
+			}
+		}
+
+		private static void asInt(ConstDirectives.Directive directive, IntSetter setter) {
+			if (!directive.type().equals("int")) {
+				return;
+			}
+
+			try {
+				setter.set(Integer.parseInt(directive.value().trim()));
+			} catch (NumberFormatException e) {
+				// As above.
+			}
+		}
+
+		/**
+		 * A {@code const bool} and nothing else. Anything but the two words is dropped without a
+		 * default, which is what Iris does with it as well: its boolean dispatch takes {@code true}
+		 * and {@code false} and leaves the setting where it stood otherwise.
+		 */
+		private static void asBool(ConstDirectives.Directive directive, BooleanSetter setter) {
+			if (!directive.type().equals("bool")) {
+				return;
+			}
+
+			String value = directive.value().trim();
+			if (value.equals("true") || value.equals("false")) {
+				setter.set(value.equals("true"));
+			}
+		}
+
+		/** One buffer's three answers while they are still being folded, any of them still unsaid. */
+		private static final class ShadowSetting {
+
+			private TargetFormat.Resolution format;
+			private Boolean clear;
+			private TargetDirectives.Colour clearColour;
+
+			private ShadowColour build() {
+				return new ShadowColour(
+						this.format == null ? SHADOW_COLOUR_DEFAULT.format() : this.format,
+						this.clear == null ? SHADOW_COLOUR_DEFAULT.clear() : this.clear,
+						this.clearColour == null ? SHADOW_COLOUR_DEFAULT.clearColour() : this.clearColour,
+						this.clearColour != null);
+			}
+		}
+
+		@FunctionalInterface
+		private interface FloatSetter {
+			void set(float value);
+		}
+
+		@FunctionalInterface
+		private interface BooleanSetter {
+			void set(boolean value);
+		}
+
+		@FunctionalInterface
+		private interface IntSetter {
+			void set(int value);
+		}
+	}
+}

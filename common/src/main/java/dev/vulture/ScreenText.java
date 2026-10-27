@@ -1,0 +1,308 @@
+package dev.vulture;
+
+import net.minecraft.network.chat.CommonComponents;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+
+/**
+ * Our own strings, and the one rule about text every widget follows.
+ * <p>
+ * The keys are gathered here rather than written where they are used, so that this list and
+ * {@code assets/vulture/lang/en_us.json} cannot drift apart: the list is the file. The ones taking an
+ * argument say so next to each. A label the game already ships translated is not repeated here: Done,
+ * Cancel, Back, On and Off come from {@link CommonComponents}, so they read in the player's language
+ * on a client we have no translation for.
+ * <p>
+ * <b>The English is Iris's, word for word, wherever Iris has a string for the same thing</b>, which is
+ * the point of porting its screens: a player who has configured a pack before reads the same words.
+ * What is ours is what Iris has no equivalent of, which is the three facts this engine has and it does
+ * not: {@link #FORCED}, {@link #REMOVED} and {@link #ERROR}.
+ * <p>
+ * A pack's own strings never go through a translation. {@link #fromPack(String)} builds a literal
+ * component, because a pack that writes a per cent sign in a suffix would break a format string, and
+ * one that writes a section sign expects the colour it names to be drawn rather than shown.
+ */
+public final class ScreenText {
+
+	/**
+	 * The screen's own title, and Iris's {@code shaderPackSelection.title}. It names the page in the
+	 * video settings that opens this screen too, since that page is this screen.
+	 */
+	public static final String PACKS_TITLE = "options.vulture.packs_title";
+
+	/**
+	 * The engine's own Sodium page, next to the pack list. Not the game's video-settings title:
+	 * that screen is already open, and naming this page the same hid that it is ours.
+	 */
+	public static final String PAGE_TITLE = "options.vulture.page_title";
+
+	/**
+	 * The selector for what a startup that ended badly comes back to, its tooltip, and its three
+	 * values.
+	 * <p>
+	 * The two backends are named here rather than borrowed from the game's own setting, which was
+	 * the first shape of this and was wrong: its Vulkan entry reads "Prefer Vulkan (Experimental)",
+	 * which is right where it stands and runs off the end of a row here. A value in a selector is a
+	 * name, not a sentence.
+	 */
+	public static final String CRASH_API = "options.vulture.crash_graphics_api";
+	public static final String CRASH_API_TOOLTIP = "options.vulture.crash_graphics_api_tooltip";
+	public static final String CRASH_API_VULKAN = "options.vulture.crash_graphics_api.vulkan";
+	public static final String CRASH_API_OPENGL = "options.vulture.crash_graphics_api.opengl";
+	public static final String CRASH_API_GAME = "options.vulture.crash_graphics_api.game";
+
+	/**
+	 * How far the light reaches, on the engine page this mod owns, with its two tooltips: what
+	 * the setting does, and what it says instead while a pack has taken the distance out of the
+	 * player's hands. The control is Iris's; the words on the row are this engine's, kept short
+	 * so they fit beside the slider.
+	 */
+	public static final String SHADOW_DISTANCE = "options.vulture.shadow_distance";
+	public static final String SHADOW_DISTANCE_TOOLTIP = "options.vulture.shadow_distance_tooltip";
+	public static final String SHADOW_DISTANCE_FORCED = "options.vulture.shadow_distance_forced";
+
+	/**
+	 * How much of the shadow map the pack asked for is drawn, under the distance above and on the
+	 * same page. No counterpart in Iris, so both strings are this project's own, and the tooltip is
+	 * about the edge of a shadow rather than about a resolution: what a player sees when they lower
+	 * it is a less defined edge, the pack being told the smaller map and smoothing over it.
+	 */
+	public static final String SHADOW_MAP_SCALE = "options.vulture.shadow_map_scale";
+	public static final String SHADOW_MAP_SCALE_TOOLTIP = "options.vulture.shadow_map_scale_tooltip";
+
+	/**
+	 * What fraction of the window the world renders at before being upscaled, on the same page as
+	 * the two above. No counterpart in Iris, so both strings are this project's own.
+	 */
+	public static final String RENDER_SCALE = "options.vulture.render_scale";
+	public static final String RENDER_SCALE_TOOLTIP = "options.vulture.render_scale_tooltip";
+
+	public static final String TEMPORAL_FOLD = "options.vulture.temporal_fold";
+	public static final String TEMPORAL_FOLD_TOOLTIP = "options.vulture.temporal_fold_tooltip";
+
+	/**
+	 * How large the compiled-shader disk store may grow. No counterpart in Iris, so both strings
+	 * are this project's own. The tooltip names the default and says the change applies at once.
+	 */
+	public static final String MODULE_CACHE_CEILING = "options.vulture.module_cache_ceiling";
+	public static final String MODULE_CACHE_CEILING_TOOLTIP =
+			"options.vulture.module_cache_ceiling_tooltip";
+
+	/**
+	 * Whether the compiling corner of the HUD shows. No counterpart in Iris, which has no such
+	 * corner, so both strings are this project's own.
+	 */
+	public static final String COMPILE_CARD = "options.vulture.compile_card";
+	public static final String COMPILE_CARD_TOOLTIP = "options.vulture.compile_card_tooltip";
+
+	/**
+	 * How many frames the shadow map is kept for. No counterpart in Iris either, which draws it
+	 * every frame. The tooltip has to say what the frames cost, since the gain is free and the
+	 * price is on casters that move.
+	 */
+	public static final String SHADOW_AMORTISATION = "options.vulture.shadow_amortisation";
+	public static final String SHADOW_AMORTISATION_TOOLTIP =
+			"options.vulture.shadow_amortisation_tooltip";
+	public static final String SHADOW_AMORTISATION_OFF = "options.vulture.shadow_amortisation_off";
+	/** Two keys and not one format: no language of ours pluralises from a number on its own. */
+	public static final String SHADOW_AMORTISATION_FRAME =
+			"options.vulture.shadow_amortisation_frame";
+	public static final String SHADOW_AMORTISATION_FRAMES =
+			"options.vulture.shadow_amortisation_frames";
+
+	/** A one-click starting point across the renderer's machine-wide performance settings. */
+	public static final String PERFORMANCE_PRESET = "options.vulture.performance_preset";
+	public static final String PERFORMANCE_PRESET_TOOLTIP =
+			"options.vulture.performance_preset_tooltip";
+	public static final String PERFORMANCE_PRESET_QUALITY =
+			"options.vulture.performance_preset.quality";
+	public static final String PERFORMANCE_PRESET_MACOS_BALANCED =
+			"options.vulture.performance_preset.macos_balanced";
+	public static final String PERFORMANCE_PRESET_MACOS_BATTERY =
+			"options.vulture.performance_preset.macos_battery";
+	public static final String PERFORMANCE_PRESET_WINDOWS_BALANCED =
+			"options.vulture.performance_preset.windows_balanced";
+	public static final String PERFORMANCE_PRESET_CUSTOM =
+			"options.vulture.performance_preset.custom";
+
+	/** The grey line under the title, one per view. */
+	public static final String SELECT_TITLE = "pack.vulture.select_title";
+	public static final String CONFIGURE_TITLE = "pack.vulture.configure_title";
+
+	/** The view switch seen from the pack list. The key takes {@link #OPEN_SETTINGS} instead. */
+	public static final String TITLE = "options.vulture.title";
+
+	/** The same switch seen from a pack's pages. */
+	public static final String PACKS = "options.vulture.packs";
+
+	public static final String APPLY = "options.vulture.apply";
+
+	/** The way to the folder the packs are read from, which both references put on this screen. */
+	public static final String FOLDER = "options.vulture.folder";
+
+	/** The eye that takes the screen away so the world behind it can be looked at, and F1's label. */
+	public static final String GUI_HIDE = "options.vulture.gui_hide";
+	public static final String GUI_SHOW = "options.vulture.gui_show";
+
+	/** The page's own tools, and the tooltips saying what each of the three would do. */
+	public static final String RESET = "options.vulture.reset";
+	public static final String RESET_TOOLTIP = "options.vulture.reset_tooltip";
+	public static final String IMPORT_TOOLTIP = "options.vulture.import_tooltip";
+	public static final String EXPORT_TOOLTIP = "options.vulture.export_tooltip";
+
+	/** One argument: the pack whose settings would be thrown away. */
+	public static final String RESET_CONFIRM = "options.vulture.reset_confirm";
+
+	/** One argument: the file that would be emptied, by name. */
+	public static final String RESET_CONFIRM_DETAIL = "options.vulture.reset_confirm_detail";
+
+	/**
+	 * The button that reads the whole pack again, which Iris has none of and this engine needs: nothing
+	 * watches a pack's own files, so a GLSL file edited by hand has no other way in.
+	 */
+	public static final String RELOAD = "options.vulture.reload";
+
+	/** Why the import and export windows will not open, since a full screen game hangs behind one. */
+	public static final String FULLSCREEN = "options.vulture.fullscreen";
+
+	/** What shift and a click would do to a setting, shown while shift is held. */
+	public static final String SET_TO_DEFAULT = "options.vulture.set_to_default";
+
+	public static final String PROFILE = "options.vulture.profile";
+
+	/** What the selector says when the values match no profile the pack declares. */
+	public static final String PROFILE_CUSTOM = "options.vulture.profile_custom";
+
+	/** The three the pack list's top row takes, one per state, and it never changes size. */
+	public static final String SHADERS_ENABLED = "options.vulture.shaders_enabled";
+	public static final String SHADERS_DISABLED = "options.vulture.shaders_disabled";
+	public static final String SHADERS_NONE_PRESENT = "options.vulture.shaders_none_present";
+
+	/** The line under the pack list, which is how anybody learns a pack can be dropped onto it. */
+	public static final String PACK_DROP = "options.vulture.pack_drop";
+
+	/** What became of the files dropped onto the pack list. One argument each but {@link #FAILED_ADD}. */
+	public static final String ADDED_PACK = "options.vulture.added_pack";
+	public static final String ADDED_PACKS = "options.vulture.added_packs";
+	public static final String FAILED_ADD = "options.vulture.failed_add";
+	public static final String FAILED_ADD_SINGLE = "options.vulture.failed_add_single";
+	public static final String COPY_ERROR = "options.vulture.copy_error";
+	public static final String COPY_ERROR_EXISTS = "options.vulture.copy_error_exists";
+
+	/** What became of a settings file dropped onto a pack's page, or chosen in the import window. */
+	public static final String TOO_MANY_FILES = "options.vulture.too_many_files";
+	public static final String IMPORTED_SETTINGS = "options.vulture.imported_settings";
+	public static final String FAILED_IMPORT = "options.vulture.failed_import";
+
+	/** One argument: how many settings {@code vulture/options.txt} is holding down. */
+	public static final String FORCED = "options.vulture.forced";
+
+	/** One argument: how many passes this backend could not build and left out. */
+	public static final String REMOVED = "options.vulture.removed";
+
+	/** One argument: why the last load failed. */
+	public static final String ERROR = "options.vulture.error";
+
+	public static final String NO_PACK = "options.vulture.no_pack";
+
+	/** The other reason there is nothing to configure: the folder was left alone on purpose. */
+	public static final String PACK_OFF = "options.vulture.pack_off";
+
+	/**
+	 * The third reason, and the only one that is a fault: a pack was named and the folder has no such
+	 * pack. One argument, the name that was asked for, without which this says no more than
+	 * {@link #NO_PACK} does.
+	 */
+	public static final String PACK_MISSING = "options.vulture.pack_missing";
+
+	/**
+	 * The fourth reason, and the only one about a pack that is perfectly fine: it was read and it
+	 * lays no settings out, which a pack is entitled to do. One argument, the pack's own file name,
+	 * because this is said while that name is on the row above it and {@link #NO_PACK} over it would
+	 * read as a fault of this mod.
+	 */
+	public static final String NO_SETTINGS = "options.vulture.no_settings";
+
+	public static final String OPEN_SETTINGS = "key.vulture.open_settings";
+
+	/**
+	 * The other key, and Iris's {@code keybind.reload}, with the two lines it says once it has read.
+	 * {@link #RELOAD_FAILED} takes one argument: why nothing was read.
+	 */
+	public static final String RELOAD_PACK = "key.vulture.reload_pack";
+	public static final String PACK_RELOADED = "options.vulture.pack_reloaded";
+	public static final String RELOAD_FAILED = "options.vulture.reload_failed";
+
+	/**
+	 * The third key, and Iris's {@code keybind.toggleShaders}, with the lines it says once it has
+	 * read: Iris's own three. {@link #SHADERS_TOGGLED} takes the pack's file name and
+	 * {@link #TOGGLE_FAILED} why nothing was turned on.
+	 */
+	public static final String TOGGLE_SHADERS = "key.vulture.toggle_shaders";
+	public static final String SHADERS_TOGGLED = "options.vulture.shaders_toggled";
+	public static final String SHADERS_TURNED_OFF = "options.vulture.shaders_turned_off";
+	public static final String TOGGLE_FAILED = "options.vulture.toggle_failed";
+
+	/**
+	 * The chat line said once, the first time a world is shown on a backend this engine is not
+	 * written for. Three arguments: the backend's name, then the two labels the game itself ships
+	 * for the setting and for its Vulkan entry. Those two are the game's keys and not ours, the one
+	 * exception to the rule above that a label the game ships is not repeated here: there is no
+	 * constant for them, and naming the setting in the player's own language is the whole of why
+	 * they are passed in rather than written into the sentence.
+	 */
+	public static final String OTHER_BACKEND = "options.vulture.other_backend";
+	public static final String GRAPHICS_API = "options.graphicsApi";
+	public static final String GRAPHICS_API_VULKAN = "options.graphicsApi.vulkan";
+
+	/** The game's own label for the other one, used by {@link #CRASH_API} for the same reason. */
+	public static final String GRAPHICS_API_OPENGL = "options.graphicsApi.opengl";
+
+	/**
+	 * What the pages leading to the pack screen open instead on a backend this engine does not draw
+	 * on, with its two buttons. Iris's words with the two backends swapped,
+	 * {@code ShaderPackScreenPlaceholder.java:30}, 19 and 38, since Iris makes the same offer the other
+	 * way round.
+	 */
+	public static final String BACKEND_PLACEHOLDER = "options.vulture.backend_placeholder";
+	public static final String BACKEND_SWITCH = "options.vulture.backend_switch";
+	public static final String BACKEND_RETURN = "options.vulture.backend_return";
+
+	/**
+	 * The words beside the pulsing mark for as long as a pack compiles, through the held world
+	 * and the background compiles alike. Short on purpose: they stand next to a sixteen-pixel
+	 * icon, not on a line of their own.
+	 */
+	public static final String COMPILING = "overlay.vulture.compiling";
+
+	/**
+	 * The sentence that takes their place when the background compiles finish, standing for a
+	 * moment before the corner fades back to the game.
+	 */
+	public static final String COMPILED = "overlay.vulture.compiled";
+
+	/**
+	 * The group that key sits in. Nothing names it and nothing can: the game builds it from the
+	 * category's identifier, in {@code KeyMapping.Category.label()}, so what decides this string is
+	 * the path of the identifier {@code VultureKeys} registers, not the name of the field holding
+	 * it. It is written down here anyway, because this list is the language file and a key left out
+	 * of the list is one nobody notices going missing.
+	 */
+	public static final String KEY_CATEGORY = "key.category.vulture.keybinds";
+
+	/**
+	 * The colour a setting whose pending value differs from the applied one is drawn in, and Iris's own
+	 * ({@code BaseOptionElementWidget.java:140}). It is the only thing telling a player whether they
+	 * are reading the world they see or the one they are about to get, so it is not decoration, and it
+	 * lives in one place for that reason.
+	 */
+	public static final int MODIFIED = 0xFFffc94a;
+
+	/** Anything a pack wrote, shown as it wrote it. */
+	public static MutableComponent fromPack(String text) {
+		return Component.literal(text);
+	}
+
+	private ScreenText() {
+	}
+}

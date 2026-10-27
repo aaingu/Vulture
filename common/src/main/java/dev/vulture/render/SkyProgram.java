@@ -1,0 +1,132 @@
+package dev.vulture.render;
+
+import dev.vulture.glsl.PackProgram;
+import dev.vulture.glsl.SkyVertex;
+import dev.vulture.pack.target.ChainPlan;
+import dev.vulture.pack.target.TargetPlan;
+import dev.vulture.Vulture;
+
+import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.blaze3d.textures.GpuSampler;
+import com.mojang.blaze3d.textures.GpuTextureView;
+
+import org.joml.Matrix4fc;
+import org.joml.Vector4fc;
+
+import java.util.List;
+import java.util.Set;
+
+/**
+ * One program the pack draws a piece of the game's sky with, in place of the game's own.
+ * <p>
+ * The body of it is {@link GeometryProgram}'s, as the terrain's is; what this class holds is what
+ * the sky answers differently, and there are only three things.
+ * <p>
+ * <strong>The sky is not one format.</strong> {@code SkyRenderer} opens a render pass per element
+ * and binds four formats between them, so the elements a stage declares are the answer of the PASS
+ * and not of the family, and a program is loaded once per format it may be drawn against. The
+ * pairing is by name and asymmetric in both directions, which {@link SkyVertex} spells out: a name
+ * declared that the format has not got refuses the program outright, and an element the format
+ * carries that the stage does not declare shifts the location of every one after it without a word.
+ * <p>
+ * <strong>It neither tests nor writes a depth.</strong> The eight passes bind five pipelines between
+ * them, and not one of the five declares a depth state at all, {@code RenderPipelines.END_SKY}
+ * included, while the sky is drawn before the world: given the ordinary one, the pack's program
+ * would write the sky into the depth buffer and the world would be tested against it.
+ * <p>
+ * <strong>Its namespace is ours and has no {@code sodium} in it.</strong> The word is what makes
+ * Sodium's mixin push twenty bytes of region offset into the layout, and the sky is the game's
+ * geometry: it has no region and no push constants, and borrowing the word would push them anyway.
+ */
+final class SkyProgram extends FamilyProgram {
+
+	/** What the log calls this geometry, one word in the middle of a sentence. */
+	private static final String FAMILY = "sky";
+
+	/** Ours, and deliberately without the word that turns push constants on. See the class comment. */
+	private static final String NAMESPACE = Vulture.MOD_ID;
+
+	private SkyProgram(GeometryProgram body) {
+		super(body);
+	}
+
+	/**
+	 * Prepares one already read program to be drawn as one piece of the sky.
+	 *
+	 * @param loaded the pack's own program, read and translated against the format the pass that
+	 *               draws this piece binds
+	 * @param writes where this piece's outputs belong, in draw buffer order and each on the half the
+	 *               schedule gives it. {@link ChainPlan#sky}'s answer for the program that draws it,
+	 *               unless {@link SkyDraw} emptied it, which it does for the whole sky at once.
+	 *               Empty leaves the piece on the one attachment the game opened its own pass with
+	 */
+	static SkyProgram of(PackProgram.Loaded loaded, SkyDraw.Element element, PackValues values,
+			int load, List<ChainPlan.Attachment> writes, TargetPlan chainTargets,
+			ColorTargets targets, boolean chainRuns) {
+		// Bound again against the chain's own plan, for the reason the terrain is: what the load
+		// bound them against is a plan without the user's pass filter. The step is the one before
+		// the deferreds, the sky standing at the third rank of the frame.
+		String servedBy = loaded.path().substring(loaded.path().lastIndexOf('/') + 1);
+		PackProgram.Loaded bound =
+				loaded.rebind(chainTargets, chainTargets.schedule().step(servedBy));
+
+		// A piece that claims every pixel it spans is one the scene seed must not paint over, and the
+		// element answers that itself rather than this deriving it from the blend. The mask is
+		// written whatever the blend, so a star quad, a hundred parts transparent to one part star,
+		// would claim every pixel it spans and cut the game's picture out of all of them; but the
+		// converse does not hold, and the End's cube of sky is where it fails, the game blending a
+		// mesh that is opaque at every vertex. The opaque and cutout chunk passes answer the same
+		// question the same way, and the translucent one answers it no.
+		return new SkyProgram(new GeometryProgram(new GeometryProgram.Pass(FAMILY, element.element(),
+				NAMESPACE, Set.copyOf(SkyVertex.ATTRIBUTES), false, element.blend(),
+				// claimed, and the sky is the one family that answers it yes: it draws pieces of its
+				// own that claim every pixel they span, the disc and the dark in the overworld and the
+				// cube of sky in the End, over the pixels the five that claim nothing span, which are
+				// the stars, the sunrise, the sun, the moon and the End's flash. Not the five that
+				// blend, which are six: the cube of sky blends and claims the frame all the same.
+				// Those five blend onto a target the seed leaves alone although none of them marks a
+				// pixel of its own. Answered no, they would go to the game's target and the seed would
+				// discard at exactly those pixels, on the mask their own siblings wrote: no stars, no
+				// sun, no moon and no flash.
+				//
+				// The band the game's own discs leave open is marked by ours, HorizonCone, which
+				// shares the disc's pass and its mask. What that still does not cover is written
+				// where the field is declared, GeometryProgram.Pass#claimed.
+				element.covers(), true, false, element.topology(),
+				// Five pipelines under the eight passes, the disc sharing one with the dark plane and
+				// the End's flash sharing another with the sun and the moon, and not one of the five
+				// names a culling of its own: all eight take the builder's default, which is to cull.
+				true, null, element.stage(),
+				// Nothing of the game's bound beside the mesh, unlike the clouds: every one of the
+				// eight sky passes carries its whole geometry in the vertex buffer it binds.
+				null,
+				// One block, written once: every draw of one pass reads the same values.
+				null,
+				// Drawn in the game's own volume, so the dh matrices answer the game's.
+				false),
+				bound, values, load, element.format(), writes, targets, chainRuns));
+	}
+
+	/**
+	 * The pipeline this sky element is drawn with, compiled before the renderer opens its pass.
+	 *
+	 * @param modelView the matrix the game pushed for this element, which is where the sun is
+	 * @see GeometryProgram#prepare
+	 */
+	RenderPipeline prepare(GpuDevice device, Matrix4fc modelView, Vector4fc colour) {
+		return this.body.prepare(device, null, modelView, null, colour, null);
+	}
+
+	/**
+	 * The texture the game was going to draw this element with, and the sampler it configured for
+	 * it: the celestial atlas for the sun, the moon and the End's flash, and an image of its own for
+	 * the End's sky. Handed on so that a pack reading {@code gtexture} reads the same image the game
+	 * would have.
+	 */
+	void texture(GpuTextureView view, GpuSampler sampler) {
+		this.body.atlas(view);
+		this.body.sampler(sampler);
+	}
+
+}

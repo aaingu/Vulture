@@ -1,0 +1,1876 @@
+package dev.vulture.pack.source;
+
+import dev.vulture.pack.option.OptionIndex;
+import dev.vulture.pack.option.OptionValue;
+import dev.vulture.pack.option.PackOption;
+import dev.vulture.pack.model.AlphaTest;
+import dev.vulture.pack.model.TargetSize;
+import dev.vulture.pack.model.BufferObject;
+import dev.vulture.pack.model.ImageInformation;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.function.Predicate;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * What {@code shaders.properties} declares: profiles, which programs are on, the settings
+ * screens, the custom uniforms, and the blending each program wants.
+ * <p>
+ * The file is not a Java properties file and reading it as one gets it wrong in two ways. Only
+ * {@code =} separates a key from a value, never {@code :}; and everything after that first
+ * {@code =} is the value, there being no end of line comment. A line continued with a backslash
+ * swallows the next line's indentation and stops at the following newline, which is spelled out at
+ * {@link #CONTINUATION}: crossing a blank line there is what makes a continued key eat the block
+ * underneath it.
+ * <p>
+ * It also carries conditionals, and they matter: packs switch whole programs off with an
+ * {@code #if} on a setting. Reading the file flat would report those programs as present.
+ * <p>
+ * <strong>Two roads run through this file, and which one a key takes is settled by whether a
+ * setting can decide it.</strong> Every reader handed a define table walks the lines as written,
+ * applying the conditionals first and joining the continuations after. That is the order the
+ * reference has by construction: it runs its preprocessor over the whole file and only then hands
+ * the result to {@code Properties.load}. Joining first lets a value that ends on a backslash
+ * swallow the {@code #else} or {@code #endif} that closes its own branch, and the branch then runs
+ * on into the one meant to replace it. Photon writes exactly that, its moon brightness spread over
+ * eleven continued lines of which the last one continues too.
+ * <p>
+ * The one pass in {@link #parse} takes the other road, a flat fold of the file read straight
+ * through with the directives stepped over, and it has to: it runs before any setting exists, and
+ * the profiles it reads are themselves what decide the settings a conditional would be evaluated
+ * against. What it keeps is what the reference reads off its own non-preprocessed copy for that
+ * same reason, the profiles, the screens with their pages and column counts, the sliders and the
+ * two feature lines, {@code properties/ShaderProperties.java:600} there. Everything else it
+ * recognises it only counts, the readers above answering for the value.
+ */
+public final class ShaderProperties {
+
+	private static final String FILE_NAME = "shaders.properties";
+
+	// Only the indentation of the joined line is swallowed, never a blank line: {@code \\s*}
+	// would cross one and make a continued key absorb whatever block follows it. Bliss ends
+	// three of its continuations on a blank line, and its main screen swallowed the commented
+	// block underneath.
+	private static final Pattern CONTINUATION = Pattern.compile("\\\\\\r?\\n[ \\t]*");
+	private static final Pattern DIRECTIVE = Pattern.compile("^\\s*#\\s*(if|ifdef|ifndef|else|elif|endif)\\b.*$");
+
+	private static final Pattern PROFILE = Pattern.compile("^\\s*profile\\.(\\w+)\\s*=\\s*(.*)$");
+	private static final Pattern PROGRAM_ENABLED = Pattern.compile("^\\s*program\\.(.+?)\\.enabled\\s*=\\s*(.*)$");
+	private static final Pattern CUSTOM_UNIFORM =
+			Pattern.compile("^\\s*(uniform|variable)\\.(\\w+)\\.(\\w+)\\s*=\\s*(.*)$");
+	private static final Pattern SCREEN = Pattern.compile("^\\s*screen(\\.\\w+)?\\s*=\\s*(.*)$");
+	// Both are read before SCREEN, and in this order. "screen.columns=2" matches SCREEN as well,
+	// as a page named columns, which is how a page nobody can reach appears in the one pack that
+	// writes the line; and "screen.NAME.columns=1" matches neither, so it would otherwise be counted
+	// as an unknown key. Packs indent these lines and put spaces around the equals sign, both of which
+	// are why the pattern has to be this loose.
+	private static final Pattern MAIN_COLUMNS = Pattern.compile("^\\s*screen\\.columns\\s*=\\s*(\\d+)\\s*$");
+	private static final Pattern PAGE_COLUMNS = Pattern.compile("^\\s*screen\\.(\\w+)\\.columns\\s*=\\s*(\\d+)\\s*$");
+	private static final Pattern BLEND = Pattern.compile("^\\s*blend\\.([^=\\s.]+)(?:\\.(\\w+))?\\s*=\\s*(.*)$");
+	private static final Pattern ALPHA_TEST = Pattern.compile("^\\s*alphaTest\\.(\\S+)\\s*=\\s*(.*)$");
+	private static final Pattern SLIDERS = Pattern.compile("^\\s*sliders\\s*=\\s*(.*)$");
+	// Two lines that say what a pack cannot draw without, and what it would use if it were there.
+	// Space separated lists, and the last line of each wins, which is how Iris reads them.
+	private static final Pattern IRIS_FEATURES =
+			Pattern.compile("^\\s*iris\\.features\\.(required|optional)\\s*=\\s*(.*)$");
+	private static final Pattern END_FLASH_SHADOWS = Pattern.compile("^\\s*endFlashShadows\\s*=\\s*(.*)$");
+	// Whether the rain and the snow write the world's depth. Read on the live lines like the family
+	// below, and that is what Iris does too, by another road: it runs the whole file through its own
+	// preprocessor with the pack's settings as macros before its parser sees a line at all
+	// (Iris shaderpack/properties/ShaderProperties.java:132 and preprocessor/PropertiesPreprocessor
+	// .java:28-63), so a dead branch is gone by then. Read flat, a pack writing this under an #if it
+	// leaves off would get depth-writing rain here and none there.
+	private static final Pattern RAIN_DEPTH = Pattern.compile("^\\s*rain\\.depth\\s*=\\s*(.*)$");
+	// Which of the world's six families are drawn into the shadow map, the six Iris parses
+	// (shaderpack/properties/ShaderProperties.java:192-197). One pattern for the lot, because they
+	// are read together and answered together: a caster the pack asked to keep out and that casts
+	// anyway is worse than no shadow at all, so they are served as a set or not.
+	// Live lines only, and here that is not a nicety. Two packs of the eight tested write one of
+	// these words twice with two different values, both Complementary packs writing shadowPlayer
+	// true and then false in the two arms of one conditional: read flat, the answer is whichever
+	// line the file happens to end with. BSL is the sharper case and it is not a repeat at all - it
+	// writes shadowEntities and shadowBlockEntities once each, under an #ifndef its own settings
+	// file defines, so both lines are dead and a flat read turns the most used pack of the corpus
+	// into one with no entity shadows.
+	private static final Pattern SHADOW_CASTER = Pattern.compile(
+			"^\\s*(shadowTerrain|shadowTranslucent|shadowEntities|shadowPlayer|shadowBlockEntities"
+					+ "|shadowLightBlockEntities)\\s*=\\s*(.*)$");
+	// Which shape the light measures a section against. Of the same family by its name, and read on
+	// the live lines for the same reason, but it is not a caster word and it is not a boolean: the
+	// value is one of four states, and ShadowCullState carries what each of the written words means.
+	private static final Pattern SHADOW_CULLING = Pattern.compile("^\\s*shadow\\.culling\\s*=\\s*(.*)$");
+	// Whether Distant Horizons' far terrain is drawn into the map. A seventh caster word by what it
+	// decides, kept out of SHADOW_CASTER because its default is the other way round: the six above
+	// are answered by a set the engine ships, and this one is on for a pack that says nothing
+	// (pipeline/IrisRenderingPipeline.java:408). Six of the eight packs of the corpus write it and
+	// five of the six write false, so a flat default would put the far terrain in five maps that
+	// asked to keep it out.
+	private static final Pattern DH_SHADOW = Pattern.compile("^\\s*dhShadow\\.enabled\\s*=\\s*(.*)$");
+	// Whether the terrain's ambient occlusion is kept out of the vertex colour. Read on the live
+	// lines like every other directive of this file, and the note on RAIN_DEPTH says why that is
+	// what the reference does too.
+	private static final Pattern SEPARATE_AO = Pattern.compile("^\\s*separateAo\\s*=\\s*(.*)$");
+	// Whether the pack declares that anisotropy breaks the way it reads the block atlas. Read on the
+	// live lines and on separateAo's rule in every respect, and answered the same way.
+	private static final Pattern BREAKS_ANISOTROPY =
+			Pattern.compile("^\\s*breaksAnisotropy\\s*=\\s*(.*)$");
+	// Whether the main hand reports the brighter of the two hands' light, which is what a pack
+	// written before the off hand had a light of its own expects. Read on the live lines and on
+	// separateAo's rule in every respect, the default alone being the other way round. Seven of the
+	// eleven packs of the corpus write it, all seven write false, and none writes true, so a flat
+	// default would have an off hand torch answering for seven main hands that asked it not to.
+	private static final Pattern OLD_HAND_LIGHT = Pattern.compile("^\\s*oldHandLight\\s*=\\s*(.*)$");
+	// Whether the game's own per face brightness stays in the chunk mesh. Read on the live
+	// lines and on separateAo's rule, and the default is off, which is the reference's
+	// (shaderpack/properties/PackDirectives.java:92, getOldLighting().orElse(false)): a pack
+	// shades from the normal it is handed, so the game's factor underneath it shades twice.
+	private static final Pattern OLD_LIGHTING = Pattern.compile("^\\s*oldLighting\\s*=\\s*(.*)$");
+	private static final Pattern SIZE_BUFFER = Pattern.compile("^\\s*size\\.buffer\\.([^=\\s.]+)\\s*=\\s*(.*)$");
+	private static final Pattern SKY_ELEMENT = Pattern.compile("^\\s*(sun|moon|stars|sky)\\s*=\\s*(.*)$");
+	// The fifth word of that family, kept apart because it is the one that takes neither a yes nor a
+	// no: a pack writes off, fast or fancy, which are the game's own three cloud settings.
+	private static final Pattern CLOUDS = Pattern.compile("^\\s*clouds\\s*=\\s*(.*)$");
+	// The word for the clouds Distant Horizons draws past the world's own, which are a generic object
+	// of that mod's rather than anything of the game's cloud renderer, so the line above never reaches
+	// them. It is not that line's vocabulary: a pack writes off, or on, which fancy also means.
+	private static final Pattern DH_CLOUDS = Pattern.compile("^\\s*dhClouds\\s*=\\s*(.*)$");
+	// And the one of that same family that carries two words rather than one, so it has a pattern
+	// of its own: the first says whether the rain and the snow are drawn at all, the second whether
+	// the splashes they leave on the ground are.
+	private static final Pattern WEATHER = Pattern.compile("^\\s*weather\\s*=\\s*(.*)$");
+	// Where the pack wants its particles drawn about the deferred stage. Two spellings, and the
+	// second is the older one: Iris reads particles.before.deferred=true as an ordering of BEFORE
+	// where nothing has already been said, so it is folded into the same answer here rather than
+	// being a directive of its own that a reader would have to know about separately.
+	private static final Pattern PARTICLE_ORDERING =
+			Pattern.compile("^\\s*particles\\.ordering\\s*=\\s*(.*)$");
+	private static final Pattern PARTICLES_BEFORE_DEFERRED =
+			Pattern.compile("^\\s*particles\\.before\\.deferred\\s*=\\s*(.*)$");
+	// The noise image is answered here because everything else about it is settled: one path, one
+	// sampler, every stage. The general family is not, and is read by customTextures instead.
+	private static final Pattern TEXTURE_NOISE = Pattern.compile("^\\s*texture\\.noise\\s*=\\s*(.*)$");
+	private static final Pattern SHADOW_ENABLED =
+			Pattern.compile("^\\s*shadow\\.enabled\\s*=\\s*(.*)$");
+	private static final Pattern CUSTOM_TEXTURE =
+			Pattern.compile("^\\s*((?:texture|customTexture)\\.[^=\\s]+)\\s*=\\s*(.*)$");
+	private static final Pattern IMAGE = Pattern.compile("^\\s*image\\.([^=\\s.]+)\\s*=\\s*(.*)$");
+	private static final Pattern BUFFER_OBJECT =
+			Pattern.compile("^\\s*bufferObject\\.(\\d+)\\s*=\\s*(.*)$");
+	private static final Pattern FLIP = Pattern.compile("^\\s*flip\\.([^=\\s.]+)\\.([^=\\s.]+)\\s*=\\s*(.*)$");
+	private static final Pattern OTHER_KEY = Pattern.compile("^\\s*([A-Za-z_][\\w]*)[.=].*$");
+
+	private static final Pattern SCREEN_TOKEN = Pattern.compile("^[A-Za-z_]\\w*$");
+
+	/** Deep enough for any real profile chain, and a stop for one that refers to itself. */
+	private static final int MAX_PROFILE_DEPTH = 8;
+
+	/**
+	 * A depth limit alone does not bound the work, for the reason {@link IncludeExpander} spells
+	 * out about its own file budget: profiles form a graph rather than a tree, and one that names
+	 * the next one ten times multiplies at every level. Nine profiles with no cycle in them, each
+	 * naming the next ten times, run for four minutes on this machine and never reach the depth
+	 * limit. A pack is downloaded content and this is read while the client is starting, so the
+	 * total is bounded too. The corpus expands twenty-eight settings at its worst.
+	 */
+	private static final int MAX_PROFILE_EXPANSIONS = 10_000;
+
+	private final List<String> lines;
+	private final Map<String, String> profiles;
+	private final Map<String, String> customUniformTypes;
+	private final Set<String> screenTokens;
+	private final Map<String, List<ScreenToken>> screenLayout;
+	private final Map<String, Integer> columns;
+	private final List<String> sliders;
+	private final List<String> requiredFeatures;
+	private final List<String> optionalFeatures;
+	private final Map<String, Integer> ignoredPrefixes;
+	private final int directiveCount;
+	private final int blendCount;
+	private final int continuationCount;
+	private final boolean present;
+
+	private ShaderProperties(Builder builder) {
+		this.lines = List.copyOf(builder.lines);
+		// Ordered, like the layout below: a profile selector walks these in the order the pack
+		// wrote them, and BSL's five run from MINIMUM to ULTRA rather than in any order.
+		this.profiles = Collections.unmodifiableMap(new LinkedHashMap<>(builder.profiles));
+		this.customUniformTypes = Map.copyOf(builder.customUniformTypes);
+		this.screenTokens = Set.copyOf(builder.screenTokens);
+		// Not Map.copyOf: the order pages are declared in is the order a screen offers them, and
+		// an immutable map does not keep one.
+		Map<String, List<ScreenToken>> layout = new LinkedHashMap<>();
+		builder.screenLayout.forEach((page, tokens) -> layout.put(page, List.copyOf(tokens)));
+		this.screenLayout = Collections.unmodifiableMap(layout);
+		this.columns = Map.copyOf(builder.columns);
+		this.sliders = List.copyOf(builder.sliders);
+		this.requiredFeatures = List.copyOf(builder.requiredFeatures);
+		this.optionalFeatures = List.copyOf(builder.optionalFeatures);
+		this.ignoredPrefixes = Map.copyOf(builder.ignoredPrefixes);
+		this.directiveCount = builder.directiveCount;
+		this.blendCount = builder.blendCount;
+		this.continuationCount = builder.continuationCount;
+		this.present = builder.present;
+	}
+
+	public static ShaderProperties parse(ShaderPackSource source) throws IOException {
+		Builder builder = new Builder();
+		Optional<Path> file = source.file(FILE_NAME);
+		if (file.isEmpty()) {
+			return new ShaderProperties(builder);
+		}
+
+		builder.present = true;
+
+		builder.lines = List.copyOf(source.readLines(file.get()));
+
+		String text = String.join("\n", builder.lines);
+		Matcher continuation = CONTINUATION.matcher(text);
+		while (continuation.find()) {
+			builder.continuationCount++;
+		}
+
+		// Counted on the lines as written and not on the fold below, since those are the lines the
+		// conditional readers apply: a directive a continued value swallows is one the file carries
+		// and one that decides a branch, so a census taken after the fold reports fewer directives
+		// than the pack has. Photon's #else at shaders.properties:495 is the one in the corpus.
+		for (String line : builder.lines) {
+			if (DIRECTIVE.matcher(line).matches()) {
+				builder.directiveCount++;
+			}
+		}
+
+		// The flat road of the two the class comment describes: no setting exists yet to decide a
+		// conditional with, so this reads the file folded and straight through.
+		for (String line : CONTINUATION.matcher(text).replaceAll(" ").split("\n", -1)) {
+			read(line, builder);
+		}
+
+		return new ShaderProperties(builder);
+	}
+
+	private static void read(String line, Builder builder) {
+		if (DIRECTIVE.matcher(line).matches()) {
+			return;
+		}
+
+		Matcher profile = PROFILE.matcher(line);
+		if (profile.matches()) {
+			builder.profiles.put(profile.group(1), profile.group(2).trim());
+			return;
+		}
+
+		// Read flat here and re-read conditionally later. The keys have to be known before the
+		// conditionals can be evaluated, because a profile may decide them.
+		if (PROGRAM_ENABLED.matcher(line).matches()) {
+			return;
+		}
+
+		Matcher uniform = CUSTOM_UNIFORM.matcher(line);
+		if (uniform.matches()) {
+			builder.customUniformTypes.put(uniform.group(3), uniform.group(2));
+			return;
+		}
+
+		Matcher mainColumns = MAIN_COLUMNS.matcher(line);
+		if (mainColumns.matches()) {
+			putColumns(builder, "", mainColumns.group(1));
+			return;
+		}
+
+		Matcher pageColumns = PAGE_COLUMNS.matcher(line);
+		if (pageColumns.matches()) {
+			putColumns(builder, pageColumns.group(1), pageColumns.group(2));
+			return;
+		}
+
+		Matcher screen = SCREEN.matcher(line);
+		if (screen.matches()) {
+			// The name of the page, "" for the one the pack opens on. A sub page is referred to
+			// from its parent by its own name, so the two are joined by name rather than nested.
+			String page = screen.group(1) == null ? "" : screen.group(1).substring(1);
+			// A second line for the same page REPLACES the first, which is how the reference
+			// reads the pair: the last assignment of a key is the key. Only the layout starts
+			// over; the token census below keeps counting what the pack wrote, dead line or not.
+			List<ScreenToken> slots = new ArrayList<>();
+			builder.screenLayout.put(page, slots);
+
+			// A run of SPACES and not a run of whitespace. The list directives are the only ones Iris
+			// splits on more than one space, and even there a tab is not a separator; every other
+			// directive of this file is split on a single space, which is why the two forms sit side
+			// by side here rather than one being used throughout.
+			for (String token : screen.group(2).trim().split(" +", -1)) {
+				if (token.isEmpty()) {
+					continue;
+				}
+
+				if (SCREEN_TOKEN.matcher(token).matches()) {
+					builder.screenTokens.add(token);
+				}
+
+				slots.add(slotOf(token));
+			}
+
+			return;
+		}
+
+		// Consumed here for the census only; the values come out of blend, which walks the
+		// conditionals for the reason alphaTests gives just below.
+		if (BLEND.matcher(line).matches()) {
+			builder.blendCount++;
+			return;
+		}
+
+		// Consumed here for the census only; the values come out of alphaTests, which walks the
+		// conditionals, because the reference reads this family off its preprocessed copy of the
+		// file. Not every family: it reads the screens, the sliders, the profiles and the feature
+		// lists off the raw one.
+		if (ALPHA_TEST.matcher(line).matches()) {
+			return;
+		}
+
+		// Replaced and not added to: a second line of the same name is the one that counts, which is
+		// how Iris reads both of them, and not how the sliders below are read, where the tokens of a
+		// second line join the first. Read so the refusal can say something: a pack that names
+		// what it cannot do without is answered with the names this engine has not built, instead
+		// of falling over later on whichever sampler its storage buffers happened to sit behind.
+		// What is served is settled at the chain, not here: this only carries the names.
+		Matcher features = IRIS_FEATURES.matcher(line);
+		if (features.matches()) {
+			List<String> named = new ArrayList<>();
+			for (String token : features.group(2).trim().split(" +", -1)) {
+				if (!token.isEmpty()) {
+					named.add(token);
+				}
+			}
+
+			if (features.group(1).equals("required")) {
+				builder.requiredFeatures = named;
+			} else {
+				builder.optionalFeatures = named;
+			}
+
+			return;
+		}
+
+		Matcher sliders = SLIDERS.matcher(line);
+		if (sliders.matches()) {
+			for (String token : sliders.group(1).trim().split(" +", -1)) {
+				if (SCREEN_TOKEN.matcher(token).matches()) {
+					builder.sliders.add(token);
+				}
+			}
+
+			return;
+		}
+
+		// Consumed here for the census only; the value comes out of endFlashShadows, which walks
+		// the conditionals.
+		if (END_FLASH_SHADOWS.matcher(line).matches()) {
+			return;
+		}
+
+		// Consumed here and read by rainDepth, which walks the conditionals. Consumed only where the
+		// value is one this engine reads, which is the rule the branches below follow: anything else
+		// belongs among the keys nothing reads, where the pack's author can see it.
+		Matcher rainDepth = RAIN_DEPTH.matcher(line);
+		if (rainDepth.matches() && truth(rainDepth.group(1).trim()) != null) {
+			return;
+		}
+
+		// Same rule for the shadow casters: consumed where the word is one this engine acts on, and
+		// left among the keys nothing reads where it is not, so a pack writing a fifth spelling can
+		// see that it was not understood.
+		Matcher caster = SHADOW_CASTER.matcher(line);
+		if (caster.matches() && truth(caster.group(2).trim()) != null) {
+			return;
+		}
+
+		// The seventh word of that family, on the casters' rule and not the culling state's: a value
+		// this cannot read leaves the default standing, and the default is ON, so a line nothing
+		// could read has to stay visible rather than pass for a refusal that was honoured.
+		Matcher dhShadow = DH_SHADOW.matcher(line);
+		if (dhShadow.matches() && truth(dhShadow.group(1).trim()) != null) {
+			return;
+		}
+
+		// The culling state goes with separateAo below rather than with the casters above, and for
+		// that entry's reason: a word this cannot read is not stepped over, it is what puts the
+		// state back to the default, so the line is read whether the word is one of the four or not.
+		Matcher culling = SHADOW_CULLING.matcher(line);
+		if (culling.matches()) {
+			return;
+		}
+
+		// And NOT the same rule for this one, whatever its neighbour above does: a word this cannot
+		// read is not ignored here, it is what leaves the default standing, so the line is read
+		// whether the word is one or not. Left among the keys nothing reads, it would tell its
+		// author that nothing looks at a line which had just overruled the one before it.
+		Matcher separateAo = SEPARATE_AO.matcher(line);
+		if (separateAo.matches()) {
+			return;
+		}
+
+		// On that same rule, and read for the same reason: a word this cannot read leaves the
+		// default standing rather than being stepped over.
+		if (BREAKS_ANISOTROPY.matcher(line).matches()) {
+			return;
+		}
+
+		// And on that rule too, for that reason: a word this cannot read is what puts the answer back
+		// to the default, so the line is read whether the word is one of the four or not.
+		if (OLD_HAND_LIGHT.matcher(line).matches()) {
+			return;
+		}
+
+		// The same rule again, and the same reason.
+		if (OLD_LIGHTING.matcher(line).matches()) {
+			return;
+		}
+
+		// Consumed here for the census only; the values come out of sizeBuffers, which walks the
+		// conditionals.
+		if (SIZE_BUFFER.matcher(line).matches()) {
+			return;
+		}
+
+		// Consumed only when the value is one of the four words that mean something, and read again
+		// conditionally by skyElements. A line that says anything else falls through to the ignored
+		// keys, which is where a reader has to be able to find it: one pack of the corpus writes
+		// sun=off and moon=off, which neither Iris nor OptiFine reads as false, so its sun and its
+		// moon keep being drawn and
+		// nothing else would say why.
+		Matcher element = SKY_ELEMENT.matcher(line);
+		if (element.matches() && truth(element.group(2).trim()) != null) {
+			return;
+		}
+
+		// The same rule for the fifth word, on its own three values: a clouds= line naming something
+		// else is a line nothing here reads, and it belongs among the keys that say so.
+		Matcher clouds = CLOUDS.matcher(line);
+		if (clouds.matches() && CloudSetting.of(clouds.group(1).trim()) != null) {
+			return;
+		}
+
+		Matcher dhClouds = DH_CLOUDS.matcher(line);
+		if (dhClouds.matches() && CloudSetting.ofDistant(dhClouds.group(1).trim()) != null) {
+			return;
+		}
+
+		// The same rule for the two word member of that family, and it takes EITHER word: a line is
+		// honoured as soon as one of the two says something this engine reads, so testing the first
+		// alone would count "weather = on false" among the keys nothing reads while its second word
+		// really did take the splashes away. A line whose two words are both unreadable falls
+		// through, which is where a reader has to be able to find it.
+		Matcher weather = WEATHER.matcher(line);
+		if (weather.matches() && reads(weather.group(1).trim().split(" ", 0))) {
+			return;
+		}
+
+		// Consumed and not kept: the two are read by particleOrdering, which walks the conditionals,
+		// and falling through here would leave them among the keys nothing reads. That is not
+		// cosmetic on this pair. Five packs of the corpus write particles.ordering, so the count
+		// would say the engine ignores the very directive it now reads and writes a line about.
+		//
+		// And consumed only where the value is one that is really read, which is the rule the three
+		// branches above follow and not the custom textures' rule: an ordering with no word after
+		// the equals sign, or a before.deferred that is not one of the four booleans, is honoured
+		// nowhere, so it has to stay visible among the keys nothing reads.
+		Matcher ordering = PARTICLE_ORDERING.matcher(line);
+		if (ordering.matches() && !ordering.group(1).trim().isEmpty()) {
+			return;
+		}
+
+		// TRUE alone, and not any boolean: particleOrdering acts on the yes and does nothing at all
+		// with the no, Iris reading the same word the same way. A false left consumed here would be
+		// a line neither honoured nor counted.
+		Matcher before = PARTICLES_BEFORE_DEFERRED.matcher(line);
+		if (before.matches() && Boolean.TRUE.equals(truth(before.group(1).trim()))) {
+			return;
+		}
+
+		// Consumed here for the census only, and only when the value is a boolean: the lines come
+		// out of flips, which walks the conditionals, and anything else falls through to the
+		// ignored keys.
+		Matcher flip = FLIP.matcher(line);
+		if (flip.matches() && flipValue(flip) != null) {
+			return;
+		}
+
+		// Consumed here for the census only; the path comes out of noiseTexturePath, which walks
+		// the conditionals like the other directive readers below.
+		Matcher noise = TEXTURE_NOISE.matcher(line);
+		if (noise.matches()) {
+			return;
+		}
+
+		// Consumed on the casters' rule: a value that is not a boolean is honoured nowhere, so
+		// it has to stay visible among the keys nothing reads. The state itself comes out of
+		// shadowEnabled, under the conditionals.
+		Matcher shadowEnabled = SHADOW_ENABLED.matcher(line);
+		if (shadowEnabled.matches() && truth(shadowEnabled.group(1).trim()) != null) {
+			return;
+		}
+
+		// Consumed and not kept: the rest of the family is read by customTextures, which walks the
+		// conditionals. Falling through here would leave those lines among the keys nothing reads
+		// and make that count say the engine ignores what it now honours.
+		if (CUSTOM_TEXTURE.matcher(line).matches()) {
+			return;
+		}
+
+		// Same reason as the texture family: the live lines are walked later, with the
+		// conditionals, and falling through would count {@code image} as a prefix nobody reads.
+		if (IMAGE.matcher(line).matches()) {
+			return;
+		}
+
+		// Same reason as the image family: the live lines are walked later, and falling through
+		// would count {@code bufferObject} as a prefix nobody reads.
+		if (BUFFER_OBJECT.matcher(line).matches()) {
+			return;
+		}
+
+		// Anything left is counted by its first segment rather than dropped. That is what makes
+		// a typo visible: one pack writes "progam.<name>.enabled" and loses the program.
+		Matcher other = OTHER_KEY.matcher(line);
+		if (other.matches()) {
+			builder.ignoredPrefixes.merge(other.group(1), 1, Integer::sum);
+		}
+	}
+
+	/**
+	 * A count is a number the pack typed, so it can be one no screen could be laid out in. An
+	 * unusable one is dropped here and the line is still consumed either way: letting it fall
+	 * through to the screen pattern is what turns it into a page.
+	 */
+	private static void putColumns(Builder builder, String page, String text) {
+		try {
+			int count = Integer.parseInt(text);
+			if (count > 0) {
+				builder.columns.put(page, count);
+			}
+		} catch (NumberFormatException e) {
+			// More digits than an int holds. The page keeps the default.
+		}
+	}
+
+	/**
+	 * One slot of a page, from the word the pack wrote. Whether the option exists, whether the
+	 * page was ever written, and whether the pack declares any profile at all are three questions
+	 * this class cannot answer, so none of them is asked here: the token is kept as written and
+	 * resolved by whoever holds the rest of the pack.
+	 * <p>
+	 * A link is anything between brackets rather than a name matching a pattern, which is the rule
+	 * packs are written against; one pack in the corpus links to a page it never wrote, and that
+	 * link is shown rather than dropped.
+	 */
+	private static ScreenToken slotOf(String token) {
+		if (token.equals("<empty>")) {
+			return new ScreenToken.Blank();
+		}
+
+		if (token.equals("<profile>")) {
+			return new ScreenToken.Profiles();
+		}
+
+		if (token.startsWith("[") && token.endsWith("]")) {
+			return new ScreenToken.Link(token.substring(1, token.length() - 1));
+		}
+
+		if (token.equals("*")) {
+			return new ScreenToken.Rest();
+		}
+
+		return new ScreenToken.Name(token);
+	}
+
+	/**
+	 * Which programs the file says are on, with both the conditionals around the line and the
+	 * expression on the line itself evaluated. The value is not a word but an expression over
+	 * the settings, so a pack writes {@code program.world0/shadow.enabled=SHADOW} and expects
+	 * the program to disappear when that setting is off.
+	 * <p>
+	 * The two are read in two different languages, and that is the packs' doing rather than a
+	 * choice made here. The {@code #if} lines around the value are preprocessor conditions, so a
+	 * pack opens {@code #if AA_MODE == 1} and expects arithmetic; the value itself is a boolean
+	 * expression, where a name that is not one of the pack's own switches stands for true. Reading
+	 * the value as a preprocessor condition switches off every pass a pack conditions on a
+	 * numbered setting, and a pass removed moves the half every later one reads.
+	 *
+	 * @param options what the pack declares, which is the only way to tell a switch the pack owns
+	 *                from a name it never declared or a setting that carries a number
+	 */
+	public Map<String, Boolean> programToggles(Map<String, String> defines, OptionIndex options) {
+		Map<String, Boolean> toggles = new LinkedHashMap<>();
+		programConditions(defines).forEach((program, expression) ->
+				toggles.put(program, enabled(expression, defines, options)));
+
+		return toggles;
+	}
+
+	/**
+	 * The programs this file switches off, under the paths the pack wrote, extension excluded.
+	 * <p>
+	 * The shape the resolution wants: a switched-off program is one the place does not ship, so
+	 * what serves the name is whatever the fallback tree offers next, and only a name whose whole
+	 * chain is switched off or absent ends up served by nothing. That is the reference's
+	 * behaviour and not an interpretation of it: a disabled name gets no source there
+	 * ({@code ShaderPack.java:292-295}), {@code ProgramSet.get} then answers empty
+	 * ({@code programs/ProgramSet.java:279-285}), and the resolver walks to the parent
+	 * ({@code programs/ProgramFallbackResolver.java:27-42}).
+	 */
+	public Set<String> switchedOff(Map<String, String> defines, OptionIndex options) {
+		Set<String> off = new LinkedHashSet<>();
+		programToggles(defines, options).forEach((program, on) -> {
+			if (!on) {
+				off.add(program);
+			}
+		});
+
+		return Set.copyOf(off);
+	}
+
+	/**
+	 * The same programs with the expression left as written, so that a log can say which setting
+	 * switched a pass off rather than only that something did. The key is the path the pack wrote,
+	 * {@code world0/composite1} or {@code composite} at the root, and never the bare name: BSL
+	 * conditions {@code world0/composite1} and {@code world-1/composite1} on two different
+	 * expressions.
+	 */
+	public Map<String, String> programConditions(Map<String, String> defines) {
+		Map<String, String> expressions = new LinkedHashMap<>();
+
+		PropertiesFile.walk(this.lines, defines, line -> {
+			Matcher program = PROGRAM_ENABLED.matcher(line);
+			if (program.matches()) {
+				expressions.put(program.group(1), program.group(2).trim());
+			}
+		});
+
+		return expressions;
+	}
+
+	/**
+	 * An empty value leaves the program on, which is how a pack writes down that it exists
+	 * without conditioning it. An expression that cannot be decided leaves it on too: dropping a
+	 * program is the more damaging way to be wrong, since nothing then reports its absence.
+	 */
+	private static boolean enabled(String expression, Map<String, String> defines,
+			OptionIndex options) {
+		if (expression.isEmpty()) {
+			return true;
+		}
+
+		Boolean value = new EnabledExpression(expression, defines, options).parse();
+
+		return value == null || value;
+	}
+
+	/**
+	 * The little boolean language a {@code program.NAME.enabled} value is written in: names,
+	 * {@code true} and {@code false}, {@code !}, {@code &&}, {@code ||} and brackets.
+	 * <p>
+	 * Every term that is not a literal is a name, and a name stands for one thing only: the state
+	 * of a switch the pack declares. Anything else, a setting that carries a number or a name the
+	 * pack never declared at all, stands for true. That is what packs are written against, and the
+	 * two shapes of the same mistake are both live in the corpus: one pack conditions a pass on a
+	 * setting declared {@code #define LUT 0 //[0 1]}, another writes the literal {@code true}, and
+	 * reading either as a preprocessor condition takes the pass away.
+	 */
+	private static final class EnabledExpression {
+
+		/**
+		 * How far a value may nest before it is called unreadable. A pack is downloaded content and
+		 * this runs while the client is starting: a {@code StackOverflowError} is an {@code Error},
+		 * so it walks straight through the {@code catch (IOException | RuntimeException)} of
+		 * {@link dev.vulture.pack.target.TargetPlan}, of the chain, and of the report that reads
+		 * every pack of the folder at startup, selected or not.
+		 */
+		private static final int MAX_DEPTH = 64;
+
+		private final String text;
+		private final Map<String, String> defines;
+		private final OptionIndex options;
+
+		private int position;
+		private int depth;
+		private boolean failed;
+
+		private EnabledExpression(String text, Map<String, String> defines, OptionIndex options) {
+			this.text = text;
+			this.defines = defines;
+			this.options = options;
+		}
+
+		/** @return null when the expression cannot be read at all, which the caller takes as true */
+		private Boolean parse() {
+			boolean value = or();
+			skipSpace();
+
+			return (this.failed || this.position < this.text.length()) ? null : value;
+		}
+
+		private boolean or() {
+			boolean left = and();
+			while (accept("||") || accept("|")) {
+				// Both sides are read whatever the left one said: short circuiting here would
+				// leave the right one in the text and the whole expression unreadable.
+				boolean right = and();
+				left = left || right;
+			}
+
+			return left;
+		}
+
+		private boolean and() {
+			boolean left = unary();
+			while (accept("&&") || accept("&")) {
+				boolean right = unary();
+				left = left && right;
+			}
+
+			return left;
+		}
+
+		/** The only place the grammar nests, so the one place the budget has to be spent. */
+		private boolean unary() {
+			this.depth++;
+			try {
+				if (this.depth > MAX_DEPTH) {
+					this.failed = true;
+					return false;
+				}
+
+				if (accept("!")) {
+					return !unary();
+				}
+
+				if (accept("(")) {
+					boolean value = or();
+					if (!accept(")")) {
+						this.failed = true;
+					}
+
+					return value;
+				}
+
+				return truth(name());
+			} finally {
+				this.depth--;
+			}
+		}
+
+		private String name() {
+			skipSpace();
+			int start = this.position;
+			while (this.position < this.text.length() && isNamePart(this.text.charAt(this.position))) {
+				this.position++;
+			}
+
+			if (start == this.position) {
+				this.failed = true;
+			}
+
+			return this.text.substring(start, this.position);
+		}
+
+		private static boolean isNamePart(char c) {
+			return Character.isLetterOrDigit(c) || c == '_' || c == '.';
+		}
+
+		/**
+		 * A switch the pack declares answers with its state; everything else answers true. The
+		 * declaration is what decides, not the value: {@code #define BLOOM} is a switch and
+		 * {@code #define BLOOM_STRENGTH 1.5} is not, however the pack later writes them.
+		 */
+		private boolean truth(String name) {
+			switch (name) {
+				case "true", "1" -> {
+					return true;
+				}
+				case "false", "0" -> {
+					return false;
+				}
+				default -> {
+				}
+			}
+
+			PackOption option = this.options.get(name).orElse(null);
+			if (option == null) {
+				return true;
+			}
+
+			if (option.kind() == PackOption.Kind.TOGGLE) {
+				return this.defines.containsKey(name);
+			}
+
+			// A constant the index does not offer is not a setting, so its name answers here
+			// the way an undeclared one does. Its declared value must not answer either: the
+			// reference never carries it into this table, whatever the declaration says.
+			if (option.kind() != PackOption.Kind.CONST || !"bool".equals(option.constType())
+					|| !this.options.offers(option)) {
+				return true;
+			}
+
+			String value = this.defines.get(name);
+
+			return value != null && (value.trim().equals("true") || value.trim().equals("1"));
+		}
+
+		private boolean accept(String token) {
+			skipSpace();
+			if (!this.text.startsWith(token, this.position)) {
+				return false;
+			}
+
+			this.position += token.length();
+
+			return true;
+		}
+
+		private void skipSpace() {
+			while (this.position < this.text.length()
+					&& Character.isWhitespace(this.text.charAt(this.position))) {
+				this.position++;
+			}
+		}
+	}
+
+	/**
+	 * The uniforms the pack declares for itself, in the order it writes them, with the
+	 * conditionals around them evaluated and the engine's symbols substituted into the expression.
+	 * <p>
+	 * Both halves of that are load bearing, and reading the file flat gets both wrong. BSL writes
+	 * its eleven biome uniforms twice, once against {@code BIOME_*} and once against the numeric
+	 * identifiers of an older Minecraft, under an {@code #if} on the version; flat reading takes
+	 * the second set and lands every biome on the wrong one. Bliss writes
+	 * {@code variable.float.lightningFlash} three times in three branches, the last of which is
+	 * the constant zero. And an expression that still says {@code BIOME_GROVE} does not parse at
+	 * all, because the evaluator has no such name.
+	 */
+	public List<CustomUniform> customUniforms(Map<String, String> defines) {
+		List<CustomUniform> uniforms = new ArrayList<>();
+
+		PropertiesFile.walkDefining(this.lines, defines, (line, live) -> {
+			Matcher uniform = CUSTOM_UNIFORM.matcher(line);
+			if (uniform.matches()) {
+				uniforms.add(new CustomUniform(uniform.group(1).equals("uniform"), uniform.group(2),
+						uniform.group(3), Macros.expand(uniform.group(4).trim(), live)));
+			}
+		});
+
+		return uniforms;
+	}
+
+	/**
+	 * The textures the pack supplies with a file of its own, by the key it wrote, in that order,
+	 * with the conditionals around each line evaluated. {@code texture.noise} is not among them:
+	 * it is answered by {@link #noiseTexturePath} and is not one of these.
+	 * <p>
+	 * Conditionally and not flat, for the reason every other reader here is conditional.
+	 * Complementary writes two of its {@code customTexture} lines under {@code #if} on its own
+	 * settings, and a {@code texture.deferred.colortex3} read out of a dead branch would take a
+	 * live colour target away from the pass that reads it.
+	 * <p>
+	 * The value is left exactly as written. What it means depends on how many words are in it, and
+	 * on files this class has no business opening.
+	 */
+	public Map<String, String> customTextures(Map<String, String> defines) {
+		Map<String, String> declared = new LinkedHashMap<>();
+
+		PropertiesFile.walk(this.lines, defines, line -> {
+			if (TEXTURE_NOISE.matcher(line).matches()) {
+				return;
+			}
+
+			Matcher texture = CUSTOM_TEXTURE.matcher(line);
+			if (texture.matches()) {
+				declared.put(texture.group(1), texture.group(2).trim());
+			}
+		});
+
+		return declared;
+	}
+
+	/**
+	 * Which pieces of the game's own sky the pack still wants drawn, live lines only.
+	 * <p>
+	 * Conditionally and not flat, and here that is not a nicety: both packs of the corpus that write
+	 * one of these lines write it under an {@code #if} on a setting of their own, and both would be
+	 * read backwards flat. Bliss switches its sun and its moon off in the {@code #else} of
+	 * {@code RESOURCEPACK_SKY == 2 || RESOURCEPACK_SKY == 3}, which is the live branch at its
+	 * default of nought; Mellow switches them off under a {@code ROUND_SUN} that its own settings
+	 * leave commented out, so that line is dead and its sun stays.
+	 * <p>
+	 * A value this cannot read leaves the piece as it was, which is what Iris does with the same
+	 * word, and the line stays among the keys nothing reads so that the pack's author can see it.
+	 *
+	 * @see SkyElements
+	 */
+	public SkyElements skyElements(Map<String, String> defines) {
+		Map<String, Boolean> drawn = new LinkedHashMap<>();
+
+		for (Matcher element : live(SKY_ELEMENT, defines)) {
+			Boolean value = truth(element.group(2).trim());
+			if (value != null) {
+				drawn.put(element.group(1), value);
+			}
+		}
+
+		// A walk of its own for the fifth word rather than a second test inside the first: what the
+		// four words answer is a boolean and what this one answers is not, and one loop reading both
+		// would carry the difference in the middle of it.
+		CloudSetting clouds = CloudSetting.DEFAULT;
+		for (Matcher asked : live(CLOUDS, defines)) {
+			CloudSetting setting = CloudSetting.of(asked.group(1).trim());
+			if (setting != null) {
+				clouds = setting;
+			}
+		}
+
+		return new SkyElements(drawn.getOrDefault("sun", true), drawn.getOrDefault("moon", true),
+				drawn.getOrDefault("stars", true), drawn.getOrDefault("sky", true), clouds);
+	}
+
+	/**
+	 * Whether the pack still wants the game's own rain and snow, and the splashes they leave on the
+	 * ground, live lines only.
+	 * <p>
+	 * The same family as {@link #skyElements} and read the same way, for the same measured reason:
+	 * the packs of the corpus that write one of these words write it under an {@code #if} on a
+	 * setting of their own, and read flat two of them come out backwards. <strong>Iris reaches the
+	 * same answer by another road and not by another rule</strong>: it hands the whole file to its
+	 * own preprocessor with the pack's settings as macros
+	 * ({@code shaderpack/properties/ShaderProperties.java:132}) and parses what comes back
+	 * ({@code :152}), so the branch this walk steps over never reaches its directive at
+	 * {@code :259-267} either.
+	 * <p>
+	 * <strong>The second word is a word about particles and not about the rain.</strong> It leaves
+	 * the curtain of rain alone and takes away the splash particles the ground throws up under it,
+	 * which is a separate thing the game does on a tick rather than in the frame.
+	 */
+	public Weather weather(Map<String, String> defines) {
+		boolean drawn = true;
+		boolean particles = true;
+
+		for (Matcher line : live(WEATHER, defines)) {
+			// Split on one space, the first word being the rain and the second the splashes, and a
+			// second word left out leaves the splashes alone. Iris splits this value the same way and
+			// reads anything that is not "true" as false; this reads the four words the rest of the
+			// file takes and leaves the piece as it was on anything else, which is the rule every
+			// other boolean of this class already follows.
+			String[] words = line.group(1).trim().split(" ", 0);
+			Boolean rain = truth(words[0]);
+			if (rain != null) {
+				drawn = rain;
+			}
+
+			if (words.length > 1) {
+				Boolean splashes = truth(words[1]);
+				if (splashes != null) {
+					particles = splashes;
+				}
+			}
+		}
+
+		return new Weather(drawn, particles);
+	}
+
+	/**
+	 * Where the pack asked for its particles to be drawn about the deferred stage, lowercased, and
+	 * empty where it did not ask.
+	 * <p>
+	 * <strong>Empty means the pack wrote nothing, and no default is worked out here.</strong> Iris
+	 * computes one, {@code AFTER} for a pack that ships deferred programs and does not ask for
+	 * separate entity draws, and then reaches for the answer nowhere in its own rendering; a default
+	 * invented here would therefore be a word about a placement neither engine performs, said about
+	 * packs that never wrote it. Five packs of the corpus write the line and all five write
+	 * {@code mixed}.
+	 * <p>
+	 * The older spelling is folded in: {@code particles.before.deferred=true} is {@code before}, and
+	 * it loses to an explicit ordering wherever the pack writes both, which is the precedence Iris
+	 * gives them.
+	 */
+	public Optional<String> particleOrdering(Map<String, String> defines) {
+		String ordering = null;
+
+		for (Matcher before : live(PARTICLES_BEFORE_DEFERRED, defines)) {
+			if (Boolean.TRUE.equals(truth(before.group(1).trim()))) {
+				ordering = "before";
+			}
+		}
+
+		for (Matcher line : live(PARTICLE_ORDERING, defines)) {
+			String word = line.group(1).trim().toLowerCase(Locale.ROOT);
+			if (!word.isEmpty()) {
+				ordering = word;
+			}
+		}
+
+		return Optional.ofNullable(ordering);
+	}
+
+	/**
+	 * Every line one pattern matches in the branches of this file that are really live, in file
+	 * order.
+	 * <p>
+	 * Shared rather than written once per caller: what counts as live is the whole subtlety of it,
+	 * and two walks that agree today are two walks that can be edited on different days. Every
+	 * family the reference reads off its preprocessed copy comes through here, one reader each;
+	 * some call it twice, the sky for its fifth word and the particles for their two spellings.
+	 */
+	private List<Matcher> live(Pattern pattern, Map<String, String> defines) {
+		List<Matcher> matched = new ArrayList<>();
+
+		PropertiesFile.walk(this.lines, defines, line -> {
+			Matcher match = pattern.matcher(line);
+			if (match.matches()) {
+				matched.add(match);
+			}
+		});
+
+		return matched;
+	}
+
+	/** Whether any word of a multi word directive is one {@link #truth} answers. */
+	private static boolean reads(String[] words) {
+		for (String word : words) {
+			if (truth(word) != null) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * The four words a boolean directive of this file may carry, and null for anything else.
+	 * <p>
+	 * Iris reads {@code true} and {@code 1} as one answer and {@code false} and {@code 0} as the
+	 * other; OptiFine reads {@code true} and {@code false} alone. The wider of the two is taken,
+	 * because a pack written against either is then read the way its author meant it.
+	 */
+	private static Boolean truth(String value) {
+		if (value.equals("true") || value.equals("1")) {
+			return Boolean.TRUE;
+		}
+
+		return (value.equals("false") || value.equals("0")) ? Boolean.FALSE : null;
+	}
+
+	/**
+	 * The sampler names an {@code image.NAME} directive hangs a storage image on, live lines only.
+	 * <p>
+	 * Read for one purpose and no more: to tell a refusal from a refusal. A {@code sampler3D} that
+	 * nothing in the pack backs with a file is a name this engine has nothing to put behind, and one
+	 * an {@code image} directive names is a volume a compute pass would have filled. Neither can be
+	 * bound, and only the second one says what is missing is a pass rather than a texture.
+	 * <p>
+	 * The sampler is the first word of the value, and {@code none} is the format's way of writing
+	 * that the image is never sampled at all, so it names nothing.
+	 */
+	public Set<String> imageSamplers(Map<String, String> defines) {
+		Set<String> samplers = new LinkedHashSet<>();
+		for (ImageInformation image : imageDirectives(defines).images()) {
+			image.sampler().ifPresent(samplers::add);
+		}
+
+		return samplers;
+	}
+
+	/**
+	 * The storage images the pack declares, live lines only, in the order it wrote them.
+	 * <p>
+	 * Iris reads the same grammar after its preprocessor has already substituted the pack's
+	 * settings ({@code ShaderProperties} around the {@code image.} handler). Here the
+	 * conditionals are evaluated against {@code defines} and a size written as a setting name
+	 * is looked up in that table, which is what lets Complementary size a volume with
+	 * {@code COLORED_LIGHTING} itself; a name the file defines above the line is looked up there
+	 * too. A seventeenth image is dropped, which is Iris's ceiling.
+	 */
+	public ImageInformation.Reading imageDirectives(Map<String, String> defines) {
+		List<ImageInformation> images = new ArrayList<>();
+		List<String> dropped = new ArrayList<>();
+
+		PropertiesFile.walkDefining(this.lines, defines, (line, live) -> {
+			Matcher image = IMAGE.matcher(line);
+			if (!image.matches()) {
+				return;
+			}
+
+			String name = image.group(1);
+			String value = image.group(2).trim();
+			if (images.size() >= ImageInformation.LIMIT) {
+				dropped.add("image." + name + ": only " + ImageInformation.LIMIT
+						+ " storage images are allowed");
+				return;
+			}
+
+			String reason = ImageInformation.parse(name, value, live, images);
+			if (reason != null) {
+				dropped.add("image." + name + " = " + value + ": " + reason);
+			}
+		});
+
+		return new ImageInformation.Reading(images, dropped);
+	}
+
+	/**
+	 * The storage buffers the pack declares, live lines only, in the order it wrote them.
+	 * <p>
+	 * Iris reads the same grammar after its preprocessor has already substituted the pack's
+	 * settings ({@code ShaderProperties} around the {@code bufferObject.} handler). Here the
+	 * conditionals are evaluated against {@code defines}. An index past twelve is dropped, which
+	 * is Iris's ceiling, and a size below one disables the line, which is Iris's way of turning
+	 * one off.
+	 */
+	public BufferObject.Reading bufferObjects(Map<String, String> defines) {
+		Map<Integer, BufferObject> buffers = new LinkedHashMap<>();
+		List<String> dropped = new ArrayList<>();
+
+		PropertiesFile.walk(this.lines, defines, line -> {
+			Matcher buffer = BUFFER_OBJECT.matcher(line);
+			if (!buffer.matches()) {
+				return;
+			}
+
+			String reason = BufferObject.parse(buffer.group(1), buffer.group(2).trim(), buffers);
+			if (reason != null) {
+				dropped.add("bufferObject." + buffer.group(1) + " = " + buffer.group(2).trim()
+						+ ": " + reason);
+			}
+		});
+
+		return new BufferObject.Reading(List.copyOf(buffers.values()), dropped);
+	}
+
+	/**
+	 * The settings a profile chooses. A profile may pull in another one, so this resolves the
+	 * chain; the later choice wins, which is what lets a profile refine the one it includes.
+	 */
+	public Map<String, OptionValue> expandProfile(String name) {
+		return expandProfile(name, _ -> true);
+	}
+
+	/**
+	 * The same, with a say over the ONE form the reference checks before it keeps it.
+	 * <p>
+	 * <strong>A bare positive token naming a setting the pack declares nowhere is not a
+	 * constraint.</strong> {@code ProfileSet.parse} looks that form up in the boolean half of its
+	 * index and drops it with a warning when it is not there
+	 * ({@code shaderpack/option/ProfileSet.java:78-81}), leaving the profile made of what remains.
+	 * The other three forms it takes go through unchecked, and so do they here.
+	 * <p>
+	 * Keeping it costs what a profile is for. Photon writes {@code GTAO} in all four of its
+	 * profiles and declares it in no shader, so a constraint on it can never be met: every profile
+	 * fails to match, the overlay reads {@code Custom (+0 options changed by user)}, which is its own
+	 * contradiction, and the selector can never land on a name. The picture is untouched either way,
+	 * both engines applying a word nowhere, which is why {@link #expandProfile(String)} keeps its
+	 * old behaviour for the paths that only apply values.
+	 *
+	 * @param known answers whether the pack declares that name as a toggle
+	 */
+	public Map<String, OptionValue> expandProfile(String name, Predicate<String> known) {
+		Map<String, OptionValue> chosen = new LinkedHashMap<>();
+		expandProfile(name, chosen, 0, new int[1], known);
+
+		return chosen;
+	}
+
+	/**
+	 * @param budget how many expansions the whole nest has left, shared rather than restarted at
+	 *               each hop. Neither a set of names already seen nor a set of names on the path
+	 *               would do instead: the first changes what the format means, since the later
+	 *               choice wins and a profile named twice is written twice on purpose, and the
+	 *               second stops only cycles, which are not what costs
+	 */
+	private void expandProfile(String name, Map<String, OptionValue> chosen, int depth, int[] budget,
+			Predicate<String> known) {
+		String body = this.profiles.get(name);
+		if (body == null || depth > MAX_PROFILE_DEPTH || ++budget[0] > MAX_PROFILE_EXPANSIONS) {
+			return;
+		}
+
+		// A profile body is one of the lists, so it is split on a run of spaces like the others.
+		for (String token : body.trim().split(" +", -1)) {
+			if (token.isEmpty()) {
+				continue;
+			}
+
+			if (token.startsWith("profile.")) {
+				expandProfile(token.substring("profile.".length()), chosen, depth + 1, budget, known);
+			} else if (token.startsWith("!")) {
+				chosen.put(token.substring(1), OptionValue.off());
+			} else {
+				int equals = token.indexOf('=');
+				if (equals >= 0) {
+					chosen.put(token.substring(0, equals), OptionValue.of(token.substring(equals + 1)));
+				} else if (known.test(token)) {
+					chosen.put(token, OptionValue.on());
+				}
+			}
+		}
+	}
+
+	public boolean present() {
+		return this.present;
+	}
+
+	/**
+	 * Whether the pack asked for its shadows to follow the End flash, off unless it says otherwise,
+	 * under the conditionals. It is the pack opting in, so it decides where the shadow light points
+	 * in the End and nothing else; the flash's own position is published either way. A line
+	 * whose value is not one of the four boolean words leaves the previous one standing, which
+	 * is what the reference does with it. No pack of the corpus writes it.
+	 */
+	public boolean endFlashShadows(Map<String, String> defines) {
+		boolean asked = false;
+		for (Matcher line : live(END_FLASH_SHADOWS, defines)) {
+			Boolean value = truth(line.group(1).trim());
+			if (value != null) {
+				asked = value;
+			}
+		}
+
+		return asked;
+	}
+
+	/**
+	 * Whether the pack asked for the rain and the snow to write the world's depth, live lines only,
+	 * off unless it says otherwise.
+	 * <p>
+	 * The game writes it only where its own transparency chain is running, so a pack asking for this
+	 * is asking for the curtain to occlude whatever is drawn behind it afterwards, and what that
+	 * decides on our side is which of the game's two weather pipelines the pack's program inherits
+	 * its depth state from.
+	 * <p>
+	 * Read through {@link #live} like the rest of the family, and the pattern's own note says why
+	 * that is what the reference does as well. Three packs of the corpus write the line and all
+	 * three ask for false, so what this buys today is the pack that will ask for true.
+	 */
+	public boolean rainDepth(Map<String, String> defines) {
+		boolean asked = false;
+		for (Matcher line : live(RAIN_DEPTH, defines)) {
+			Boolean value = truth(line.group(1).trim());
+			if (value != null) {
+				asked = value;
+			}
+		}
+
+		return asked;
+	}
+
+	/**
+	 * Whether the pack wants Distant Horizons' far terrain drawn into its shadow map, live lines
+	 * only, ON unless it says otherwise.
+	 * <p>
+	 * <strong>The default is the opposite way round from every other word about the map, and it is
+	 * Iris's</strong> ({@code pipeline/IrisRenderingPipeline.java:408} handing
+	 * {@code isDhShadowEnabled().orElse(true)} to the object that builds the program). A pack that
+	 * ships a {@code dh_shadow} and says nothing has asked for it to be drawn; there is no second
+	 * flag it could have meant.
+	 * <p>
+	 * <strong>Live lines are the whole of it here.</strong> Bliss writes the word three times, once
+	 * true and twice false, and the true one stands alone under an {@code #ifdef} of a setting it
+	 * ships commented out ({@code shaders/lib/settings.glsl:721}). Read flat, the answer is whichever
+	 * line the file ends on, which is the {@code #else} arm of a conditional about whether Distant
+	 * Horizons is running at all.
+	 *
+	 * @param defines the pack's settings, which decide which lines of the file are alive at all
+	 */
+	public boolean dhShadow(Map<String, String> defines) {
+		boolean asked = true;
+		for (Matcher line : live(DH_SHADOW, defines)) {
+			Boolean value = truth(line.group(1).trim());
+			if (value != null) {
+				asked = value;
+			}
+		}
+
+		return asked;
+	}
+
+	/**
+	 * What the pack asked of the clouds Distant Horizons draws past the world's own, live lines only,
+	 * or {@link CloudSetting#DEFAULT} where no live line says anything this can read.
+	 * <p>
+	 * Iris reads the same word into a setting of its own and answers DH with it in
+	 * {@code compat/dh/DHCompatInternal.java:290}: the far clouds are kept out where it says
+	 * {@code off}, and where it says nothing they follow {@code clouds}, so a pack that switched the
+	 * game's clouds off for clouds of its own does not have DH's drawn back over them.
+	 * <p>
+	 * <strong>{@code on} is a word of this line and not of {@code clouds},</strong> which is why it
+	 * is read through {@link CloudSetting#ofDistant}: Iris takes {@code off} as off and {@code on} or
+	 * {@code fancy} as fancy ({@code shaderpack/properties/ShaderProperties.java:170-178}). Read as
+	 * {@code clouds} is read, {@code on} named nothing, so a pack writing {@code dhClouds=on} beside
+	 * {@code clouds=off} was taken to have said nothing and lost DH's clouds to the rule above.
+	 * <p>
+	 * Live lines for the reason {@link #dhShadow} gives: the packs that write it write it under an
+	 * {@code #ifdef DISTANT_HORIZONS}.
+	 *
+	 * @param defines the pack's settings, which decide which lines of the file are alive at all
+	 */
+	public CloudSetting dhClouds(Map<String, String> defines) {
+		CloudSetting asked = CloudSetting.DEFAULT;
+		for (Matcher line : live(DH_CLOUDS, defines)) {
+			CloudSetting setting = CloudSetting.ofDistant(line.group(1).trim());
+			if (setting != null) {
+				asked = setting;
+			}
+		}
+
+		return asked;
+	}
+
+	/**
+	 * Which of the world's six families the pack wants drawn into the shadow map, live lines only.
+	 * <p>
+	 * <strong>The defaults are Iris's and two of them are not what they look like.</strong> Four are
+	 * on, {@code shadowPlayer} and {@code shadowLightBlockEntities} are OFF
+	 * ({@code shaderpack/properties/PackShadowDirectives.java:87-92}), and neither of those two means
+	 * the thing it names casts nothing by default: the player is one of the entities and a lamp is
+	 * one of the block entities, so the wider word carries it. Each narrow word is consulted only
+	 * where its wider one is off, and there it is the whole of what is drawn. Read as additive flags
+	 * they get both readings wrong in opposite directions: the player would be kept out of every
+	 * default shadow map there is, and a pack asking for its lamps alone would have every chest and
+	 * every sign in its map beside them.
+	 *
+	 * @param defines the pack's settings, which decide which lines of the file are alive at all
+	 */
+	public ShadowCasters shadowCasters(Map<String, String> defines) {
+		boolean terrain = ShadowCasters.DEFAULT.terrain();
+		boolean translucent = ShadowCasters.DEFAULT.translucent();
+		boolean entities = ShadowCasters.DEFAULT.entities();
+		boolean player = ShadowCasters.DEFAULT.player();
+		boolean blockEntities = ShadowCasters.DEFAULT.blockEntities();
+		boolean lightBlockEntities = ShadowCasters.DEFAULT.lightBlockEntities();
+
+		for (Matcher line : live(SHADOW_CASTER, defines)) {
+			Boolean value = truth(line.group(2).trim());
+			if (value == null) {
+				continue;
+			}
+
+			switch (line.group(1)) {
+				case "shadowTerrain" -> terrain = value;
+				case "shadowTranslucent" -> translucent = value;
+				case "shadowEntities" -> entities = value;
+				case "shadowPlayer" -> player = value;
+				case "shadowBlockEntities" -> blockEntities = value;
+				case "shadowLightBlockEntities" -> lightBlockEntities = value;
+				// Named one by one rather than letting the last word be the catch-all: a seventh
+				// alternative added to the pattern without its own arm would be written into the
+				// sixth family in silence, and a caster read into the wrong family is a caster in a
+				// map the pack asked to keep it out of.
+				default -> { }
+			}
+		}
+
+		return new ShadowCasters(terrain, translucent, entities, player, blockEntities,
+				lightBlockEntities);
+	}
+
+	/**
+	 * Which shape the pack wants the light to measure a section against, live lines only, and
+	 * {@link ShadowCullState#DEFAULT} unless it says otherwise. Six packs of the eight tested write
+	 * the key.
+	 * <p>
+	 * The last live line decides, and a word this cannot read leaves the default standing rather
+	 * than the line before it. That is Iris's reading and not a simplification of it: it loads the
+	 * preprocessed file into a map and runs its switch once, on the key's last value alone, and the
+	 * arm for an unknown word logs and touches nothing
+	 * ({@code shaderpack/properties/ShaderProperties.java:180-186}). The one thing not carried over
+	 * is that log line, this module having no logger and no business acquiring one.
+	 *
+	 * @param defines the pack's settings, which decide which lines of the file are alive at all
+	 */
+	public ShadowCullState shadowCull(Map<String, String> defines) {
+		ShadowCullState asked = ShadowCullState.DEFAULT;
+		for (Matcher line : live(SHADOW_CULLING, defines)) {
+			ShadowCullState state = ShadowCullState.of(line.group(1).trim());
+			asked = state == null ? ShadowCullState.DEFAULT : state;
+		}
+
+		return asked;
+	}
+
+	/**
+	 * Whether the pack asked for the terrain's ambient occlusion to be kept out of the vertex
+	 * colour, live lines only, off unless it says otherwise.
+	 * <p>
+	 * A pack that asks for it reads the block's own tint in {@code gl_Color.rgb} and the occlusion
+	 * in {@code gl_Color.a}, instead of the tint with the occlusion already multiplied into it.
+	 * Six packs of the corpus ask for it, and it is a property of the MESH: what answers it is the
+	 * chunk vertex encoder, not anything the translator writes.
+	 * <p>
+	 * Read through {@link #live}, and {@link #RAIN_DEPTH}'s own note says why that is what the
+	 * reference does as well. <strong>The last live line decides, and it decides even when it
+	 * carries a word this cannot read</strong>, which is what Iris does: it
+	 * loads the preprocessed file into an {@code OrderBackedProperties} and walks the MAP rather
+	 * than the file ({@code shaderpack/properties/ShaderProperties.java:143-152}), so a key written
+	 * twice keeps its last value and {@code :211} runs once for it, on that value alone. Its
+	 * {@code handleBooleanDirective} takes {@code true}, {@code 1}, {@code false} and {@code 0} and
+	 * warns at anything else without touching the field ({@code :636-648}).
+	 * <p>
+	 * That is the whole of the difference the other reading would make, and it takes a
+	 * pack writing the key twice to see it: on {@code separateAo=true} followed by
+	 * {@code separateAo=yes}, keeping the last line this can read answers true where the reference
+	 * leaves its default standing and answers false.
+	 * <p>
+	 * <strong>{@link #rainDepth} and {@link #shadowCasters} still read the older way</strong>, so
+	 * this file answers the same question two ways until they are moved with it. They are not left
+	 * behind for a reason: the reference reads all three through the one map walk and the one
+	 * boolean handler, so the same correction is owed to both, and it is a change of its own rather
+	 * than a line of this one. A reader comparing the three should expect them to part, and should
+	 * expect that to end.
+	 */
+	public boolean separateAo(Map<String, String> defines) {
+		Boolean asked = null;
+		for (Matcher line : live(SEPARATE_AO, defines)) {
+			asked = truth(line.group(1).trim());
+		}
+
+		return Boolean.TRUE.equals(asked);
+	}
+
+	/**
+	 * Whether the pack declares that anisotropic filtering breaks the way it reads the block atlas,
+	 * live lines only, off unless it says otherwise.
+	 * <p>
+	 * A pack that asks for it is not asking for a look: it is saying that neighbouring sprites bleed
+	 * into each other at grazing angles once the sampler averages across their border, which is a
+	 * strip of the wrong texture along a block edge seen from low down. BSL and both Complementary
+	 * variants write it. Iris reads it into its directives
+	 * ({@code shaderpack/properties/ShaderProperties.java:212}) and forces the anisotropy of the
+	 * terrain sampler to one where it holds, whatever the player set
+	 * ({@code samplers/IrisSamplers.java:250}).
+	 * <p>
+	 * Read through {@link #live} and answered like {@link #separateAo}, whose note carries why the
+	 * last live line decides even when it carries a word this cannot read.
+	 */
+	public boolean breaksAnisotropy(Map<String, String> defines) {
+		Boolean asked = null;
+		for (Matcher line : live(BREAKS_ANISOTROPY, defines)) {
+			asked = truth(line.group(1).trim());
+		}
+
+		return Boolean.TRUE.equals(asked);
+	}
+
+	/**
+	 * Whether the main hand reports the brighter of the two hands' light, live lines only, ON unless
+	 * the pack says otherwise.
+	 * <p>
+	 * <strong>The default is the other way round from its two neighbours above, and it is Iris's</strong>
+	 * ({@code shaderpack/properties/PackDirectives.java:96}, {@code getOldHandLight().orElse(true)}).
+	 * A pack that says nothing was written when the off hand had no light of its own, so the one
+	 * name it reads has to answer for whichever hand carries the torch.
+	 * <p>
+	 * <strong>It decides a light and never an identifier.</strong> Iris builds the off hand's
+	 * supplier with the rule switched off outright ({@code uniforms/IdMapUniforms.java:29}) and
+	 * applies it inside the light alone ({@code :98-100}, after the identifier is settled at
+	 * {@code :93}), so a torch in the off hand brightens the scene without making an empty main hand
+	 * read as a torch.
+	 * <p>
+	 * Read through {@link #live} and answered like {@link #separateAo}, whose note carries why the
+	 * last live line decides even when it carries a word this cannot read.
+	 *
+	 * @param defines the pack's settings, which decide which lines of the file are alive at all
+	 */
+	public boolean oldHandLight(Map<String, String> defines) {
+		Boolean asked = null;
+		for (Matcher line : live(OLD_HAND_LIGHT, defines)) {
+			asked = truth(line.group(1).trim());
+		}
+
+		return asked == null || asked;
+	}
+
+	/**
+	 * Whether the pack asks for the game's own per face brightness to stay in the chunk mesh, which
+	 * is what {@code oldLighting} means and what almost no pack wants.
+	 * <p>
+	 * <strong>The default is off, and it is the reference's</strong>
+	 * ({@code shaderpack/properties/PackDirectives.java:92},
+	 * {@code getOldLighting().orElse(false)}). A pack computes its own directional shading from the
+	 * normal it is handed, so the game's fixed factor multiplied in beneath it shades the same
+	 * surface twice: the top of the world is unharmed, its factor being one, and every other face
+	 * comes out darker than the pack drew it. What the directive buys back is the old behaviour for
+	 * a pack written to expect it.
+	 * <p>
+	 * Read through {@link #live} and answered like {@link #separateAo}, whose note carries why the
+	 * last live line decides even when it carries a word this cannot read.
+	 *
+	 * @param defines the pack's settings, which decide which lines of the file are alive at all
+	 */
+	public boolean oldLighting(Map<String, String> defines) {
+		Boolean asked = null;
+		for (Matcher line : live(OLD_LIGHTING, defines)) {
+			asked = truth(line.group(1).trim());
+		}
+
+		return Boolean.TRUE.equals(asked);
+	}
+
+	/** Each profile's unexpanded body, in the order the pack declares them. */
+	public Map<String, String> profiles() {
+		return this.profiles;
+	}
+
+	public Map<String, String> customUniformTypes() {
+		return this.customUniformTypes;
+	}
+
+	public Set<String> screenTokens() {
+		return this.screenTokens;
+	}
+
+	/**
+	 * The pages a pack lays out with every token kept: a blank slot, an option, a link to another
+	 * page, the profile selector, or the dump of everything no page named. This is the form a
+	 * screen reads. Pages come in the order the pack declares them, the one it opens on being
+	 * ""; a name that is not an option is a sub page, and the key to find it under here.
+	 * <p>
+	 * {@link #screenTokens()} keeps the role it had, because the measurements this project
+	 * compares itself against were taken with it, and it drops the three hundred and eighteen
+	 * tokens of the corpus that are not an option name. Reading {@code screen.columns} consumes
+	 * that line, so it leaves behind no page named {@code columns} that nothing could reach:
+	 * Bliss is the one pack that writes it, and it goes from sixty three pages to sixty two.
+	 */
+	public Map<String, List<ScreenToken>> screenLayout() {
+		return this.screenLayout;
+	}
+
+	/** How many columns a page asks for, when it asks. "" is the page the pack opens on. */
+	public OptionalInt columns(String page) {
+		Integer count = this.columns.get(page);
+
+		return count == null ? OptionalInt.empty() : OptionalInt.of(count);
+	}
+
+	public List<String> sliders() {
+		return this.sliders;
+	}
+
+	/**
+	 * What the pack says it cannot be drawn without, in the pack's own spelling and unfiltered.
+	 * <p>
+	 * Whoever compares this list decides what the names mean; this class only reads them. Iris
+	 * refuses a pack naming one it cannot serve and the rule here is the same: {@code PackChain}
+	 * strikes off the names this engine has built, which are the ones {@code EngineDefines} poses
+	 * an {@code IRIS_FEATURE_} define for, and refuses the pack on whatever is left over. The two
+	 * move together, a define being the promise the refusal is the other half of.
+	 */
+	public List<String> requiredFeatures() {
+		return this.requiredFeatures;
+	}
+
+	/**
+	 * Whether the pack names a capability at all, required or optional, which is the question that
+	 * decides what a name buys it. Iris folds the two lists into one set and asks it exactly this
+	 * ({@code shaderpack/ShaderPack.java:208-213}, read at line 620 by {@code hasFeature}), and its
+	 * own lookup is case-insensitive ({@code features/FeatureFlags.java:65-73}), so this one is too.
+	 */
+	public boolean declares(String feature) {
+		return names(this.requiredFeatures, feature) || names(this.optionalFeatures, feature);
+	}
+
+	private static boolean names(List<String> declared, String feature) {
+		return declared.stream().anyMatch(name -> name.equalsIgnoreCase(feature));
+	}
+
+	/**
+	 * The blend overrides the pack writes, in file order, under the conditionals. Conditionally
+	 * for the reason {@link #alphaTests} gives: Complementary writes its water blend under
+	 * {@code DISTANT_HORIZONS} and a weather target's {@code off} under a setting of its own, and
+	 * read flat both would hold whatever the define or the setting said.
+	 */
+	public List<BlendDirective> blend(Map<String, String> defines) {
+		List<BlendDirective> directives = new ArrayList<>();
+		for (Matcher line : live(BLEND, defines)) {
+			directives.add(new BlendDirective(line.group(1), line.group(2), line.group(3).trim()));
+		}
+
+		return directives;
+	}
+
+	/**
+	 * The size a pack asks a colour target to be, by the name it wrote, raw, the last live line
+	 * for a name winning. The two tokens are often settings rather than numbers, so reading them
+	 * needs {@link TargetSize} and the resolved settings.
+	 * <p>
+	 * Under the conditionals, and this family is where a flat read costs the most: Photon writes
+	 * the size of two targets four times in the four arms of one setting, so a flat read hands
+	 * every choice the size of the last arm.
+	 */
+	public Map<String, String> sizeBuffers(Map<String, String> defines) {
+		Map<String, String> sizes = new LinkedHashMap<>();
+		for (Matcher line : live(SIZE_BUFFER, defines)) {
+			sizes.put(line.group(1), line.group(2).trim());
+		}
+
+		return sizes;
+	}
+
+	/**
+	 * Where a pack takes the ping pong into its own hands, under the conditionals. One line in the
+	 * whole corpus, and a line whose value is not one of the four boolean words is not one of
+	 * these, which is where the reference leaves it too.
+	 */
+	public List<FlipDirective> flips(Map<String, String> defines) {
+		List<FlipDirective> directives = new ArrayList<>();
+		for (Matcher line : live(FLIP, defines)) {
+			Boolean value = flipValue(line);
+			if (value != null) {
+				directives.add(new FlipDirective(line.group(1), line.group(2), value));
+			}
+		}
+
+		return directives;
+	}
+
+	/** The boolean a {@code flip} line carries, or null for a value that is not one. */
+	private static Boolean flipValue(Matcher flip) {
+		return truth(flip.group(3).trim());
+	}
+
+	/**
+	 * What alpha each program discards at, where the pack overrides the default of the pass it is
+	 * drawn in, keyed by the name of the file that serves the pass and not the name the pass asked
+	 * for. A line this could not read is absent, and the program falls back to the default of its
+	 * pass.
+	 * <p>
+	 * Conditionally and not flat: the reference reads this family off its preprocessed copy of
+	 * the file, so an override written under a setting's {@code #if} has to come and go with the
+	 * setting. Six of the eight packs of the corpus write these lines, and none under a
+	 * conditional, which is what kept a flat read invisible.
+	 */
+	public Map<String, AlphaTest> alphaTests(Map<String, String> defines) {
+		Map<String, AlphaTest> overrides = new LinkedHashMap<>();
+		for (Matcher line : live(ALPHA_TEST, defines)) {
+			AlphaTest.parse(line.group(2).trim())
+					.ifPresent(test -> overrides.put(line.group(1), test));
+		}
+
+		return overrides;
+	}
+
+	/**
+	 * Whether the pack switches its whole shadow map on or off, {@code shadow.enabled}, under the
+	 * conditionals. Empty when the pack says nothing, which leaves the stage standing on its
+	 * programs; the reference reads it the same way and only an explicit {@code false} moves
+	 * anything there ({@code IrisRenderingPipeline.java:464}, {@code orElse(true)}).
+	 */
+	public Optional<Boolean> shadowEnabled(Map<String, String> defines) {
+		Boolean state = null;
+		for (Matcher line : live(SHADOW_ENABLED, defines)) {
+			Boolean value = truth(line.group(1).trim());
+			if (value != null) {
+				state = value;
+			}
+		}
+
+		return Optional.ofNullable(state);
+	}
+
+	public int directiveCount() {
+		return this.directiveCount;
+	}
+
+	/** How many blend lines the file carries, live or not: a census, where {@link #blend} answers. */
+	public int blendCount() {
+		return this.blendCount;
+	}
+
+	public int continuationCount() {
+		return this.continuationCount;
+	}
+
+	public Map<String, Integer> ignoredPrefixes() {
+		return new TreeMap<>(this.ignoredPrefixes);
+	}
+
+	/**
+	 * The pack's own noise image, {@code texture.noise}, relative to {@code shaders/}, read under
+	 * the conditionals with the last live line winning.
+	 */
+	public Optional<String> noiseTexturePath(Map<String, String> defines) {
+		String path = null;
+		for (Matcher line : live(TEXTURE_NOISE, defines)) {
+			path = line.group(1).trim();
+		}
+
+		return Optional.ofNullable(path);
+	}
+
+	/**
+	 * One slot of a settings page, in the order the pack wrote it.
+	 * <p>
+	 * Sealed rather than a string, so that a form a screen forgets to draw is a compile error
+	 * instead of a blank square nobody notices. A blank is one of the five forms and not the
+	 * absence of a form: it is how a pack lines its columns up by hand, and the corpus writes
+	 * seven hundred and seventy three of them.
+	 */
+	public sealed interface ScreenToken {
+
+		/** {@code <empty>}. */
+		record Blank() implements ScreenToken {
+		}
+
+		/** An option, if the pack turns out to declare one by that name. */
+		record Name(String name) implements ScreenToken {
+		}
+
+		/** {@code [NAME]}. Pages are flat and joined by name, never nested. */
+		record Link(String page) implements ScreenToken {
+		}
+
+		/** {@code <profile>}, which a pack declaring no profile does not get. */
+		record Profiles() implements ScreenToken {
+		}
+
+		/** {@code *}, everything no page named, at this position. */
+		record Rest() implements ScreenToken {
+		}
+	}
+
+	/**
+	 * One {@code uniform.<type>.<name>} or {@code variable.<type>.<name>} line. A {@code uniform.}
+	 * reaches the shader, a {@code variable.} is only there for the ones that do.
+	 */
+	public record CustomUniform(boolean exposed, String type, String name, String expression) {
+	}
+
+	/** How a program wants its output blended, either off or four GL factors. */
+	public record BlendDirective(String program, String buffer, String value) {
+
+		public boolean off() {
+			return this.value.equalsIgnoreCase("off");
+		}
+	}
+
+	/** Whether a program swaps a target's two halves, said outright rather than inferred. */
+	public record FlipDirective(String program, String buffer, boolean value) {
+	}
+
+	/**
+	 * What a pack still wants of the game's own weather. A pack that says nothing wants both, which
+	 * is what every pack of the corpus is: none of the eight writes the line.
+	 *
+	 * @param drawn     whether the curtain of rain and snow is drawn at all. Like the sky's four
+	 *                  words this is a removal and not a choice of shader: a pack that says no draws
+	 *                  its own, and handing it the game's on top puts two curtains in the air
+	 * @param particles whether the splashes the ground throws up under the rain are drawn. A
+	 *                  different thing in a different place: they are ordinary particles, spawned on
+	 *                  a tick by the level rather than drawn by the weather renderer
+	 */
+	public record Weather(boolean drawn, boolean particles) {
+	}
+
+	/**
+	 * How the game's own three cloud settings are named in {@code shaders.properties}, plus the
+	 * absence of the line.
+	 * <p>
+	 * Not a boolean, alone in its family, and that is why it is an enum rather than a fifth flag: a
+	 * pack asking for {@code fast} is not refusing the clouds, it is asking for the flat ones, and
+	 * the game has a pipeline for each.
+	 */
+	public enum CloudSetting {
+
+		/** The line is missing or says something this cannot read. The user's own setting stands. */
+		DEFAULT,
+		OFF,
+		FAST,
+		FANCY;
+
+		/** The setting a value names, or null for anything else. */
+		static CloudSetting of(String value) {
+			return switch (value.toLowerCase(Locale.ROOT)) {
+				case "off" -> OFF;
+				case "fast" -> FAST;
+				case "fancy" -> FANCY;
+				default -> null;
+			};
+		}
+
+		/**
+		 * The setting a {@code dhClouds} value names, or null for anything else: {@code off}, or
+		 * {@code on} and {@code fancy} for the same thing, which are Iris's words for that line
+		 * ({@code shaderpack/properties/ShaderProperties.java:170-178}). {@code fast} is not one of
+		 * them.
+		 */
+		static CloudSetting ofDistant(String value) {
+			return switch (value.toLowerCase(Locale.ROOT)) {
+				case "off" -> OFF;
+				case "on", "fancy" -> FANCY;
+				default -> null;
+			};
+		}
+	}
+
+	/**
+	 * Which pieces of the game's own sky a pack still wants drawn, and how it wants the clouds. A
+	 * pack that says nothing wants all four and leaves the clouds to the user, which is what every
+	 * one of them was written against.
+	 * <p>
+	 * The four booleans are a way of saying "I draw that myself", so the piece has to go rather than
+	 * fall back to the game's own shader: a pack drawing its own sun in {@code gbuffers_skybasic} and
+	 * handed the game's on top has two suns in the sky.
+	 * <p>
+	 * The fifth is not one of those and reads the other way round: it overrules the user's cloud
+	 * setting so that the pack's own {@code gbuffers_clouds} is handed the geometry it was written
+	 * for. It was deliberately not honoured while nothing here drew a cloud, because {@code off}
+	 * would then have taken the game's clouds away and put nothing back.
+	 */
+	public record SkyElements(boolean sun, boolean moon, boolean stars, boolean sky,
+			CloudSetting clouds) {
+
+		/**
+		 * Whether the piece one directive names is still drawn.
+		 *
+		 * @param directive the key as the file spells it, or anything else for a piece no directive
+		 *                  of the format names, which is then always drawn
+		 */
+		public boolean allows(String directive) {
+			return switch (directive) {
+				case "sun" -> this.sun;
+				case "moon" -> this.moon;
+				case "stars" -> this.stars;
+				case "sky" -> this.sky;
+				default -> true;
+			};
+		}
+
+	}
+
+	private static final class Builder {
+
+		private List<String> lines = List.of();
+		private final Map<String, String> profiles = new LinkedHashMap<>();
+		private final Map<String, String> customUniformTypes = new LinkedHashMap<>();
+		private final Set<String> screenTokens = new LinkedHashSet<>();
+		private final Map<String, List<ScreenToken>> screenLayout = new LinkedHashMap<>();
+		private final Map<String, Integer> columns = new LinkedHashMap<>();
+		private final List<String> sliders = new ArrayList<>();
+		private List<String> requiredFeatures = List.of();
+		private List<String> optionalFeatures = List.of();
+		private final Map<String, Integer> ignoredPrefixes = new LinkedHashMap<>();
+		private int directiveCount;
+		private int blendCount;
+		private int continuationCount;
+		private boolean present;
+	}
+}

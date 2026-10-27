@@ -1,0 +1,479 @@
+plugins {
+	id "base"
+	id "net.ltgt.errorprone" version "4.1.0" apply false
+}
+
+// Between two releases `dev` carries the version being written towards, suffixed `-dev`, so that
+// nothing built before a release can be read as that release. One ambiguity survives that suffix:
+// every topic branch open at the same time builds the same 0.10.0-dev, and a jar, a log line or a
+// screenshot out of one is indistinguishable from another's. So a build off a topic branch appends
+// the branch name to the suffix. It is appended here and committed nowhere, because the answer
+// depends on which branch is checked out and a committed one would be wrong on every other.
+//
+// This is the one place the number is decided, and everything that states it reads this: the jar
+// names, the two metadata files the loaders parse, and through them the F3 line, the settings
+// screen and the line the engine logs at load. They agree because there is nothing left for them
+// to disagree about.
+//
+// A version that does not end in `-dev` is never touched, which is the whole of what leaves a
+// release exactly what gradle.properties says. `.github/workflows/release.yml` compares the tag
+// against that line and refuses a mismatch, and it checks a tag out, so its head is detached and
+// carries no branch name to append anyway. `dev` and `main` are left bare for the other half of
+// the reason: a branch name that every build of the line shares tells no build from another. What
+// does tell them apart is the commit, and that is read below and kept out of the version.
+def effectiveVersion = project.mod_version
+def development = effectiveVersion.endsWith("-dev")
+
+// What git says to one question, trimmed, or null when there is no git on the path, no repository
+// under this directory, or the command itself refused. A build out of a tarball is a legitimate
+// build, so every caller below answers a null rather than stopping on it.
+def gitSaid = { String... command ->
+	try {
+		def git = new ProcessBuilder(command)
+				.directory(rootDir)
+				.redirectErrorStream(true)
+				.start()
+		def said = git.inputStream.getText("UTF-8").trim()
+
+		return git.waitFor() == 0 ? said : null
+	} catch (IOException ignored) {
+		return null
+	}
+}
+
+if (development) {
+	def branch = gitSaid("git", "rev-parse", "--abbrev-ref", "HEAD")
+
+	// "HEAD" is what a detached head answers, which is what continuous integration checks out and
+	// what a release build therefore is.
+	if (branch != null && !(branch in ["dev", "main", "HEAD"])) {
+		// Where this ends up is a semantic version pre-release string, a run of identifiers of
+		// [-0-9A-Za-z] separated by dots: that is what Fabric Loader's SemanticVersionImpl matches
+		// everything after the first dash against, and a jar it refuses there does not load at
+		// all. So a slash becomes a dot, and anything outside the set is dropped rather than
+		// replaced, a replacement being only another character to justify. Empty identifiers go
+		// with them, because a name made entirely of dropped characters would otherwise leave a
+		// trailing dot, which is one of the strings that parser refuses.
+		//
+		// NeoForge asks something weaker, worth naming since the same string is handed to both:
+		// ModInfo takes any Maven version whose first character is a digit, and the major number
+		// in front satisfies that whatever follows it.
+		def slug = branch.replace("/", ".")
+				.replaceAll("[^0-9A-Za-z.-]", "")
+				.split("\\.")
+				.findAll { !it.isEmpty() }
+				.join(".")
+
+		if (!slug.isEmpty()) {
+			effectiveVersion = "${effectiveVersion}.${slug}"
+		}
+	}
+}
+
+// Put back on the project because both loader modules read it too, each of them naming it in the
+// metadata it expands and in the name of the jar it writes.
+ext.effectiveVersion = effectiveVersion
+
+// The commit a development build was made from, which is the one thing that tells two of them
+// apart. The number above cannot: every build between two releases declares the same one, and the
+// two disk caches name their editions after it, so a jar built today is served the units a jar
+// built last week wrote. A translator fixed without the number moving is then invisible on screen,
+// with nothing anywhere saying why.
+//
+// It stays out of the version. The version is what a player reads, what names a jar and what two
+// loaders parse, and a hash there is noise to all three. It travels as a resource the common
+// module writes instead, and the road is the branch's: read from git here, committed nowhere,
+// because the answer depends on which commit is checked out and a committed one would be wrong at
+// the next.
+//
+// A release build leaves it empty, and that is what leaves a player's caches exactly as they are:
+// they are worth keeping across every jar of one version, since nothing but a release changes what
+// those jars compile.
+def buildIdentity = ""
+
+if (development) {
+	def head = gitSaid("git", "rev-parse", "--short", "HEAD")
+
+	if (head != null && !head.isEmpty()) {
+		// A jar built over an edited tree is described by no commit, so it says so. Two such jars
+		// off one commit still share the name, which is the one case left where a build can read
+		// another's units. An unanswered question counts as edited for the same reason a silence
+		// counts against: what must not happen is a folder claiming a commit it does not hold.
+		def edits = gitSaid("git", "status", "--porcelain")
+
+		buildIdentity = edits == null || !edits.isEmpty() ? head + ".dirty" : head
+	}
+}
+
+// Read by the common module, which is where the caches that need it live.
+ext.buildIdentity = buildIdentity
+
+subprojects {
+	apply plugin: "java"
+	apply plugin: "net.ltgt.errorprone"
+
+	group = project.group_id
+	version = rootProject.effectiveVersion
+
+	repositories {
+		mavenCentral()
+	}
+
+	dependencies {
+		errorprone "com.google.errorprone:error_prone_core:${project.errorprone_version}"
+	}
+
+	java {
+		toolchain {
+			languageVersion = JavaLanguageVersion.of(Integer.parseInt(project.java_version))
+		}
+	}
+
+	// Sources that differ between two games. src/main/ holds what every supported game compiles,
+	// written against the names of the oldest one, and src/mc<version>/ beside it holds what only
+	// that game compiles. The second is ADDED to the module rather than laid over the first, so a
+	// class is either shared or belongs to one game, never both: a reader who opens a shared file
+	// is reading what every jar runs, and a difference between two games is always a whole file
+	// under a directory that says which game it is for.
+	def minecraft = project.minecraft_version
+	def versionSources = "src/mc${minecraft}"
+
+	// Each game builds into a directory of its own, so that asking for the other one does not throw
+	// away every output of this one: the two compile against different games, and a module switched
+	// back and forth in one directory would recompile from nothing on every switch.
+	layout.buildDirectory = layout.projectDirectory.dir("build/mc${minecraft}")
+
+	sourceSets.main.java.srcDir("${versionSources}/java")
+	sourceSets.main.resources.srcDir("${versionSources}/resources")
+
+	// A game that moved classes the shared sources name is given those sources with the names
+	// rewritten, rather than a copy of them kept by hand. versions/<version>.remap lists the moves,
+	// one class per line, and the rewrite is applied line by line to a copy under build/, so a
+	// compiler error on the copy is on the same line as in the file it came from. It reaches the
+	// dotted name in code and in strings and the slashed one in descriptors, which is how a mixin
+	// target names a class; a name is only ever matched whole, so a class whose name another one
+	// begins with is not rewritten by the shorter entry.
+	def remapFile = rootProject.file("versions/${minecraft}.remap")
+
+	if (remapFile.isFile()) {
+		def moves = [:]
+
+		remapFile.eachLine("UTF-8") { line ->
+			def text = line.trim()
+			if (text.isEmpty() || text.startsWith("#")) {
+				return
+			}
+
+			def names = text.split(/\s+/)
+			if (names.length != 2) {
+				throw new GradleException("${remapFile.name}: '${text}' is not a class and where it "
+						+ "moved to")
+			}
+
+			moves[names[0]] = names[1]
+			moves[names[0].replace(".", "/")] = names[1].replace(".", "/")
+			// A descriptor spells the class after an L, which the match below would otherwise read
+			// as the end of a longer name and leave alone.
+			moves["L" + names[0].replace(".", "/")] = "L" + names[1].replace(".", "/")
+		}
+
+		// Longest first, so the alternation tries a name before any name it begins with. A name is
+		// matched whole: not after a letter, not before one. The descriptor spelling is the one
+		// exception on its left, since a descriptor packs its types together, (ILcom/...;) giving
+		// the name an I in front, and what closes it on the right, a semicolon or a nested class,
+		// is what says it is a descriptor.
+		def quoted = { names -> names.sort { -it.length() }
+				.collect { java.util.regex.Pattern.quote(it) }.join("|") }
+		def pattern = java.util.regex.Pattern.compile(
+				'(?:' + quoted(moves.keySet().findAll { it.startsWith("L") }) + ')(?=[;$<])'
+				+ '|(?<![\\w$])(?:' + quoted(moves.keySet().findAll { !it.startsWith("L") })
+				+ ')(?!\\w)')
+
+		def remapSources = tasks.register("remapSources", Sync) {
+			description = "Rewrites the shared sources onto the class names of Minecraft ${minecraft}."
+
+			// The table as rewritten, and not only the file it came from: a change to how a line of
+			// that file becomes a rewrite would otherwise leave every copy under build/ standing.
+			inputs.property("moves", moves)
+			from("src/main/java")
+			into(layout.buildDirectory.dir("generated/sources/remapped/java"))
+			filteringCharset = "UTF-8"
+			filter { String line ->
+				def matcher = pattern.matcher(line)
+				def rewritten = new StringBuilder()
+
+				while (matcher.find()) {
+					matcher.appendReplacement(rewritten,
+							java.util.regex.Matcher.quoteReplacement(moves[matcher.group()]))
+				}
+
+				matcher.appendTail(rewritten)
+				rewritten.toString()
+			}
+		}
+
+		sourceSets.main.java.srcDirs = [remapSources, "${versionSources}/java"]
+	}
+
+	// A warning nobody is required to fix is a warning nobody reads, so what is kept here is what
+	// is wrong rather than what is merely unfashionable, and it fails the build. Four are left out
+	// on purpose, and the test each one passes is the same: its findings cannot be about this code.
+	// Deprecation, because Minecraft and NeoForge deprecate faster than a mod can follow and the
+	// noise would bury everything else; processing, which reports which annotation processor
+	// claimed what and is about this build's wiring rather than about anything written here;
+	// classfile, which only ever reports annotations missing from a dependency's own jar; and
+	// serial, which asks for a serialVersionUID on exceptions nothing serialises.
+	//
+	// Error Prone contributes the checks it rates as errors, which is the part of its catalogue
+	// meant to be a bug rather than a preference, plus the two promoted further down. Its other
+	// warnings are worth reading and not worth blocking on, so they are off unless asked for.
+	//
+	// gradlew build -PlintReport prints what is there without failing, which is how both lists get
+	// read when the point is to look at them rather than to gate on them.
+	def lintReport = providers.gradleProperty("lintReport").present
+
+	tasks.withType(JavaCompile).configureEach {
+		options.encoding = "UTF-8"
+		options.release = Integer.parseInt(project.java_version)
+		options.compilerArgs += [
+				"-Xlint:all,-deprecation,-processing,-classfile,-serial",
+				"-Xdoclint:all,-missing",
+				// stareval is vendored and its javadoc is its author's. Bending borrowed code to
+				// our taste buys nothing and makes the next comparison with upstream harder.
+				"-Xdoclint/package:-dev.vulture.uniform.expr.kroppeb.*",
+				// javac prints a hundred of each and stops, and what reaches the reader through
+				// Gradle is the bare line "100 warnings" that reads like a count. Both are raised,
+				// and on every path rather than under the report flag alone, because a build that
+				// fails is a build somebody is about to read a list from. Why this is worth a line
+				// at all is in docs/developing.md.
+				"-Xmaxwarns", "100000",
+				"-Xmaxerrs", "100000",
+		]
+
+		if (!lintReport) {
+			options.compilerArgs << "-Werror"
+		} else {
+			// Said by the build itself, because a sentence in a document rots and this cannot.
+			//
+			// What the flag really disarms is everything that is a WARNING: the lint categories
+			// above and the Error Prone findings still rated as warnings. What it cannot disarm is
+			// anything javac reports as an ERROR, since -Werror has nothing to say about those.
+			// Doclint is one, and so are the two checks promoted below. Measured with a planted
+			// defect rather than reasoned about: an earlier version of this line claimed that the
+			// flag turned everything off, and it was wrong then for the doclint half of the same
+			// reason.
+			doFirst {
+				logger.lifecycle("lintReport: -Werror is off, so no javac warning and no Error "
+						+ "Prone warning can fail this build. What stays armed is what javac calls "
+						+ "an error: doclint, and the Error Prone checks this build promotes. This "
+						+ "run is a listing, not a check - green here does not mean 'gradlew build' "
+						+ "is green.")
+			}
+		}
+
+		options.errorprone.disableAllWarnings = !lintReport
+
+		// Two warnings promoted to errors. Why those two, and the two places where the promotion
+		// does not reach, are in docs/developing.md. What belongs here is the one thing about these
+		// lines that is not visible in them: the promotion outlives disableAllWarnings above,
+		// because that option rewrites only the checks still RATED a warning and an entry already
+		// at error is not one of them. Nothing about it depends on which of these two lines comes
+		// first. Settled by planting a single-argument split and watching the build fail on it,
+		// under the report flag as well as without it.
+		options.errorprone.error("StringSplitter", "OperatorPrecedence")
+
+		// Mixins are outside what this analyser can model, so it is pointed away from them rather
+		// than argued with. A handler is called by the mixin framework and never from our own code,
+		// and its parameters have to match the target method whether it reads them or not: every
+		// one of them reads as unused. Measured before deciding, on the report of 6 August: sixty
+		// of the hundred and sixty four findings were UnusedMethod or UnusedVariable and ALL sixty
+		// were in this one package, none of them dead. Acting on a single one would have deleted a
+		// handler the game calls, and neither half of that is caught here. Dropping a parameter
+		// leaves a descriptor that no longer matches its target, which the required injections turn
+		// into a refusal to start, and that is the trap DefaultFluidRendererMixin documents.
+		// Dropping the whole method takes its injector with it, and nothing counts an injector that
+		// is not there: that half fails in silence whatever the configuration says.
+		//
+		// Only this analyser steps back. The javac warnings still apply here and are still errors,
+		// and they are the ones that catch a real mistake in a mixin.
+		//
+		// It steps back whole, promotions included: a single-argument split planted in this package
+		// compiles green, measured rather than assumed. What the pattern names is a path and not a
+		// module, so it is this package that steps back and nothing else does.
+		//
+		// The vendored evaluator steps back for the reason already written three times about its
+		// javadoc, above at -Xdoclint/package, in CONTRIBUTING and in developing: the code is its
+		// author's, and bending it to this project's taste makes the next comparison with upstream
+		// harder. Answering this analyser file by file is bending it - a cast rewritten as a pattern
+		// and a summary line added are both a diff against Iris that nothing asked for. Pointing the
+		// analyser away is the same answer the javadoc gate already gives, in one place instead of
+		// seven.
+		//
+		// The price is bigger than the warnings it silences and is worth naming in full: a path
+		// this option names steps back from EVERY check, so the half of the catalogue rated an
+		// error by default stops gating that package too, and so do the two promoted above. A
+		// hand-written parser is exactly where OperatorPrecedence would earn its keep. That is what
+		// not owning the code costs, and reading is what stands in its place.
+		options.errorprone.excludedPaths = ".*/vulture/mixin/.*|.*/uniform/expr/kroppeb/.*"
+	}
+
+	// The javadoc task gates nothing the block above does not already gate: it runs the same doclint
+	// over the same sources, and a self-closing tag planted outside the vendored package fails
+	// `gradlew build` on its own, measured rather than reasoned about. So it is deliberately left out
+	// of `check`, where it would buy a second run of doclint and nothing else.
+	//
+	// What it cannot be left as is unconfigured, because then it disagrees with the gate on both of
+	// the decisions above. It reports the missing comments that -missing drops, a hundred of them
+	// before javadoc stops counting, and it fails on the vendored evaluator that -Xdoclint/package
+	// steps back from. Whoever runs it by hand reads a failure on borrowed code and a wall of
+	// warnings, and concludes the gate has a hole in exactly the place the gate made a decision. The
+	// two lines below are that decision said once more, to the only other tool that asks.
+	tasks.withType(Javadoc).configureEach {
+		options.encoding = "UTF-8"
+		options.addBooleanOption("Xdoclint:all,-missing", true)
+		options.addBooleanOption("Xdoclint/package:-dev.vulture.uniform.expr.kroppeb.*", true)
+	}
+
+	tasks.withType(AbstractArchiveTask).configureEach {
+		preserveFileTimestamps = false
+		reproducibleFileOrder = true
+	}
+}
+
+// Two text rules no compiler can see. The byte order mark is the one that costs an afternoon: it
+// reaches a GLSL compiler as a stray character in front of the version directive, and PowerShell
+// writes one unless told not to. Typographic punctuation is house style and nothing more, but
+// nothing else keeps it, and it arrives by copy and paste rather than by typing.
+tasks.register("checkText") {
+	group = "verification"
+	description = "Rejects a byte order mark or typographic punctuation in a text file."
+
+	// Only what the repository ships. Binary resources are skipped by extension rather than by
+	// listing them, so a new icon does not have to be remembered here.
+	def texts = fileTree(rootDir) {
+		include "*.md", "*.gradle", "*.properties", ".gitattributes", ".gitignore"
+		include "common/src/**", "neoforge/src/**", "fabric/src/**", ".github/**", ".githooks/**"
+		include "versions/**"
+		// docs/ is prose rather than code, which is exactly why it needs this: a curly quote
+		// pasted from a browser is invisible in a diff and reaches the published page.
+		include "docs/**"
+		exclude "**/*.png", "**/*.jpg", "**/*.jar", "**/*.zip"
+	}
+	def root = rootDir.toPath()
+
+	// En and em dashes, curly quotes, the ellipsis character and the non-breaking space. Written
+	// as escapes so that this file passes its own check.
+	def typographic = ~"[\\u2013\\u2014\\u2018\\u2019\\u201C\\u201D\\u2026\\u00A0]"
+
+	inputs.files(texts).withPathSensitivity(PathSensitivity.RELATIVE)
+
+	doLast {
+		def wrong = []
+
+		texts.each { file ->
+			def path = root.relativize(file.toPath())
+			def bytes = file.bytes
+
+			if (bytes.length >= 3 && bytes[0] == (byte) 0xEF && bytes[1] == (byte) 0xBB && bytes[2] == (byte) 0xBF) {
+				wrong << "$path: byte order mark"
+			}
+
+			new String(bytes, "UTF-8").readLines().eachWithIndex { line, index ->
+				def found = typographic.matcher(line)
+				if (found.find()) {
+					def codePoint = String.format("U+%04X", (int) found.group().charAt(0))
+					wrong << "$path:${index + 1}: $codePoint, use plain ASCII punctuation"
+				}
+			}
+		}
+
+		if (wrong) {
+			throw new GradleException("${wrong.size()} text rule violations:\n  " + wrong.join("\n  "))
+		}
+	}
+}
+
+tasks.named("check") {
+	dependsOn tasks.named("checkText")
+}
+
+// One jar that runs under either loader. Each loader opens its own metadata file and walks past
+// the other's - NeoForge reads META-INF/neoforge.mods.toml, Fabric reads fabric.mod.json - so a
+// jar carrying both is a mod to each of them, and the other loader's classes lie fallow: Fabric
+// instantiates only what fabric.mod.json names, and FML, which scans every class in the jar,
+// acts on its own annotations, which the Fabric-side classes do not carry. Merging takes nothing
+// more than the union of the two loader jars: from 26.2 on there is one set of names, so neither
+// jar is remapped and nothing has to be relocated or rewritten on the way in.
+def loaderJars = ["neoforge", "fabric"].collect { module ->
+	project(":$module").tasks.named("jar", Jar)
+}
+
+tasks.register("mergedJar", Jar) {
+	group = "build"
+	description = "Assembles the one jar that runs under either loader."
+
+	archiveBaseName = "vulture"
+	archiveVersion = "${project.effectiveVersion}+mc${project.minecraft_version}"
+
+	// Aimed at build/libs itself, because the base plugin's home for a root archive is
+	// build/distributions, and everything this build makes is read out of one directory.
+	destinationDirectory = layout.buildDirectory.dir("libs")
+
+	// The subprojects block pins these on every archive a module builds. This task is the root's
+	// own, outside that block, so it says the same thing itself.
+	preserveFileTimestamps = false
+	reproducibleFileOrder = true
+
+	loaderJars.each { loaderJar ->
+		from(loaderJar.map { zipTree(it.archiveFile) }) {
+			// So that this jar gets a manifest of its own instead of whichever copy was walked
+			// first.
+			exclude "META-INF/MANIFEST.MF"
+		}
+	}
+
+	// What the two trees share is the common module's output and the licence files, one copy in
+	// each loader jar out of the same build, so keeping the first copy of each is keeping the only
+	// bytes there are. That is an assumption worth a check rather than a comment, and the check is
+	// below: a path present in both jars with different bytes fails the merge, instead of one copy
+	// silently standing in for both.
+	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+	doFirst {
+		def entries = [:]
+
+		loaderJars.each { loaderJar ->
+			def archive = loaderJar.get().archiveFile.get().asFile
+
+			new java.util.zip.ZipFile(archive).withCloseable { zip ->
+				for (entry in zip.entries()) {
+					// The manifest is excluded from the merge above, so a difference there is not
+					// a difference in what ships.
+					if (entry.directory || entry.name == "META-INF/MANIFEST.MF") {
+						continue
+					}
+
+					def before = entries.put(entry.name, entry.crc)
+					if (before != null && before != entry.crc) {
+						throw new GradleException("${entry.name} differs between the loader jars, "
+								+ "so neither copy can stand for both")
+					}
+				}
+			}
+		}
+	}
+}
+
+// The merged jar is what a release ships, and it lands in build/libs by the line above. The
+// loader jars are copied in beside it because a slice for one loader is still the smaller thing
+// to hand a test instance, and because a reader of build/libs should see everything the build
+// makes without digging through each module.
+tasks.register("collectJars", Copy) {
+	from project(":neoforge").tasks.named("jar")
+	from project(":fabric").tasks.named("jar")
+	into layout.buildDirectory.dir("libs")
+}
+
+tasks.named("assemble") {
+	dependsOn tasks.named("mergedJar"), tasks.named("collectJars")
+}

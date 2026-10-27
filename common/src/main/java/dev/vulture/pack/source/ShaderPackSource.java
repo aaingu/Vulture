@@ -1,0 +1,638 @@
+package dev.vulture.pack.source;
+
+import dev.vulture.pack.option.OptionIndex;
+import dev.vulture.pack.option.SettingSet;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystem;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
+
+/**
+ * Read access to a pack, whether it is a directory or a zip, behind one API. A zip is opened
+ * as a {@link FileSystem} so that everything above this class works on {@link Path} and never
+ * has to know which of the two it is looking at.
+ * <p>
+ * Nothing this class hands out may outlive {@link #close()}. Closing the zip invalidates every
+ * {@code Path} taken from it, and the failure shows up much later as a
+ * {@code ClosedFileSystemException} on an unrelated read, so the loaded form of a pack holds
+ * strings only.
+ */
+public final class ShaderPackSource implements AutoCloseable {
+
+	/**
+	 * The only extensions that are read. Widening this list is not free: several packs ship
+	 * JSON for other mods that contains lines starting with {@code #include}, and counting
+	 * those would move numbers that are supposed to be comparable against the measurements.
+	 */
+	private static final Set<String> SOURCE_EXTENSIONS =
+			Set.of("glsl", "fsh", "vsh", "gsh", "csh", "tcs", "tes", "inc", "settings");
+
+	private static final String SHADERS_DIRECTORY = "shaders";
+
+	/** How deep to look for a misplaced {@code shaders/} before giving up. */
+	private static final int SHADERS_SEARCH_DEPTH = 3;
+
+	/** Fifty times the largest source file in the corpus, and a bound on a hostile archive. */
+	private static final long MAX_FILE_BYTES = 8L * 1024 * 1024;
+
+	/** How much of a file is read before it is allowed to be called binary. */
+	private static final int BINARY_PROBE = 4096;
+
+	/**
+	 * How many packs have been opened since the game started, which a load reports the difference
+	 * of.
+	 * <p>
+	 * Counted here because this is the one door, and because the number is the shape of what a load
+	 * costs: opening a zip mounts the archive as a filesystem, and everything above this class then
+	 * walks every source file of the pack again to rebuild what it needs. A load that opens the same
+	 * pack half a dozen times is doing all of that half a dozen times, and the difference between
+	 * "it should be faster" and a figure is this one increment.
+	 */
+	private static final AtomicInteger OPENINGS = new AtomicInteger();
+
+	private final String packName;
+	private final Path shadersRoot;
+	private final FileSystem ownedFileSystem;
+
+	// Directory listings, lower-cased, kept for the case-insensitive fallback below. Built on
+	// demand because most packs never need it.
+	private final Map<String, Map<String, Path>> listingsByDirectory = new HashMap<>();
+
+	/**
+	 * Every file this opening has already decoded, by its path under {@code shaders/}.
+	 * <p>
+	 * Held because a pack's includes are read far more often than they are opened: one entry file
+	 * pulls in the same handful of shared headers as the thirty odd others of its place, and the
+	 * place is walked once for the directives, once for the chain, once for the chunk programs and
+	 * once per compute program. Reading, decoding and splitting a header again for each of those was
+	 * the largest single cost of a warm load.
+	 * <p>
+	 * It is bounded by the pack: the widest of the corpus ships a megabyte and a half of source
+	 * across five hundred files, and everything in here dies with {@link #close()}.
+	 */
+	private final Map<String, List<String>> linesByFile = new HashMap<>();
+
+	/**
+	 * Units this opening has already flattened, by the entry file and the settings it was read
+	 * under.
+	 * <p>
+	 * The settings are compared by IDENTITY, which a {@link SettingSet} being immutable is what
+	 * makes safe: one reading of a pack resolves exactly one of them and hands it to every expander
+	 * it builds, so two readings that happened to resolve equal tables would miss this memo and
+	 * expand again, which costs time and cannot cost an answer.
+	 * <p>
+	 * Nearly free to hold beside the map above: most of a unit's lines are the very strings that map
+	 * already keeps, so what is added here is a list of references, the liveness bits, and the few
+	 * lines the expansion wrote itself, which are the settings it rewrote and the markers it leaves
+	 * where an include was not taken or could not be read.
+	 */
+	private final Map<Expansion, IncludeExpander.ExpandedUnit> expandedUnits = new HashMap<>();
+
+	/**
+	 * Whatever else a reader works out of this opening alone and would work out again on the
+	 * next read: the plan of a place, its textures, the program tree. Each family of programs
+	 * used to open the pack for itself and rebuild all of it, so a load walked the archive once
+	 * per family. Keyed by whatever the reader chooses, and like the two memos above it belongs
+	 * to the one thread that reads through this opening.
+	 */
+	private final Map<Object, Object> derived = new HashMap<>();
+
+	private int caseInsensitiveHits;
+
+	private ShaderPackSource(String packName, Path shadersRoot, FileSystem ownedFileSystem) {
+		this.packName = packName;
+		this.shadersRoot = shadersRoot;
+		this.ownedFileSystem = ownedFileSystem;
+	}
+
+	/**
+	 * What a pack is called: the folder's own name, or the archive's without the extension.
+	 * <p>
+	 * The one answer to that question, and it is answered from the path alone, without opening
+	 * anything: a refusal has to name the pack it refuses, and it is often refusing it precisely
+	 * because it could not be opened. Everything that names a pack in the log goes through here, so
+	 * that one startup cannot call the same pack two things two lines apart.
+	 */
+	public static String nameOf(Path packPath) {
+		Path name = packPath.getFileName();
+		if (name == null) {
+			return packPath.toString();
+		}
+
+		String text = name.toString();
+		if (Files.isDirectory(packPath) || !text.toLowerCase(Locale.ROOT).endsWith(".zip")) {
+			return text;
+		}
+
+		return text.substring(0, text.length() - 4);
+	}
+
+	/** How many packs have been opened so far, which a load takes a before and an after of. */
+	public static int openings() {
+		return OPENINGS.get();
+	}
+
+	/** A computation that reads the archive, for {@link #derived}. */
+	public interface Derivation<T> {
+		T read() throws IOException;
+	}
+
+	/**
+	 * The value {@code compute} yields for this opening, worked out on the first ask under that
+	 * key and handed back as it is after. The key says what was asked and with what: two asks
+	 * with equal keys are one question.
+	 */
+	@SuppressWarnings("unchecked")
+	public <T> T derived(Object key, Derivation<T> compute) throws IOException {
+		Object known = this.derived.get(key);
+		if (known == null) {
+			known = compute.read();
+			this.derived.put(key, known);
+		}
+
+		return (T) known;
+	}
+
+	/**
+	 * Every setting this pack declares, read once per opening off {@link #sourceFiles()} in that
+	 * order and kept: the same files answer the same index, and a load asks for it from the
+	 * session, the report, the opened pack and the programs alike.
+	 */
+	public OptionIndex options() throws IOException {
+		return derived(OptionIndex.class, () -> {
+			OptionIndex.Reader reader = new OptionIndex.Reader();
+			for (Path file : sourceFiles()) {
+				reader.read(rel(file), readLines(file));
+			}
+
+			return reader.index();
+		});
+	}
+
+	public static ShaderPackSource open(Path packPath) throws IOException {
+		OPENINGS.incrementAndGet();
+		if (Files.isDirectory(packPath)) {
+			return new ShaderPackSource(nameOf(packPath), findShadersRoot(packPath), null);
+		}
+
+		String fileName = packPath.getFileName() == null ? "" : packPath.getFileName().toString();
+		if (!fileName.toLowerCase(Locale.ROOT).endsWith(".zip")) {
+			throw new IOException("A shader pack is either a directory or a .zip, and " + fileName + " is neither");
+		}
+
+		FileSystem zip = FileSystems.newFileSystem(packPath);
+		try {
+			return new ShaderPackSource(nameOf(packPath), findShadersRoot(zip.getPath("/")), zip);
+		} catch (IOException | RuntimeException e) {
+			zip.close();
+			throw e;
+		}
+	}
+
+	/**
+	 * The pack is whatever contains a {@code shaders} directory. Usually that is the root, but
+	 * a pack re-zipped by hand ends up one level down, and packs do ship other things beside
+	 * it: licences, readmes, and files meant for other mods entirely.
+	 */
+	private static Path findShadersRoot(Path root) throws IOException {
+		Path direct = root.resolve(SHADERS_DIRECTORY);
+		if (Files.isDirectory(direct)) {
+			return direct;
+		}
+
+		try (Stream<Path> tree = Files.walk(root, SHADERS_SEARCH_DEPTH)) {
+			return tree.filter(Files::isDirectory)
+					.filter(path -> path.getFileName() != null
+							&& path.getFileName().toString().equals(SHADERS_DIRECTORY))
+					.min(Comparator.comparing(Path::toString))
+					.orElseThrow(() -> new IOException("No shaders directory in this pack"));
+		}
+	}
+
+	public String packName() {
+		return this.packName;
+	}
+
+	public boolean isZip() {
+		return this.ownedFileSystem != null;
+	}
+
+	/** How many reads only succeeded because the name was matched ignoring case. */
+	public int caseInsensitiveHits() {
+		return this.caseInsensitiveHits;
+	}
+
+	/**
+	 * A file's path relative to {@code shaders/}, with forward slashes. This is the only form
+	 * of a path that leaves this class: an absolute one means nothing inside a zip, and outside
+	 * one it would put the player's directory layout in the log.
+	 */
+	public String rel(Path file) {
+		return this.shadersRoot.relativize(file).toString().replace('\\', '/');
+	}
+
+	/**
+	 * Every source file, in a fixed order. The order is part of the contract rather than an
+	 * accident: the settings index keeps the first declaration of a name and drops later ones,
+	 * so a different walk order would silently give a different answer on the packs that
+	 * declare the same setting twice.
+	 */
+	public List<Path> sourceFiles() throws IOException {
+		try (Stream<Path> tree = Files.walk(this.shadersRoot)) {
+			List<Path> files = new ArrayList<>(tree.filter(Files::isRegularFile)
+					.filter(path -> SOURCE_EXTENSIONS.contains(extensionOf(path)))
+					.toList());
+			files.sort(Comparator.comparing(this::rel));
+
+			return List.copyOf(files);
+		}
+	}
+
+	/**
+	 * Every regular file under the shaders root that {@link #sourceFiles} leaves out, and that is
+	 * small enough to still be read, in the same fixed order.
+	 * <p>
+	 * The pair exists because the two lists answer different questions. That one is settled by
+	 * extension and has to stay that way, the lexical measurements being taken over it; but an
+	 * include is settled by the path it names, so {@code #include "common.h"} reaches a file that
+	 * list never had, and a reader that has to prove a name appears NOWHERE cannot stop at an
+	 * extension.
+	 * <p>
+	 * Past the ceiling a source is allowed is left out rather than refused here. It is the ceiling
+	 * {@link #readLines} throws on, so a file that big cannot be expanded into a program either, and
+	 * nothing can read a name out of it.
+	 */
+	public List<Path> otherFiles() throws IOException {
+		Set<Path> sources = Set.copyOf(sourceFiles());
+
+		try (Stream<Path> tree = Files.walk(this.shadersRoot)) {
+			List<Path> files = new ArrayList<>(tree.filter(Files::isRegularFile)
+					.filter(path -> !sources.contains(path))
+					.filter(this::withinCeiling)
+					.toList());
+			files.sort(Comparator.comparing(this::rel));
+
+			return List.copyOf(files);
+		}
+	}
+
+	/**
+	 * A file's bytes as text to search through, or empty for a file that is not text at all.
+	 * <p>
+	 * Not text is decided on a zero byte in the first {@value #BINARY_PROBE}, which no GLSL source
+	 * can hold and which the head of a compressed texture almost always does. <strong>The test is
+	 * made before the rest is read</strong>, and that is the point of it: the one caller has to
+	 * visit every file of the pack to prove a name appears in none of them, and inflating a few
+	 * megabytes of noise to search it for an identifier would be the whole cost of that walk.
+	 * <p>
+	 * Decoded as Latin-1 where {@link #readLines} decodes UTF-8, which is exact for this and would
+	 * be wrong there: what is searched are ASCII names, and no byte of a multi-byte UTF-8 sequence
+	 * is ever an ASCII letter, so a name is found in the same files either way.
+	 */
+	public String searchableText(Path file) throws IOException {
+		try (InputStream in = Files.newInputStream(file)) {
+			byte[] head = in.readNBytes(BINARY_PROBE);
+			for (byte b : head) {
+				if (b == 0) {
+					return "";
+				}
+			}
+
+			byte[] rest = in.readAllBytes();
+			StringBuilder text = new StringBuilder(head.length + rest.length);
+			text.append(new String(head, StandardCharsets.ISO_8859_1));
+			text.append(new String(rest, StandardCharsets.ISO_8859_1));
+
+			return text.toString();
+		}
+	}
+
+	private boolean withinCeiling(Path file) {
+		try {
+			return Files.size(file) <= MAX_FILE_BYTES;
+		} catch (IOException e) {
+			// A file whose size cannot even be read is one nothing will read either.
+			return false;
+		}
+	}
+
+	private static String extensionOf(Path path) {
+		Path name = path.getFileName();
+		if (name == null) {
+			return "";
+		}
+
+		String text = name.toString();
+		int dot = text.lastIndexOf('.');
+
+		return dot < 0 ? "" : text.substring(dot + 1).toLowerCase(Locale.ROOT);
+	}
+
+	/**
+	 * Decoding never throws. A pack that ships one file in the wrong encoding should lose that
+	 * file's accented comments, not fail to load; the compiler will complain later if the loss
+	 * touched something that mattered.
+	 * <p>
+	 * Read once per opening and kept, which is what {@link #linesByFile} exists for. The list handed
+	 * back is immutable and always was, so callers cannot tell a second reader from the first; a
+	 * file too big to read is not kept, and every caller of it goes on getting the refusal.
+	 */
+	public List<String> readLines(Path file) throws IOException {
+		String relative = rel(file);
+		List<String> known = this.linesByFile.get(relative);
+		if (known != null) {
+			return known;
+		}
+
+		// The largest source file in the corpus is a hundred and sixty kilobytes. Reading without
+		// a ceiling means a zip that unpacks to half a gigabyte is read whole into memory before
+		// anything downstream gets the chance to refuse it.
+		long size = Files.size(file);
+		if (size > MAX_FILE_BYTES) {
+			throw new IOException(relative + " is " + size + " bytes, past the " + MAX_FILE_BYTES
+					+ " a shader source is allowed");
+		}
+
+		CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
+				.onMalformedInput(CodingErrorAction.REPLACE)
+				.onUnmappableCharacter(CodingErrorAction.REPLACE);
+		CharBuffer decoded = decoder.decode(ByteBuffer.wrap(Files.readAllBytes(file)));
+
+		String text = decoded.toString();
+		if (!text.isEmpty() && text.charAt(0) == 0xFEFF) {
+			text = text.substring(1);
+		}
+
+		// Splitting on a lone carriage return as well: some pack files still carry classic Mac
+		// line endings, and treating such a file as one long line loses every directive in it.
+		List<String> lines = List.of(text.split("\r\n|\n|\r", -1));
+		this.linesByFile.put(relative, lines);
+
+		return lines;
+	}
+
+	/** A unit this opening has already flattened under those settings, or nothing. */
+	Optional<IncludeExpander.ExpandedUnit> expandedUnit(SettingSet settings, String entry) {
+		return Optional.ofNullable(this.expandedUnits.get(new Expansion(settings, entry)));
+	}
+
+	/** Kept for the next reading of this opening. A unit that threw never reaches here. */
+	void rememberUnit(SettingSet settings, String entry, IncludeExpander.ExpandedUnit unit) {
+		this.expandedUnits.put(new Expansion(settings, entry), unit);
+	}
+
+	private record Expansion(SettingSet settings, String entry) {
+	}
+
+	/** Resolves a path written with a leading slash, which means relative to {@code shaders/}. */
+	public Optional<Path> resolveInsideShaders(String spec) {
+		return resolveAgainst(this.shadersRoot, withoutLeadingSlash(spec));
+	}
+
+	private static String withoutLeadingSlash(String spec) {
+		return spec.replaceAll("^/+", "");
+	}
+
+	/** Resolves a path written without a leading slash, which means next to the including file. */
+	public Optional<Path> resolveRelativeTo(Path fromFile, String spec) {
+		Path parent = fromFile.getParent();
+
+		return parent == null ? Optional.empty() : resolveAgainst(parent, spec);
+	}
+
+	private Optional<Path> resolveAgainst(Path base, String spec) {
+		Optional<Path> target = confine(base, spec);
+		if (target.isEmpty()) {
+			return Optional.empty();
+		}
+
+		if (Files.isRegularFile(target.get())) {
+			return target;
+		}
+
+		return resolveIgnoringCase(target.get());
+	}
+
+	/**
+	 * Where a path a pack wrote lands once normalised, or nothing when that is outside the pack.
+	 * Says nothing about whether anything is there.
+	 * <p>
+	 * A pack is downloaded content. Without this check a crafted include could walk out of the pack
+	 * with ".." and have the engine read any file the game can reach. It is the one place the
+	 * shader root is compared against, so that every road into the pack passes it exactly once.
+	 */
+	private Optional<Path> confine(Path base, String spec) {
+		Path target;
+		try {
+			target = base.resolve(spec).normalize();
+		} catch (RuntimeException e) {
+			return Optional.empty();
+		}
+
+		return target.startsWith(this.shadersRoot) ? Optional.of(target) : Optional.empty();
+	}
+
+	/**
+	 * Whether a path a pack wrote still lands inside the pack once normalised, WITHOUT asking
+	 * whether the pack ships anything there.
+	 * <p>
+	 * The two questions are one for every caller but one, and that caller needs them apart. A
+	 * directive naming a file the pack simply forgot to ship is a mistake of the pack's, and the
+	 * name it claimed goes back to whatever it meant before, which is what Iris does with it. A
+	 * directive naming a file OUTSIDE the pack is the refusal this class exists for, and the name
+	 * stays claimed and reads black, so that a path crafted to leave the pack cannot also come out
+	 * looking like a pass that drew normally.
+	 */
+	public boolean insidePack(String relative) {
+		return confine(this.shadersRoot, withoutLeadingSlash(relative)).isPresent();
+	}
+
+	/**
+	 * Packs are authored on Windows, where a name that disagrees with the file on disk still
+	 * opens. Inside a zip it does not, so the same pack that works as a folder would fail as an
+	 * archive. Matching without case keeps both working; the hits are counted so that a pack
+	 * relying on it can be named in the log.
+	 */
+	private Optional<Path> resolveIgnoringCase(Path target) {
+		Path parent = target.getParent();
+		Path name = target.getFileName();
+		if (parent == null || name == null || !Files.isDirectory(parent)) {
+			return Optional.empty();
+		}
+
+		Map<String, Path> listing = this.listingsByDirectory.computeIfAbsent(rel(parent), _ -> listing(parent));
+		Path found = listing.get(name.toString().toLowerCase(Locale.ROOT));
+		if (found == null) {
+			return Optional.empty();
+		}
+
+		this.caseInsensitiveHits++;
+
+		return Optional.of(found);
+	}
+
+	private static Map<String, Path> listing(Path directory) {
+		Map<String, Path> byLowerName = new HashMap<>();
+		try (Stream<Path> entries = Files.list(directory)) {
+			entries.filter(Files::isRegularFile).forEach(entry -> {
+				Path name = entry.getFileName();
+				if (name != null) {
+					byLowerName.putIfAbsent(name.toString().toLowerCase(Locale.ROOT), entry);
+				}
+			});
+		} catch (IOException e) {
+			return Map.of();
+		}
+
+		return byLowerName;
+	}
+
+	/** Directories directly under {@code shaders/}, by name. */
+	public List<String> topLevelDirectories() throws IOException {
+		try (Stream<Path> entries = Files.list(this.shadersRoot)) {
+			return entries.filter(Files::isDirectory)
+					.map(this::rel)
+					.sorted()
+					.toList();
+		}
+	}
+
+	/**
+	 * A path a pack wrote, relative to {@code shaders/} whether or not it opens with a slash.
+	 * <p>
+	 * The leading slash has to come off before the resolution and not after. {@code Path.resolve}
+	 * throws the base away when it is handed something absolute, so the search would drop to the
+	 * root of the archive and find nothing, and a texture that is not found is black rather than
+	 * an error. Mellow and Reverie write every one of their texture paths that way.
+	 * <p>
+	 * Resolved by the same road an {@code #include} takes, and for the same reason: a path written
+	 * in {@code shaders.properties} is downloaded content exactly as an include is, so it is
+	 * normalised and confined to the pack before anything opens it. Without that, one
+	 * {@code customTexture} of dots and slashes reads any file the game can reach and hands it to a
+	 * shader as a picture. The case-insensitive fallback comes with it, which is what a texture path
+	 * needs most: it is typed by hand, and a pack that works as a folder on Windows would otherwise
+	 * lose the same file once it is zipped.
+	 */
+	public Optional<Path> file(String relative) {
+		return resolveInsideShaders(relative);
+	}
+
+	/**
+	 * How many bytes a file holds ON DISK, which for a zip entry is the uncompressed length.
+	 * <p>
+	 * Asked rather than taken from {@link #bytes}, because the one caller that needs it is
+	 * checking whether a raw texture is as long as its directive claims, and a blob that is not is
+	 * to be refused rather than read whole and then refused.
+	 */
+	public long size(Path file) throws IOException {
+		return Files.size(file);
+	}
+
+	/**
+	 * The first {@code wanted} bytes of a file, for a raw texture whose own declaration says how
+	 * many there are to read.
+	 * <p>
+	 * The ceiling on {@link #bytes} is the one a shader SOURCE gets, and a raw texture is not one.
+	 * iterationT ships a thirty three megabyte atmosphere table, four times that ceiling, and
+	 * reading it under the source's rule left the pack with a {@code sampler3D} nothing stood
+	 * behind and nineteen passes of its overworld that could not be built. What bounds this read
+	 * instead is the declaration: {@code PackTextures} refuses one longer than the file it names
+	 * before this is ever called, and the atlas laid out for it has already had to fit inside what
+	 * this engine will spend on one.
+	 * <p>
+	 * The tail past the declaration is not read at all, which is what the note beside such a
+	 * declaration says out loud: what the file holds is the author's business, what the directive
+	 * announces is what the shaders address.
+	 *
+	 * @throws IOException if the file holds fewer than {@code wanted} bytes, which would otherwise
+	 *                     go up padded with zeroes and read as a lookup table
+	 */
+	public byte[] head(Path file, long wanted) throws IOException {
+		if (wanted < 0 || wanted > Integer.MAX_VALUE) {
+			throw new IOException(rel(file) + " is asked for " + wanted
+					+ " bytes, which is not a length anything here can hold");
+		}
+
+		try (InputStream in = Files.newInputStream(file)) {
+			byte[] read = in.readNBytes((int) wanted);
+			if (read.length < wanted) {
+				throw new IOException(rel(file) + " holds " + read.length
+						+ " bytes where the declaration asks for " + wanted);
+			}
+
+			return read;
+		}
+	}
+
+	/** A file's raw bytes, under the same ceiling as the sources: an image is not exempt. */
+	public byte[] bytes(Path file) throws IOException {
+		long size = Files.size(file);
+		if (size > MAX_FILE_BYTES) {
+			throw new IOException(rel(file) + " is " + size + " bytes, past the " + MAX_FILE_BYTES
+					+ " a pack file is allowed");
+		}
+
+		return Files.readAllBytes(file);
+	}
+
+	/**
+	 * Empties what a READER worked out of this opening, and nothing else, so that an opening handed
+	 * to a second load carries the archive forward and no conclusion drawn from it.
+	 * <p>
+	 * The line between the two is what makes {@link KeptPack} safe. The listings, the file lines and
+	 * the flattened units are functions of the archive's bytes and the settings, and that pair is
+	 * what its key compares. What lands in {@link #derived} need not be: a plan carries the size of
+	 * the window, a texture set carries what the resource packs hold, and either of them served
+	 * across a load would be a picture that is credible and wrong. So the whole map goes, including
+	 * the entries that WOULD have been safe to keep, {@code IncludeExpander}'s logical lines among
+	 * them: the rule is about where an answer is filed rather than about what it happens to depend
+	 * on, and a rule with an exception in it is the one that costs a picture.
+	 */
+	void forgetDerived() {
+		this.derived.clear();
+	}
+
+	/** How many files this opening has read, for the line that says what a kept opening saved. */
+	int filesRead() {
+		return this.linesByFile.size();
+	}
+
+	/** And how many units it has flattened, which is the post that stands before every lookup. */
+	int unitsFlattened() {
+		return this.expandedUnits.size();
+	}
+
+	/**
+	 * Lets the two memos go as well as the archive, which is what makes an opening the bound on
+	 * what they hold: a directory pack owns no filesystem at all, so without these two lines
+	 * closing one would free nothing, and an opening a caller keeps in a field past its own use
+	 * would carry a pack's worth of text for as long as it lived.
+	 */
+	@Override
+	public void close() throws IOException {
+		this.linesByFile.clear();
+		this.expandedUnits.clear();
+		this.derived.clear();
+		if (this.ownedFileSystem != null) {
+			this.ownedFileSystem.close();
+		}
+	}
+}

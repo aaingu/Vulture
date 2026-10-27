@@ -1,0 +1,65 @@
+name: Something else is broken
+description: A crash, a game that will not start, or anything that is not a pack drawing wrongly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A world that looks entirely like vanilla is most often a game that came up on
+        OpenGL, which
+        [INSTALL.md](https://github.com/avpbynf/Vulture-Shaders/blob/main/INSTALL.md) covers,
+        along with the two ways that failure hides itself. The log says which backend
+        the game is on.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you did, what happened, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: The log
+      description: >
+        `logs/latest.log`, attached as a file. For a crash, the file under `crash-reports/` as well.
+        The log's first line names the version that is actually running.
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Vulture and its loader, Minecraft, Sodium, and anything else in `mods/`.
+      placeholder: Vulture 0.6.0-beta on NeoForge, MC 26.2, Sodium 0.9.1
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics card and driver
+      description: >
+        The log names both, on its line "Using graphics backend Vulkan, using drivers". Everything
+        here is tried on one NVIDIA card, and a crash that comes with every pack is most often
+        something another card's driver refuses, so this is the line that tells.
+      placeholder: NVIDIA GeForce RTX 3060, driver 610.88
+    validations:
+      required: true
+
+  - type: dropdown
+    id: without
+    attributes:
+      label: Does it still happen with Vulture taken out?
+      description: >
+        Sodium on its own, on the Vulkan backend, with the same pack folder in place.
+        It separates this engine from the one mod it cannot run without.
+      options:
+        - It stops when Vulture is out
+        - It happens without Vulture too
+        - Not tried
+    validations:
+      required: true

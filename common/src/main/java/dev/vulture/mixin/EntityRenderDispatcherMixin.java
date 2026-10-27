@@ -1,0 +1,113 @@
+package dev.vulture.mixin;
+
+import dev.vulture.render.EntityIdentifiers;
+import dev.vulture.render.PackNameIds;
+import dev.vulture.render.TerrainDraw;
+
+import java.util.List;
+
+import com.llamalad7.mixinextras.injector.v2.WrapWithCondition;
+import com.mojang.blaze3d.vertex.PoseStack;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.AbstractClientPlayer;
+import net.minecraft.client.renderer.SubmitNodeCollector;
+import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
+import net.minecraft.client.renderer.entity.state.AvatarRenderState;
+import net.minecraft.client.renderer.entity.state.EntityRenderState;
+import net.minecraft.client.renderer.entity.state.ZombieVillagerRenderState;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+/**
+ * Says, for the length of one submission, which kind of entity is being handed in, and keeps the
+ * game's ground oval off a mob while the pack draws a shadow map.
+ * <p>
+ * <strong>This is the only moment in the frame the answer exists</strong>, which is what
+ * {@link EntityIdentifiers} is about: everything submitted here is drawn much later, out of one
+ * batch, and nothing in a draw says which mob a given vertex came from. Around the dispatcher and
+ * not around each renderer, where Iris puts it too
+ * ({@code mixin/entity_render_context/MixinEntityRenderDispatcher.java:53} and {@code :87}).
+ * <p>
+ * The number comes from {@code entity.properties} and is the pack's own, so a pack that named
+ * nothing leaves every mob at minus one and no branch of it is ever taken. What is not a table
+ * lookup is the two names below: neither is an entity type, and both are the pack's way of asking a
+ * question the registry has no key for.
+ * <p>
+ * Both injections required. Only the first applying leaves the last mob's number standing over
+ * everything drawn after it; only the second applying does nothing at all. Neither says anything on
+ * screen.
+ */
+@Mixin(EntityRenderDispatcher.class)
+public abstract class EntityRenderDispatcherMixin {
+
+	@Inject(method = "submit", at = @At("HEAD"), require = 1)
+	private <S extends EntityRenderState> void vulture$begin(S state, CameraRenderState camera,
+			double x, double y, double z, PoseStack poseStack, SubmitNodeCollector collector,
+			CallbackInfo callback) {
+		EntityIdentifiers.entity(vulture$identify(state));
+	}
+
+	@Inject(method = "submit", at = @At("RETURN"), require = 1)
+	private <S extends EntityRenderState> void vulture$end(S state, CameraRenderState camera,
+			double x, double y, double z, PoseStack poseStack, SubmitNodeCollector collector,
+			CallbackInfo callback) {
+		EntityIdentifiers.entity(0);
+
+		// The held item goes down with the entity that was holding it, and not at the end of the item
+		// itself: an item is submitted inside this call and its own window closes first, so leaving
+		// this out would keep the last item's number over everything after it. Iris drops the two
+		// together here for the same reason (MixinEntityRenderDispatcher.java:88-89).
+		EntityIdentifiers.item(0);
+	}
+
+	/**
+	 * Whether the dark oval the game lays under a mob is submitted at all, which it is not while the
+	 * pack draws a shadow map.
+	 * <p>
+	 * Iris's answer, at the same call ({@code mixin/MixinEntityRenderDispatcher.java:48-59}): the
+	 * oval goes for as long as its shadow renderer stands, and the comment on that test says OptiFine
+	 * seems to do the same ({@code pipeline/IrisRenderingPipeline.java:1102}). A pack with a map
+	 * lights the ground under a mob with that map, so the oval on top of it is a second shadow,
+	 * drawn with {@code gbuffers_entities_translucent}, that no pack author ever saw under their own
+	 * pack. Kept as it is where there is no map, which is where Iris keeps it too: there the oval is
+	 * the only shadow a mob has, and the packs that reach that state have a setting for it.
+	 * <p>
+	 * At the submission and not at the draw, because the light's walk submits through this same
+	 * dispatcher: a condition here keeps the oval out of the map as well, and for the same reason.
+	 */
+	@WrapWithCondition(method = "submit",
+			at = @At(value = "INVOKE",
+					target = "Lnet/minecraft/client/renderer/SubmitNodeCollector;"
+							+ "submitShadow(Lcom/mojang/blaze3d/vertex/PoseStack;FLjava/util/List;)V"),
+			require = 1)
+	private static boolean vulture$keepGroundOval(SubmitNodeCollector collector, PoseStack poseStack,
+			float radius, List<EntityRenderState.ShadowPiece> pieces) {
+		return !TerrainDraw.shadowMapServed();
+	}
+
+	/**
+	 * Which number this render state is worth, the two special names first.
+	 * <p>
+	 * The order is Iris's and it decides what a cured zombie villager reads: the conversion is asked
+	 * before the type, so a pack that named both gets the conversion. Each is asked of the pack
+	 * first, because a pack that named neither has to fall back on the type rather than on a number
+	 * that means nothing.
+	 */
+	private static int vulture$identify(EntityRenderState state) {
+		if (state instanceof ZombieVillagerRenderState villager && villager.isConverting
+				&& PackNameIds.namesConvertingVillager()) {
+			return PackNameIds.convertingVillager();
+		}
+
+		if (state instanceof AvatarRenderState avatar && PackNameIds.namesCurrentPlayer()
+				&& Minecraft.getInstance().getCameraEntity() instanceof AbstractClientPlayer camera
+				&& camera.getId() == avatar.id) {
+			return PackNameIds.currentPlayer();
+		}
+
+		return PackNameIds.entity(state.entityType);
+	}
+}

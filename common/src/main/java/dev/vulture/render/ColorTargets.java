@@ -1,0 +1,1460 @@
+package dev.vulture.render;
+
+import dev.vulture.pack.model.BlendMode;
+import dev.vulture.pack.model.ImageInformation;
+import dev.vulture.pack.model.TargetFormat;
+import dev.vulture.pack.model.TargetName;
+import dev.vulture.pack.model.TargetSize;
+import dev.vulture.pack.model.TextureStage;
+import dev.vulture.pack.target.PackDirectives;
+import dev.vulture.pack.target.SamplerPlan;
+import dev.vulture.pack.target.TargetDirectives;
+import dev.vulture.pack.target.TargetPlan;
+import dev.vulture.pack.target.TargetSchedule;
+import dev.vulture.pack.texture.CustomStorage;
+import dev.vulture.render.storage.StorageBuffers;
+import dev.vulture.render.storage.StorageImages;
+import dev.vulture.uniform.ClipSpace;
+import dev.vulture.uniform.NoiseTexture;
+import dev.vulture.Vulture;
+
+import com.mojang.blaze3d.GpuDeviceLossException;
+import com.mojang.blaze3d.GpuFormat;
+import com.mojang.blaze3d.systems.CommandEncoder;
+import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.blaze3d.systems.RenderPass;
+import com.mojang.blaze3d.systems.RenderPassDescriptor;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.textures.FilterMode;
+import com.mojang.blaze3d.textures.GpuTexture;
+import com.mojang.blaze3d.textures.GpuTextureView;
+import org.joml.Vector4f;
+import org.joml.Vector4fc;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.ToLongFunction;
+import java.util.stream.Collectors;
+
+/**
+ * The textures behind one pack's colour targets: what exists, at which format and size, what is
+ * cleared and to what, and what a sampler is handed when nothing serves it.
+ * <p>
+ * Nothing here decides anything. Which indices exist, which format each was declared with, which
+ * side of a ping-pong a program reads, and which sizes are relative to the screen are all answers
+ * the plan already carries; this class allocates what the plan describes and clears it. Keeping
+ * the decisions on the pack side is what lets them be measured against the eight packs without
+ * starting the game.
+ * <p>
+ * Allocating has to happen outside a render pass. Creating a texture records a barrier into the
+ * very command buffer a pass would be recording into. Clears of the pack's colour targets are
+ * remembered until the first pass that writes them, and become that pass's load operation: a
+ * standalone texture clear is a GPU stop of its own on this backend, which OpenGL's
+ * {@code glClear} as the FBO is bound is not.
+ * <p>
+ * No caller ever holds a texture view. A resize destroys and recreates the texture behind a target
+ * and closes every view onto it, and nothing on the Vulkan backend checks that a bound view is
+ * still alive: a view kept across a resize is a silent use after free rather than an exception.
+ * Views are therefore looked up again at every use, which is what {@link #view} is for. The views
+ * themselves belong to {@link TargetSurface}, which closes them with the texture they look onto,
+ * so the two can never be freed apart.
+ * <p>
+ * A target some program reads at a lod carries a mip chain, and that is why these are
+ * {@link TargetSurface} rather than the game's own {@code TextureTarget}: that class allocates one
+ * level, hard coded, and cannot express a chain. Filling it is not this class's work, only holding
+ * it. {@link MipmapReduction} writes the levels, and they have to be rewritten whenever level
+ * nought changes, so the moment it runs belongs to whoever walks the frame.
+ * <p>
+ * A target the schedule turns over carries two textures, and which half a program reads and
+ * writes is the schedule's answer rather than a flag kept here. The one thing this class owes the
+ * ping pong is {@link #copyBack}: a target the pack keeps between frames and that the chain left
+ * on the alternate half has to come back to the main one, because the next frame starts its walk
+ * from an empty flipped set and would read the half nothing wrote.
+ * <p>
+ * The files the pack ships as textures of its own live here too, and for one reason: they are
+ * allocated, uploaded and freed at exactly the moments the constants are, and a second holder
+ * threaded through the same calls would only be a second chance for the two to fall out of step.
+ * They are not colour targets in any other sense, {@link PackImages} decides everything about them,
+ * and nothing here ever resizes one.
+ */
+final class ColorTargets {
+
+	/** Enough for the three constants: they carry one pixel each and nothing samples their precision. */
+	private static final GpuFormat CONSTANT_FORMAT = GpuFormat.RGBA8_UNORM;
+
+	/**
+	 * One float a pixel, and no conversion: the mask carries the depth the pack's geometry left,
+	 * and it is compared with the game's own depth rather than read as one.
+	 * <p>
+	 * A float and nothing narrower because the comparison is for equality as much as for order. The
+	 * game's depth attachment is {@code D32_FLOAT} ({@code RenderTarget.createBuffers}), the mask is
+	 * filled from the very value the fragment stage hands that attachment (the sky, which hands it
+	 * none, writes the clear it stands over), and both sides then carry
+	 * the same thirty two bits: a pixel nothing has been drawn over compares exactly equal. Rounded
+	 * into a narrower format it would not, and the seed would repaint the pack's own geometry
+	 * wherever the rounding fell the wrong way.
+	 */
+	private static final GpuFormat COVERAGE_FORMAT = GpuFormat.R32_FLOAT;
+
+	/**
+	 * What the mask holds where the pack's geometry has written nothing, which is outside the depth
+	 * range on the far side of the eye.
+	 * <p>
+	 * <strong>This is what makes the cut one comparison instead of two.</strong> Every real depth is
+	 * in front of it, so a pixel the pack never wrote answers "the game drew in front" through the
+	 * same test as a pixel it did write and something was drawn over, and the reader owes an empty
+	 * pixel no test of its own. The value follows {@link ClipSpace#REVERSED} rather than being
+	 * written out: the game rasterises reversed, so far is nought and this has to be below it.
+	 */
+	static final float COVERAGE_EMPTY = ClipSpace.REVERSED.z < 0.0F ? -1.0F : 2.0F;
+
+	/** The one target the format says starts at the fog colour. Every other one starts at a constant. */
+	private static final int FOG_TARGET = 0;
+
+	private static final Vector4fc OPAQUE_BLACK = new Vector4f(0.0F, 0.0F, 0.0F, 1.0F);
+	private static final Vector4fc OPAQUE_WHITE = new Vector4f(1.0F, 1.0F, 1.0F, 1.0F);
+	private static final Vector4fc MID_GREY = new Vector4f(0.5F, 0.5F, 0.5F, 1.0F);
+
+	/** The sentinel above as a clear colour: one channel, and the mask reads the first of them. */
+	private static final Vector4fc UNWRITTEN =
+			new Vector4f(COVERAGE_EMPTY, COVERAGE_EMPTY, COVERAGE_EMPTY, COVERAGE_EMPTY);
+
+	/** Past this much the log says so once. Refusing to allocate would trade a stutter for a black screen. */
+	private static final long LOUD_BYTES = 512L * 1024L * 1024L;
+
+	/**
+	 * What to assume a pass can carry before there is a device to ask. Eight is what a pack's own
+	 * draw buffers already use.
+	 */
+	private static final int ASSUMED_COLOR_ATTACHMENTS = 8;
+
+	/**
+	 * What the census files this pass under, and it says COLOUR because the shadow map empties its
+	 * own the same way under a name of its own. One name over both read as two colour flushes in a
+	 * frame that had paid one of each, and a count that stands for two things at once sends whoever
+	 * reads it hunting a fault that is not there.
+	 */
+	private static final String CLEAR_LABEL = "Vulture pending colour clears";
+
+	/**
+	 * What one sampler is handed for a texture the pack ships: the image, and how the pack asked for
+	 * it to be read. They travel together because they are one answer, written in one directive and
+	 * the {@code .mcmeta} beside its file, rather than several questions for several places.
+	 */
+	record PackBinding(GpuTextureView view, FilterMode filter, boolean repeat, boolean mipmaps) {
+	}
+
+	/** The schedule the plan gave these targets, for a pass to settle its own step off. */
+	TargetSchedule schedule() {
+		return this.plan.schedule();
+	}
+
+	/**
+	 * What the pack supplies for a name, settled once: the image, and the filter and addressing
+	 * its directive and its .mcmeta asked for. Only the view behind the image moves after that,
+	 * and {@link #packView} answers it per frame. Only a texture the game holds climbs past level
+	 * nought, a file the pack ships being uploaded as one level.
+	 */
+	record PackSource(PackImages.Image image, FilterMode filter, boolean repeat, boolean mipmaps) {
+	}
+
+	private final TargetPlan plan;
+	private final Set<Integer> doubled;
+	private final int noiseResolution;
+
+	/** The pack's own noise image, or null when the generated field stands in. */
+	private final NoiseTexture.Image noiseImage;
+
+	/** The textures the pack ships as files, already decoded, waiting for a device to exist. */
+	private final PackImages packImages;
+
+	/** Storage images the pack declared. Allocated on the device; not bound yet. */
+	private final StorageImages storageImages;
+	private final StorageBuffers storageBuffers;
+
+	/** One surface per texture the pack ships, allocated and uploaded with the constants. */
+	private final Map<PackImages.Image, TargetSurface> packSurfaces = new LinkedHashMap<>();
+
+	/**
+	 * Which formats this device blends between two texels of, asked once each and kept.
+	 * <p>
+	 * Keyed on the FORMAT and filled where it is read rather than beside the surfaces, because the
+	 * two do not happen in that order: the passes are built before the targets are prepared
+	 * ({@code PackChain.ready}), so a pass captures what it reads from a name while
+	 * {@link #packSurfaces} is still empty. A table filled at allocation would have answered every
+	 * pass nearest.
+	 * <p>
+	 * Concurrent because it is written from two threads. A geometry program is built on the
+	 * pack-load worker ({@code FamilyWarmup}) and asks {@link #packSource} from its constructor,
+	 * where a full screen pass asks the same method on the render thread; {@code TargetCopies}
+	 * guards its own two collections for exactly that reason. Every format that reaches here is one
+	 * an allocated image is in, and {@link #ensurePackTextures} asks for all of them on the render
+	 * thread, so the device itself is answered before any worker exists.
+	 */
+	private final Map<GpuFormat, Boolean> filterable = new ConcurrentHashMap<>();
+
+	/**
+	 * The shadow map, allocated and cleared with the rest.
+	 * <p>
+	 * It is held here rather than beside because everything that binds a sampler already holds this
+	 * object, and a second one threaded through the same calls would only be a second chance for the
+	 * two to be allocated, cleared or released at different moments. It is a family of its own all
+	 * the same: its own resolution, its own depth window, its own clear colour.
+	 */
+	private final ShadowTargets shadowMap;
+
+	/**
+	 * The world's depth as the pack reads it, held here for the same reason the shadow map is:
+	 * everything that binds a sampler already holds this object.
+	 */
+	private final PackDepth depth = new PackDepth();
+
+	/**
+	 * The copies of the targets a translucent geometry program samples on the half it writes,
+	 * held here for the same reason again: they answer a sampler a program binds.
+	 */
+	private final TargetCopies copies = new TargetCopies();
+
+	/**
+	 * The smoothed depth at the centre of the screen, held here for the same reason again: it is a
+	 * sampler a program binds, and everything that binds one already holds this object.
+	 */
+	private final CenterDepth centerDepth = new CenterDepth();
+
+	/**
+	 * Where each pixel stood in the previous frame. Held here beside the rest, though no pack binds
+	 * it: what owns a full screen image of this engine owns it here, and a second home for one image
+	 * is how a resize comes to free some of them and not others.
+	 */
+	private final MotionVectors motionVectors = new MotionVectors();
+
+	private final Map<Integer, GpuFormat> formats = new LinkedHashMap<>();
+
+	/** The filter each carried target is sampled with, settled with its format. */
+	private final Map<Integer, FilterMode> filters = new LinkedHashMap<>();
+	private final Map<Integer, Vector4fc> clearColours = new LinkedHashMap<>();
+
+	/**
+	 * Whether colortex0 starts each frame at the fog colour rather than at the colour below.
+	 * <p>
+	 * That is the rule packs are written against, and it is not a nicety: everything the pack's own
+	 * geometry does not cover is exactly the sky under the horizon, and a target emptied to black
+	 * there hands the whole of the chain a hole where the distance should be. It is a per frame value
+	 * and this class holds no frame, which is why the plan cannot answer it and only says whether the
+	 * pack named a colour of its own instead.
+	 */
+	private final boolean fogCleared;
+	private final Map<Integer, TargetSurface> mainSide = new LinkedHashMap<>();
+	private final Map<Integer, TargetSurface> altSide = new LinkedHashMap<>();
+	private final Set<Integer> fellBack = new TreeSet<>();
+	private final List<String> notes = new ArrayList<>();
+
+	/**
+	 * The targets some program of this place reads at a lod, which are the ones allocated with a mip
+	 * chain. Both halves of a doubled target carry one: which half a program reads is the schedule's
+	 * answer and it is not the same for every reader, so a chain on one half only would serve some
+	 * of them and hand the others an empty level.
+	 */
+	private final Set<Integer> mipmapped;
+
+	/** For each program, the targets it reads at a lod and that carry a chain, in target order. */
+	private final Map<String, Set<Integer>> lodReads;
+
+	private TargetSurface black;
+	private TargetSurface white;
+	private TargetSurface grey;
+	private TargetSurface noise;
+	private TargetSurface unwritten;
+
+	/**
+	 * The depth the pack's own opaque geometry left this frame, one float a pixel, so that whoever
+	 * puts the game's picture into the same target can tell a pixel that is still the pack's from
+	 * one the game has drawn a feature over since.
+	 * <p>
+	 * Emptied here at the head of every frame rather than by the pass that writes it, and that is
+	 * the whole safety of the thing. The frames where it is not written are exactly the frames
+	 * nothing of ours would clear it: a pack whose terrain program was refused, a place whose
+	 * targets are scaled, the frames before anything is allocated. A mask left standing from the
+	 * previous frame hides the game's picture behind geometry that has since moved, which reads as
+	 * a smear rather than as a stale mask.
+	 */
+	private TargetSurface coverage;
+
+	private int screenWidth;
+	private int screenHeight;
+	private boolean clearOwed;
+
+	/**
+	 * Whether the full round of emptying a reallocation asks for is still owed, which is a different
+	 * question from {@link #clearOwed} and is why it is a field of its own.
+	 * <p>
+	 * A round is WRITTEN in one part and RECORDED in another, and the two are not finished at the
+	 * same moment. The constants, the noise field and the pack's own textures are written where the
+	 * round is decided, so they are done the instant {@link #clear} runs, and {@code clearOwed} is
+	 * all they need. The per target emptying is only recorded there and paid afterwards, by the
+	 * load-op of the first pass that attaches the surface or by the flush that takes what is left,
+	 * so it can be lost outright: the frame that recorded it may open no pass at all, and the next
+	 * one drops what it finds. This flag is what carries the recording across such a frame.
+	 * <p>
+	 * <strong>What it watches is the record, not the texels.</strong> It comes down when nothing is
+	 * left on the books, and an entry leaves them where a pass descriptor is BUILT rather than where
+	 * one opens. A frame that builds descriptors and opens none of them therefore clears the books
+	 * without emptying anything, and this comes down with them. That gap is older than this flag and
+	 * it is not in the carrying. What it used to cost was a target starting from whatever the
+	 * driver had left in it; since every half of every target is emptied outright the moment the
+	 * round is decided, it costs a recorded clear that is dropped after the texels were emptied
+	 * anyway.
+	 * <p>
+	 * Warm up is the case this exists for, and it is the ordinary road rather than an odd one: the
+	 * terrain opens the targets and hands the frame straight back, once per frame, for as long as
+	 * programs are still compiling. Carrying {@code clearOwed} itself across those frames would
+	 * rewrite every constant and re-upload every texture the pack ships on each one of them.
+	 */
+	private boolean fullDeferOwed;
+
+	/**
+	 * The targets a compute or graphics pass writes as {@code colorimgN}, created with
+	 * the storage usage: the bit is baked into the image, so it is known before the first
+	 * allocation and never added to one.
+	 */
+	private Set<Integer> storageTargets = Set.of();
+
+	/** The targets a pack program asked to store into and the device refused, each said once. */
+	private final Set<Integer> storageRefused = new HashSet<>();
+
+	private boolean broken;
+
+	/**
+	 * Colour textures still owed a clear this frame. Folded into the load-op of the first pass that
+	 * writes them, which is the OpenGL equivalent of {@code glClear} as the FBO is bound; a
+	 * standalone {@code clearColorTexture} is a GPU stop of its own on this backend.
+	 */
+	private final Map<GpuTexture, Vector4fc> pendingClears = new IdentityHashMap<>();
+
+	/**
+	 * The megabytes the last announcement carried, or -1 before there has been one. Held so that a
+	 * resize says something only when there is something new to say; see {@link #announceSize}.
+	 */
+	private long announcedMegabytes = -1L;
+
+	/**
+	 * The screen the allocation failed at, so that the refusal is about that screen rather than
+	 * about the pack.
+	 * <p>
+	 * The panorama capture is what makes the difference matter. The game takes the main target to
+	 * 4096 square for six frames there, in {@code Minecraft.grabPanoramixScreenshot}, resizing it
+	 * itself rather than through the window the rest of the frame follows, and this class follows the
+	 * target: a machine that is comfortable at 1080p can fail to find the memory for the same chain
+	 * sixteen times over, and the pack was then dead for the rest of the session, on a window that
+	 * had gone back to its own size a frame later.
+	 */
+	private int brokenWidth;
+	private int brokenHeight;
+
+	/**
+	 * Whether the refusal is about the pack after all: a storage image of a size the pack chose
+	 * and no screen can change, which another screen size would only fail at again. The latch
+	 * above never lifts on it, and the chain puts the pack away rather than asking every frame.
+	 */
+	private boolean brokenForGood;
+
+	/**
+	 * The plan describes the programs that run and no others, so what its schedule turns over is
+	 * exactly what needs a second texture. Nothing is filtered here: a set of doubled targets
+	 * worked out from anything but the schedule the samplers were bound against is a parity that
+	 * disagrees with itself, and that shows as a plausible picture rather than as an error.
+	 */
+	ColorTargets(TargetPlan plan, int noiseResolution, NoiseTexture.Image noiseImage,
+			PackImages packImages, ImageInformation.Reading storageImages, int shadowResolution,
+			List<PackDirectives.ShadowColour> shadowColours,
+			List<PackDirectives.ShadowDepth> shadowDepths) {
+		this.plan = plan;
+		this.packImages = packImages;
+		this.storageImages = new StorageImages(storageImages);
+		this.storageBuffers = new StorageBuffers(CustomStorage.reading());
+		// The pack asks for it by directive and 256 is the default. Held rather than looked up at
+		// allocation: this class knows nothing of a frame, and the resolution never moves while a
+		// pack is loaded.
+		this.noiseResolution = noiseResolution;
+		// The image wins over the directive when the pack ships both: the directive sizes the
+		// generated field, and the image is uploaded as it stands, which is Iris's rule.
+		this.noiseImage = noiseImage;
+		// Which of the light's colour buffers are worth the memory is the plan's answer and not a
+		// count, on the rule the colour targets themselves follow: a pack naming shadowcolor2 gets
+		// the image, a pack writing nought alone pays for nought alone. The ceiling those names were
+		// read against comes from the same place, being the pack's own declaration and not ours.
+		this.shadowMap = new ShadowTargets(shadowResolution, shadowColours, shadowDepths,
+				plan.shadowAllocated(), plan.shadowCeiling());
+		this.doubled = Set.copyOf(plan.schedule().doubled());
+
+		// The format and the starting colour are read once and kept. Neither moves while a pack
+		// is loaded, and the colour especially is a decision the plan has already made: the Iris
+		// defaults, the pack's own override and the corrections this engine owes are settled
+		// there, and answering any of it again here would be the second answer to one question.
+		TargetDirectives directives = plan.directives();
+		for (int index : plan.ordered()) {
+			TargetDirectives.Colour colour = directives.clearColour(index);
+			TargetFormat format = directives.format(index).used();
+			this.formats.put(index, GpuFormats.of(format));
+			this.filters.put(index, GpuFormats.filterFor(format));
+			this.clearColours.put(index, new Vector4f(colour.r(), colour.g(), colour.b(), colour.a()));
+		}
+
+		this.fogCleared = !directives.declaresClearColour(FOG_TARGET);
+
+		// Narrowed to what is actually allocated: a pack may turn the directive on for a target no
+		// program of this place writes or samples, and a chain is a property of a texture that
+		// exists. What is dropped here is named below with everything else that was asked for and
+		// is not there.
+		this.mipmapped = directives.mipmapped().stream()
+				.filter(this.formats::containsKey)
+				.collect(Collectors.toCollection(TreeSet::new));
+		Map<String, Set<Integer>> lodReads = new LinkedHashMap<>();
+		directives.mipmapRequests().forEach((program, asked) -> lodReads.put(program,
+				asked.stream().filter(this.mipmapped::contains)
+						.collect(Collectors.toCollection(TreeSet::new))));
+		this.lodReads = Map.copyOf(lodReads);
+
+		// A flip directive may turn over a target no program of this place writes or samples, and
+		// nothing is allocated for one of those. Said here because the count of doubled targets is
+		// read against the memory the pack costs, and those two would otherwise disagree.
+		List<Integer> nowhere = this.doubled.stream()
+				.filter(index -> !this.formats.containsKey(index))
+				.toList();
+		if (!nowhere.isEmpty()) {
+			note("targets the schedule turns over and that no program of this place writes or "
+					+ "samples, so no texture exists for either half: " + nowhere);
+		}
+	}
+
+	/**
+	 * Makes every planned target exist at its own size, allocating or resizing as needed, and
+	 * owes itself a full clear whenever it had to. Must run on the render thread and outside any
+	 * render pass.
+	 *
+	 * @return false when nothing usable could be prepared, in which case nothing may be drawn
+	 */
+	boolean ensure(int screenWidth, int screenHeight) {
+		// A screen with no surface is refused before anything else, and before the latch below is
+		// consulted at all: a minimised window reports nought, which is another size and would lift
+		// a refusal on a size no allocation is ever attempted at. The frame the window comes back
+		// would then pay the failure again, in full, with its stack trace.
+		if (screenWidth <= 0 || screenHeight <= 0) {
+			return false;
+		}
+
+		// A screen of another size is another question, so it is asked again rather than answered by
+		// the last refusal. Nothing is retried at the size that failed: a screen that stays where it
+		// is would otherwise pay a full allocation and a full log line every frame.
+		if (this.broken && !this.brokenForGood
+				&& (screenWidth != this.brokenWidth || screenHeight != this.brokenHeight)) {
+			this.broken = false;
+		}
+
+		if (this.broken) {
+			return false;
+		}
+
+		this.screenWidth = screenWidth;
+		this.screenHeight = screenHeight;
+
+		boolean changed = false;
+		try {
+			changed = ensureConstants();
+			changed |= ensureCoverage(screenWidth, screenHeight);
+			// Not sized on the screen and therefore never resized with it: the pack's own resolution
+			// is the whole point of the map. Its answer is not folded into the debt below because
+			// the map is never in the clear that pays it: it empties itself where it is allocated,
+			// and again at the top of the stage that fills it, because its content has to cross the
+			// frame boundary.
+			this.shadowMap.ensure();
+			this.storageImages.ensure(screenWidth, screenHeight);
+			this.storageBuffers.ensure(screenWidth, screenHeight);
+			for (int index : this.plan.ordered()) {
+				// Each target has its own size, so one of them can be half the screen and be the
+				// only one reallocated when the window changes.
+				TargetSize size = this.plan.directives().size(index);
+				int width = size.width(screenWidth);
+				int height = size.height(screenHeight);
+
+				changed |= ensureSide(this.mainSide, index, width, height, "");
+				if (this.doubled.contains(index)) {
+					changed |= ensureSide(this.altSide, index, width, height, " alt");
+				}
+			}
+
+			// After the targets and sized on them, and not folded into the debt above: a copy is
+			// filled by the frame before anything reads it, so it is never owed a clear. A refusal
+			// there is the copy's own to keep, one target at a time, and takes nothing else down.
+			this.copies.ensure(this::target);
+		} catch (GpuDeviceLossException e) {
+			throw e;
+		} catch (RuntimeException e) {
+			this.broken = true;
+			this.brokenWidth = screenWidth;
+			this.brokenHeight = screenHeight;
+			this.brokenForGood = this.storageImages.refusedForGood();
+			// The notes are printed on their own, one line each and with nothing in front of them,
+			// so this one carries its subject: the error below is written where it happened and this
+			// is read again much later, beside the notes of the plan. The size stays out of it on
+			// purpose, note() being deduplicated on the exact text: a window dragged while the
+			// allocation keeps failing would otherwise add one line per size it passed through.
+			note(this.plan.packName() + " could not allocate its colour targets: " + e.getMessage());
+			Vulture.logger().error("Vulture could not allocate the colour targets of {} at {}x{}, so "
+					+ "nothing is drawn {}", this.plan.packName(), screenWidth, screenHeight,
+					this.brokenForGood ? "at any size" : "until the screen is another size", e);
+
+			return false;
+		}
+
+		if (changed) {
+			// One debt, paid by the next clear. Two calls that a later reader could put out of
+			// step would show as an image that explodes one frame after a resize and blames
+			// everything but the resize.
+			this.clearOwed = true;
+			announceSize();
+		}
+
+		return true;
+	}
+
+	/**
+	 * Whether {@link #ensure} has prepared this set at a real screen size and not refused it since,
+	 * at this size or at any. Read at the head of the frame, before that call is made for it, by
+	 * the one dispatch that runs there: a compute pushed over a set never prepared, or refused,
+	 * would be handed names nothing stands behind.
+	 */
+	boolean usable() {
+		return !this.broken && this.screenWidth > 0 && this.screenHeight > 0;
+	}
+
+	/**
+	 * Whether the refusal is one no screen size lifts, in which case the pack is not drawn again
+	 * this session and the reason is the one the notes carry.
+	 */
+	boolean refusedForGood() {
+		return this.brokenForGood;
+	}
+
+	/**
+	 * Records the emptying that the main and the alternate surface of each target the pack asked to
+	 * have cleared are owed, and of every other target as well while a round is a full one.
+	 * <p>
+	 * A record is paid afterwards, by the load-op of the first pass that attaches the surface or by
+	 * the flush that takes whatever is left, and {@link #fullDeferOwed} is what carries it over a
+	 * frame that pays nothing. On {@link #clearOwed} alone, once per reallocation and never again
+	 * while one is merely carried, a second part is written here and now: the constants, the noise
+	 * field and the textures the pack ships, which are not targets and fold into no load-op, and
+	 * both halves of every target, emptied outright so that a half no pass attaches while the
+	 * programs are still compiling does not wait on a record that can be dropped.
+	 * <p>
+	 * The shadow map is deliberately not in this list. It is drawn at the end of a frame for the
+	 * next one, so what it holds when the frame opens is exactly what the gbuffers are about to
+	 * read, and the shadow stage empties it itself right before drawing.
+	 *
+	 * @param fog what colortex0 starts this frame at, unless the pack named a colour of its own for
+	 *            it: the fog the game computed, with an alpha of one. The alpha is not a detail and
+	 *            Iris says so where it builds the same vector: a zero there gives Sildur's pink
+	 *            reflections, because the pack reads that channel as something of its own
+	 */
+	void clear(CommandEncoder encoder, Vector4fc fog) {
+		// Entries still standing are the last frame's, recorded and never paid, and the wipe below
+		// drops them without emptying a texel. So a full round that got no further than being
+		// recorded is owed again, and stays owed while anything of it is still on the books.
+		this.fullDeferOwed &= !this.pendingClears.isEmpty();
+
+		boolean full = this.clearOwed || this.fullDeferOwed;
+
+		// The written part, on the flag a reallocation raises and nothing carries forward. Hanging
+		// it off `full` instead would run all of this on every frame of a warm up, where the targets
+		// are opened and the frame handed back before any pass exists: four clears of their own, the
+		// noise field written out again, and every texture the pack ships uploaded again, once per
+		// frame for as long as programs are still compiling.
+		if (this.clearOwed) {
+			clear(encoder, this.black, OPAQUE_BLACK);
+			clear(encoder, this.white, OPAQUE_WHITE);
+			clear(encoder, this.grey, MID_GREY);
+			clear(encoder, this.unwritten, UNWRITTEN);
+			uploadNoise(encoder);
+			this.packSurfaces.forEach((image, surface) -> upload(encoder, surface, image.pixels()));
+
+			// Every half of every target, here and now rather than as a load-op. A half no pass
+			// attaches while the programs are still compiling keeps its load-op on the books until
+			// a frame that builds a descriptor and opens none drops the record, which is the hole
+			// fullDeferOwed names, and a target the pack keeps between frames then starts from
+			// whatever the driver left in it. Iris clears both framebuffers of every target on the
+			// first frame after an allocation, clear flag or not (ClearPassCreator with fullClear),
+			// and this is that clear, paid once per reallocation.
+			for (int index : this.plan.ordered()) {
+				Vector4fc colour = this.fogCleared && index == FOG_TARGET
+						? fog
+						: this.clearColours.get(index);
+				clear(encoder, this.mainSide.get(index), colour);
+				clear(encoder, this.altSide.get(index), colour);
+			}
+		}
+
+		this.pendingClears.clear();
+
+		// Every frame and never conditionally: the mask answers a question about THIS frame, and an
+		// answer carried over from the last one is worse than no answer at all. Left standing, last
+		// frame's depths would be compared with this frame's, the camera having moved between the
+		// two, and the seed would repaint the pack's geometry over most of the screen.
+		defer(this.coverage, UNWRITTEN);
+
+		for (int index : this.plan.ordered()) {
+			// A full clear ignores colortexNClear: a target that is kept from one frame to the
+			// next still has to start from something known the first time it is written.
+			if (!full && !this.plan.directives().clears(index)) {
+				continue;
+			}
+
+			Vector4fc colour = this.fogCleared && index == FOG_TARGET
+					? fog
+					: this.clearColours.get(index);
+			defer(this.mainSide.get(index), colour);
+			defer(this.altSide.get(index), colour);
+		}
+
+		// Last, so a throw above leaves both flags standing. Written off at the top, an upload that
+		// threw halfway left the pack sampling whatever the driver had put in a texture nobody had
+		// written, for the rest of the session and without a line to say so.
+		//
+		// The written part is done by the time this line runs and is written off here. The record
+		// has only just been made, so it is owed from here until the check at the top of the next
+		// round finds the books clear.
+		this.fullDeferOwed = full;
+		this.clearOwed = false;
+	}
+
+	/**
+	 * The clear colour of this view, once, for the pass that first writes it. Empty when the
+	 * texture was already cleared or is kept from the last frame.
+	 */
+	Optional<Vector4fc> takeClear(GpuTextureView view) {
+		if (view == null) {
+			return Optional.empty();
+		}
+
+		Vector4fc colour = this.pendingClears.remove(view.texture());
+		return colour == null ? Optional.empty() : Optional.of(colour);
+	}
+
+	/** True while a colour texture is still owed a clear this frame. */
+	boolean hasPendingClears() {
+		return !this.pendingClears.isEmpty();
+	}
+
+	/** One surface still owed its emptying, and the colour it is owed. */
+	private record Pending(GpuTextureView view, Vector4fc colour) {
+	}
+
+	/**
+	 * Empties every colour target still owed it. A pass about to open never finds its own targets
+	 * here: it took theirs through {@code takeClear} while building its descriptor, so what is left
+	 * is owed by surfaces nothing this frame is attaching.
+	 * <p>
+	 * <strong>Everything at once, and that is the point.</strong> Clearing only what one program
+	 * samples left the rest pending, so the next program that needed one opened another pass for
+	 * it, and a pass opened here ENDS THE GEOMETRY HOLD: the run of programs writing the same
+	 * images that this engine works to keep in a single pass is cut at every one of those. Measured
+	 * on Complementary Reimagined, a frame paid two of these passes and the entity family opened
+	 * four to six passes where the terrain, which meets none of them, opened two.
+	 * <p>
+	 * The trade is paid by the target a LATER pass of the same frame writes: it used to keep its
+	 * debt and ride that pass's load-op for free, and it is now emptied here, a full-surface write
+	 * ahead of one more. Fewer passes, more cleared texels, and the frame comes out ahead because
+	 * a pass is a GPU stop while a clear is bandwidth.
+	 * <p>
+	 * Doing them together also puts the emptying back where it was before it was deferred, at the
+	 * head of the frame rather than scattered through it, which is the order the rest of this class
+	 * was written against.
+	 * <p>
+	 * Encoded as one empty pass per size, load-op clear, which is {@code glClear} as the FBO is
+	 * bound. One {@code clearColorTexture} apiece would each be a GPU stop of its own.
+	 */
+	void flushPending(CommandEncoder encoder) {
+		if (this.pendingClears.isEmpty()) {
+			return;
+		}
+
+		List<Pending> pending = new ArrayList<>();
+		collectPending(this.coverage, pending);
+		for (TargetSurface surface : this.mainSide.values()) {
+			collectPending(surface, pending);
+		}
+
+		for (TargetSurface surface : this.altSide.values()) {
+			collectPending(surface, pending);
+		}
+
+		if (pending.isEmpty()) {
+			return;
+		}
+
+		LinkedHashMap<Long, List<Pending>> bySize = new LinkedHashMap<>();
+		for (Pending one : pending) {
+			GpuTexture texture = one.view().texture();
+			long key = ((long) texture.getWidth(0) << 32) | (texture.getHeight(0) & 0xFFFFFFFFL);
+			bySize.computeIfAbsent(key, ignored -> new ArrayList<>()).add(one);
+		}
+
+		int perPass = maxColorAttachments();
+		for (List<Pending> group : bySize.values()) {
+			int width = group.get(0).view().texture().getWidth(0);
+			int height = group.get(0).view().texture().getHeight(0);
+			for (int from = 0; from < group.size(); from += perPass) {
+				int to = Math.min(from + perPass, group.size());
+				PassDescriptor descriptor = PassDescriptor.create(() -> CLEAR_LABEL);
+				for (int index = from; index < to; index++) {
+					Pending one = group.get(index);
+					descriptor.withColorAttachment(one.view(), Optional.of(one.colour()));
+				}
+
+				descriptor.withRenderArea(new RenderPass.RenderArea(0, 0, width, height));
+				encoder.createRenderPass(descriptor.build()).close();
+			}
+		}
+	}
+
+	/**
+	 * Takes this surface's owed emptying. Silent on a surface that is not there or owes nothing,
+	 * which is the ordinary case for most of them.
+	 */
+	private void collectPending(TargetSurface surface, List<Pending> into) {
+		GpuTexture texture = surface == null ? null : surface.texture();
+		if (texture == null) {
+			return;
+		}
+
+		Vector4fc colour = this.pendingClears.remove(texture);
+		if (colour != null) {
+			into.add(new Pending(surface.view(), colour));
+		}
+	}
+
+	/**
+	 * How many colour attachments one pass may carry, asked of the device rather than assumed.
+	 * <p>
+	 * The Vulkan minimum a driver has to offer is four, not eight, and the count that matters here
+	 * is whatever this device reports: a pass built with more attachments than it allows is not a
+	 * slow pass, it is an invalid one. Asked per call rather than held, because the only cost is a
+	 * record field and a device can be replaced under this class.
+	 */
+	private static int maxColorAttachments() {
+		GpuDevice device = RenderSystem.tryGetDevice();
+
+		return device == null
+				? ASSUMED_COLOR_ATTACHMENTS
+				: Math.max(1, device.getDeviceInfo().limits().maxColorAttachments());
+	}
+
+	/**
+	 * Names the targets a program of the pack stores into as an image, before any is allocated.
+	 * Whether the device makes a storage image of a target's format is asked at its allocation, on
+	 * the render thread where a device exists, and a refusal is said there: the target is
+	 * allocated as it was and what stores into it is refused at its first draw or dispatch.
+	 */
+	void storageTargets(Set<Integer> targets) {
+		this.storageTargets = Set.copyOf(targets);
+	}
+
+	/**
+	 * Copies the alternate half back over the main one, for the targets the plan named and no
+	 * others. Must run outside any render pass, and after the last one of the frame.
+	 * <p>
+	 * Only a target the pack keeps between frames is ever in that list. The next frame walks the
+	 * chain from an empty flipped set, so it reads the main half of everything before anything has
+	 * written it; without this the pack would be handed, once per frame, the half it filled two
+	 * frames ago. Both halves carry the same format, so this is a copy of bits that mean the same
+	 * thing on both sides rather than a reinterpretation.
+	 * <p>
+	 * <strong>Exchanging the two surfaces instead of copying is NOT the same operation, and the
+	 * difference is what the frame did not write.</strong> A copy leaves the two halves carrying
+	 * the same image; an exchange leaves main on the last write and alt on the one before it. The
+	 * two only agree where the frame covered the whole target. Where it did not, because the pass
+	 * blends over a region rather than painting the surface, because a program the plan counted
+	 * failed to build, or because the chain is still warming up, the copy converges in one frame
+	 * and the exchange alternates for as long as the pack stays loaded. That alternation is
+	 * invisible while the player stands still, both halves then holding the same scene, and shows
+	 * as soon as the view moves and they hold two.
+	 * <p>
+	 * Iris copies here, {@code pipeline/FinalPassRenderer.java:139-162} and the
+	 * {@code glCopyTexSubImage2D} at {@code :290-303}, and it skips the targets
+	 * it is about to clear the same way this skips the ones the pack does not keep. Its own note
+	 * says a copy "works for the most part" and that the better approach would be a second set of
+	 * framebuffers on every other frame. That approach is not the exchange below: it needs the
+	 * chain walk itself to start from the other side on odd frames, where this engine starts every
+	 * frame from an empty flipped set, so exchanging the surfaces under a fixed walk moves the
+	 * image without moving the reader.
+	 * <p>
+	 * The list handed in keeps the plan's name for it, {@code ChainPlan.swapBack}: it names the
+	 * targets the frame leaves on the far half, whatever is done to bring them back, and the
+	 * harness reads it under that name.
+	 */
+	void copyBack(CommandEncoder encoder, List<Integer> targets) {
+		for (int index : targets) {
+			TargetSurface alt = this.altSide.get(index);
+			TargetSurface main = this.mainSide.get(index);
+			if (alt == null || main == null) {
+				note("nothing to copy back for " + TargetName.canonical(index) + ": the plan asks "
+						+ "for it and only one half of it exists");
+				continue;
+			}
+
+			GpuTexture from = alt.texture();
+			GpuTexture to = main.texture();
+			if (from != null && to != null) {
+				// Level nought alone, chain or no chain. The levels past it are refilled from it
+				// ahead of the next pass that reads one, so copying them here would be work whose
+				// result is overwritten before that pass can read it. A compute dispatched ahead of
+				// that refill samples the frame before's levels over this frame's nought, which is
+				// what Iris hands it too, its copy being level nought as well.
+				encoder.copyTextureToTexture(from, to, 0, 0, 0, 0, 0, main.width(), main.height());
+			}
+		}
+	}
+
+	/**
+	 * The world's depth in the window the pack reads it in. Never null, and its own images are null
+	 * until a frame has filled them.
+	 */
+	PackDepth depth() {
+		return this.depth;
+	}
+
+	/**
+	 * The copies served where a translucent geometry program reads a target it writes. Never
+	 * null, and each of its images is null until a frame has filled it.
+	 */
+	TargetCopies copies() {
+		return this.copies;
+	}
+
+	/**
+	 * The one texel {@code centerDepthSmooth} is read out of, and the pass that draws it. Its own
+	 * image is null until a frame has drawn it, and a name bound to it then reads the far plane.
+	 */
+	CenterDepth centerDepth() {
+		return this.centerDepth;
+	}
+
+	/**
+	 * The pass that reprojects the frame, and the image it writes. Camera only, and the class says
+	 * what that costs.
+	 */
+	MotionVectors motionVectors() {
+		return this.motionVectors;
+	}
+
+	/** Never held from one frame to the next. Null when this index was never allocated. */
+	GpuTextureView view(int index, TargetSchedule.Side side) {
+		TargetSurface surface = target(index, side);
+
+		return surface == null ? null : surface.view();
+	}
+
+	GpuTexture texture(int index, TargetSchedule.Side side) {
+		TargetSurface surface = target(index, side);
+
+		return surface == null ? null : surface.texture();
+	}
+
+	/**
+	 * The surface itself, for the reduction that fills its chain. Null when this index was never
+	 * allocated, and carrying a single level whenever nothing reads this target at a lod.
+	 */
+	TargetSurface surface(int index, TargetSchedule.Side side) {
+		return target(index, side);
+	}
+
+	/** What this program asks to blend with, or null when it asks for nothing. */
+	BlendMode blend(String program) {
+		return this.plan.blend(program).orElse(null);
+	}
+
+	/**
+	 * The same for the attachment holding that rank among the program's draw buffers, which is what
+	 * a {@code blend.<program>.<buffer>} directive lands on. Null when neither form says anything.
+	 */
+	BlendMode blend(String program, int rank) {
+		return this.plan.blend(program, rank).orElse(null);
+	}
+
+	/**
+	 * Which targets one program reads at a lod, narrowed to those that carry a chain.
+	 * <p>
+	 * Per program and not the union, because this is what decides when a chain is rebuilt. A chain
+	 * is only valid until something writes level nought again, so it is refilled before the next
+	 * program that reads one after such a write; taking the union here would rebuild every chain
+	 * before every program that happens to sample the target, which is ten render passes apiece
+	 * for a result nothing reads.
+	 * <p>
+	 * Settled with the plan rather than filtered on each ask: a compute asks per colour descriptor
+	 * of every dispatch.
+	 */
+	Set<Integer> lodReads(String program) {
+		return this.lodReads.getOrDefault(program, Set.of());
+	}
+
+	GpuFormat format(int index) {
+		return this.formats.get(index);
+	}
+
+	/**
+	 * The format one {@code shadowcolor} is allocated in, which the pack may have chosen. Read by the
+	 * shadow pipelines: dynamic rendering wants the colour state of a pipeline to name the format of
+	 * the attachment it is bound against, so a pack asking for R8 moves both or neither.
+	 */
+	GpuFormat shadowFormat(int index) {
+		return this.shadowMap.format(index);
+	}
+
+	int screenWidth() {
+		return this.screenWidth;
+	}
+
+	int screenHeight() {
+		return this.screenHeight;
+	}
+
+	/**
+	 * LINEAR wherever Iris allows it, which is everywhere but an integer format, and NEAREST for
+	 * a target the plan does not carry. Read off the table rather than resolved through the
+	 * directives again: asked per colour sampler of every pass of every frame.
+	 */
+	FilterMode filter(int index) {
+		return this.filters.getOrDefault(index, FilterMode.NEAREST);
+	}
+
+	/**
+	 * Whether the plan carries this target at all, which is answerable before anything has been
+	 * allocated. {@link #view} still comes back null until {@link #ensure} has run.
+	 */
+	boolean has(int index) {
+		return this.formats.containsKey(index);
+	}
+
+	/** Opaque black, one pixel, for a sampler the engine has no answer for. Never the scene. */
+	GpuTextureView black() {
+		return this.black == null ? null : this.black.view();
+	}
+
+	/**
+	 * One pixel of the sentinel, which is a mask saying the pack wrote nowhere at all. Stands in
+	 * for the mask itself over the frames before it is allocated, so that the seed covers its
+	 * target whole there rather than being cut against a depth nothing wrote.
+	 */
+	GpuTextureView unwritten() {
+		return this.unwritten == null ? null : this.unwritten.view();
+	}
+
+	/** White, so a shadow lookup reads the far plane rather than putting the world in shadow. */
+	GpuTextureView white() {
+		return this.white == null ? null : this.white.view();
+	}
+
+	/** Mid grey, for a lookup this engine has no answer for. */
+	GpuTextureView grey() {
+		return this.grey == null ? null : this.grey.view();
+	}
+
+	/** The pack's noise image, at the resolution it asked for. */
+	GpuTextureView noise() {
+		return this.noise == null ? grey() : this.noise.view();
+	}
+
+	/**
+	 * The depth the pack's opaque geometry left this frame, or null until the first frame allocates
+	 * it. Never held across a frame by anyone: it is looked up like every other view here.
+	 */
+	GpuTextureView coverage() {
+		return this.coverage == null ? null : this.coverage.view();
+	}
+
+	/**
+	 * The format the mask is allocated in, which the terrain pipeline has to name as well: dynamic
+	 * rendering refuses a pipeline whose colour state does not match the attachment it is bound
+	 * against, by name and in the middle of the world.
+	 */
+	GpuFormat coverageFormat() {
+		return COVERAGE_FORMAT;
+	}
+
+	/** The shadow map. Never null, and its own images are null until the first frame allocates them. */
+	ShadowTargets shadow() {
+		return this.shadowMap;
+	}
+
+	long bytes() {
+		return sum(TargetSurface::bytes);
+	}
+
+	/** What the same targets would cost with no chain, so that the two costs are read apart. */
+	private long baseBytes() {
+		return sum(TargetSurface::baseBytes);
+	}
+
+	private long sum(ToLongFunction<TargetSurface> cost) {
+		long total = 0L;
+		for (TargetSurface surface : this.mainSide.values()) {
+			total += cost.applyAsLong(surface);
+		}
+
+		for (TargetSurface surface : this.altSide.values()) {
+			total += cost.applyAsLong(surface);
+		}
+
+		return total;
+	}
+
+	List<String> notes() {
+		return List.copyOf(this.notes);
+	}
+
+	/**
+	 * Empties the storage images the pack marked {@code clear = true}, at the top of the shadow
+	 * stage, before geometry writes them. Complementary's voxel volume is one of those.
+	 */
+	void clearStorage(CommandEncoder encoder) {
+		this.storageImages.clearMarked(encoder);
+	}
+
+	/** Moves what may be moved onto this frame's anchor. {@link StorageImages#reanchor} says why. */
+	void reanchorStorage(CommandEncoder encoder, int dx, int dy, int dz) {
+		this.storageImages.reanchor(encoder, dx, dy, dz);
+	}
+
+	void release() {
+		this.mainSide.values().forEach(TargetSurface::close);
+		this.altSide.values().forEach(TargetSurface::close);
+		this.mainSide.clear();
+		this.altSide.clear();
+
+		this.packSurfaces.values().forEach(TargetSurface::close);
+		this.packSurfaces.clear();
+		this.filterable.clear();
+		this.storageImages.close();
+		this.storageBuffers.close();
+
+		this.black = release(this.black);
+		this.white = release(this.white);
+		this.grey = release(this.grey);
+		this.noise = release(this.noise);
+		this.unwritten = release(this.unwritten);
+		this.coverage = release(this.coverage);
+		this.shadowMap.release();
+		this.depth.release();
+		this.copies.release();
+		this.centerDepth.release();
+		this.motionVectors.release();
+		this.pendingClears.clear();
+
+		// Whatever is allocated next is a first allocation again, and it has to say what it costs
+		// even when it happens to cost the same as what was just let go.
+		this.announcedMegabytes = -1L;
+	}
+
+	private boolean ensureConstants() {
+		if (this.black != null) {
+			return false;
+		}
+
+		// The device's own set first, made here because this runs outside any pass and the passes
+		// below cannot: it carries the far plane in a depth format, which is the one fallback a
+		// comparison sampler can be bound against.
+		ConstantTextures.of(RenderSystem.getDevice());
+
+		// One pixel each, and clamped when they are bound, so the value is what a lookup reads
+		// wherever it lands. None of them carries a chain: a constant has nothing to average, and
+		// the noise image is a field a pack indexes itself rather than one anything reads at a lod.
+		this.black = new TargetSurface("Vulture black", CONSTANT_FORMAT, false, 1, 1);
+		this.white = new TargetSurface("Vulture white", CONSTANT_FORMAT, false, 1, 1);
+		this.grey = new TargetSurface("Vulture grey", CONSTANT_FORMAT, false, 1, 1);
+		// The mask's own format and not the constants', because it stands in for the mask: what
+		// reads it compares it with a depth, and black would say the pack wrote the whole screen at
+		// the far plane rather than that it wrote nothing.
+		this.unwritten = new TargetSurface("Vulture unwritten mask", COVERAGE_FORMAT, false, 1, 1);
+
+		if (this.noiseImage != null) {
+			this.noise = new TargetSurface("Vulture noise", CONSTANT_FORMAT, false,
+					this.noiseImage.width(), this.noiseImage.height());
+			Vulture.logger().info("noisetex is the pack's own image, {}x{}",
+					this.noiseImage.width(), this.noiseImage.height());
+		} else {
+			int resolution = this.noiseResolution;
+			this.noise = new TargetSurface("Vulture noise", CONSTANT_FORMAT, false, resolution,
+					resolution);
+			Vulture.logger().info("noisetex is the generated field at {}x{}", resolution, resolution);
+		}
+
+		ensurePackTextures();
+
+		return true;
+	}
+
+	/**
+	 * Makes the coverage mask exist at the size of the screen, which is the size the geometry it
+	 * records is rasterised at. No chain: nothing reads it at a lod, and a coarser mask would let
+	 * the seed through along every silhouette.
+	 */
+	private boolean ensureCoverage(int width, int height) {
+		if (this.coverage == null) {
+			this.coverage = new TargetSurface("Vulture terrain coverage", COVERAGE_FORMAT, false,
+					width, height);
+
+			return true;
+		}
+
+		return this.coverage.resize(width, height);
+	}
+
+	/**
+	 * One texture per file the pack ships, at the size it decoded to, with no chain.
+	 * <p>
+	 * No chain because a texture of the pack's own has never had one: Iris forces the maximum level
+	 * to nought on every one of them, and a lookup table read at a level nobody wrote is the kind of
+	 * wrong that looks right. Never resized either, since none of them is sized on the screen.
+	 * <p>
+	 * The size is written out texture by texture and the memory once at the end, because neither is
+	 * readable from the pack: Body Camera's lookup table is fifty nine kilobytes in the zip and
+	 * sixty four megabytes once it is four thousand and ninety six square in memory.
+	 */
+	private void ensurePackTextures() {
+		List<PackImages.Image> images = this.packImages.images();
+		if (images.isEmpty()) {
+			return;
+		}
+
+		for (PackImages.Image image : images) {
+			Vulture.logger().info("The pack supplies {}", PackImages.describe(image));
+
+			// Nothing to allocate for a texture the game holds: packView asks the game for it at
+			// every bind, and an image of our own here would be a copy of nothing.
+			if (image.live()) {
+				continue;
+			}
+
+			// On the render thread, and before the pack-load worker exists: this is what answers the
+			// device for every format the pack supplies, so a geometry program built off thread
+			// reads the table rather than filling it. The note belongs here for the same reason.
+			if (image.texture().blur() && !filterable(image.format())) {
+				note(image.texture().sampler() + " is read at the nearest texel, this device not "
+						+ "filtering " + image.format() + " linearly");
+			}
+
+			// One at a time, because one refusal here must cost one texture and not the pack. These
+			// are the only surfaces of the engine whose size comes from a downloaded file rather
+			// than from the window, and everything else in this method is on the road that sets
+			// broken and draws nothing. Same answer ShadowTargets gives for a size a pack chose: a
+			// lookup table is not worth taking the pack down for, and a sampler with nothing behind
+			// it already reads black.
+			try {
+				this.packSurfaces.put(image, new TargetSurface(
+						"Vulture " + image.texture().sampler(), image.format(), false, image.width(),
+						image.height()));
+			} catch (GpuDeviceLossException e) {
+				throw e;
+			} catch (RuntimeException e) {
+				note(image.texture().sampler() + " could not be allocated at " + image.width() + "x"
+						+ image.height() + ", so it reads one black pixel: " + e.getMessage());
+				Vulture.logger().warn("Vulture could not allocate {} at {}x{}, so it reads one black pixel",
+						image.texture().sampler(), image.width(), image.height(), e);
+			}
+		}
+
+		long bytes = this.packImages.bytes();
+		Vulture.logger().info("{} textures of the pack's own, {} MiB once decoded", images.size(),
+				megabytes(bytes));
+
+		if (this.packImages.loud()) {
+			// Said apart because it is invisible from the pack: what is read is compressed and what
+			// is allocated is not, and the two are three orders of magnitude apart for a lookup
+			// table.
+			Vulture.logger().warn("The pack's own textures take {} MiB of memory, far more than the "
+					+ "files they were read from", megabytes(bytes));
+		}
+	}
+
+	/**
+	 * The image the pack supplies for that name at that stage, with the filter and the addressing it
+	 * asked for, or null when the pack takes the name over and nothing could be put behind it.
+	 * <p>
+	 * A volume is addressed CLAMP whatever the pack wrote, and that is the one answer this class
+	 * overrides. Its wrapping is done by the helper the translation printed, on coordinates that
+	 * never leave the tile; letting the sampler repeat as well would wrap the ATLAS, which is a
+	 * different image, and the gutter would stop being read at all.
+	 */
+	PackBinding packTexture(TextureStage stage, String sampler) {
+		PackSource source = packSource(stage, sampler);
+		GpuTextureView view = source == null ? null : packView(source.image());
+
+		return view == null ? null
+				: new PackBinding(view, source.filter(), source.repeat(), source.mipmaps());
+	}
+
+	/**
+	 * The half of {@link #packTexture} that never moves once the pack is read, for a caller that
+	 * binds the same name every frame: null where the pack supplies nothing for it.
+	 */
+	PackSource packSource(TextureStage stage, String sampler) {
+		PackImages.Image image = this.packImages.find(stage, sampler);
+		if (image == null) {
+			return null;
+		}
+
+		boolean flat = !sampler.equals(SamplerPlan.behind(sampler));
+
+		// A texture the game holds is read the way Iris reads it, through MIPPED_NEAREST_REPEAT
+		// (gl/texture/TextureWrapper.java:27-29): nearest within a level, repeating, and down the
+		// levels the game built for it, which is what an atlas read from far away needs to stay
+		// the colour of its blocks rather than a shimmer of single texels. It has no .mcmeta of the
+		// pack's to ask otherwise.
+		if (image.live()) {
+			return new PackSource(image, FilterMode.NEAREST, !flat, true);
+		}
+
+		return new PackSource(image, filterFor(image), !flat && !image.texture().clamp(), false);
+	}
+
+	/**
+	 * How one supplied texture is read: what the pack asked for, unless this device cannot filter
+	 * the format it went up in.
+	 * <p>
+	 * The formats that can lose here are the ones the specification does not require a device to
+	 * filter, which among the four an atlas is allocated as are the thirty two bit float and the
+	 * sixteen bit normalised one. What is lost is the blend between two entries of a lookup table:
+	 * read at the nearest entry it still draws the picture the pack drew, banded.
+	 */
+	private FilterMode filterFor(PackImages.Image image) {
+		return image.texture().blur() && filterable(image.format())
+				? FilterMode.LINEAR
+				: FilterMode.NEAREST;
+	}
+
+	/**
+	 * Asked of the device the first time a format is met here, and said once when it answers no.
+	 * <p>
+	 * The log line rather than a note, because this is reachable from the pack-load worker and the
+	 * note list is the render thread's; {@link #ensurePackTextures} writes the note for every format
+	 * the pack really supplies, which is every format that can reach here.
+	 */
+	private boolean filterable(GpuFormat format) {
+		return this.filterable.computeIfAbsent(format, one -> {
+			boolean answer = GpuFormats.filtersLinearly(one);
+			if (!answer) {
+				Vulture.logger().warn("This device does not filter {} linearly, so what the pack "
+						+ "supplies in it is read at the nearest texel where its directive asked for "
+						+ "a blend", one);
+			}
+
+			return answer;
+		});
+	}
+
+	/**
+	 * The view behind a supplied image, or null while nothing could be put behind it. For one bound
+	 * live, whatever the game holds under its name as this is asked, which is what an atlas needs.
+	 */
+	GpuTextureView packView(PackImages.Image image) {
+		if (image.live()) {
+			return GameImages.held(PackImages.location(image.texture().path()));
+		}
+
+		TargetSurface surface = this.packSurfaces.get(image);
+
+		return surface == null ? null : surface.view();
+	}
+
+	/**
+	 * Uploads the noise image, once: the pack's own when it ships one, otherwise the generator the
+	 * harness has a fingerprint for.
+	 * <p>
+	 * A pack indexes this image with coordinates of its own, so it is not enough for the picture to
+	 * look like noise: it has to be the image the pack was tuned against, which is why the generator
+	 * follows Iris bit for bit and why no observation in the game could ever prove it right. The
+	 * same rule is what makes {@code texture.noise} matter: four packs of the corpus were tuned
+	 * against a smooth image of their own, and the generated white noise fed to their water octaves
+	 * crumples the surface into facets.
+	 * <p>
+	 * Until this was here every {@code noisetex} lookup read one mid grey pixel, which is a constant
+	 * where the pack asked for a field. That is not a missing detail: BSL builds its cloud distance
+	 * from it, and a cloud distance of nought discards every fragment of water.
+	 */
+	private void uploadNoise(CommandEncoder encoder) {
+		byte[] pixels = this.noiseImage != null
+				? this.noiseImage.rgba()
+				: NoiseTexture.rgba(this.noise.width());
+		upload(encoder, this.noise, pixels);
+	}
+
+	/** One image into one surface, whole, at level nought. Outside any render pass, like the clears. */
+	private static void upload(CommandEncoder encoder, TargetSurface surface, byte[] pixels) {
+		ByteBuffer data = ByteBuffer.allocateDirect(pixels.length).order(ByteOrder.nativeOrder());
+		data.put(pixels).flip();
+
+		encoder.writeToTexture(surface.texture(), data, 0, 0, 0, 0, surface.width(),
+				surface.height());
+	}
+
+	private boolean ensureSide(Map<Integer, TargetSurface> side, int index, int width, int height, String suffix) {
+		TargetSurface surface = side.get(index);
+		if (surface != null && surface.width() == width && surface.height() == height) {
+			return false;
+		}
+
+		String name = TargetName.canonical(index) + suffix;
+		boolean mipped = this.mipmapped.contains(index);
+		if (surface == null) {
+			GpuFormat format = this.formats.get(index);
+			TargetDirectives directives = this.plan.directives();
+			boolean storage = this.storageTargets.contains(index) && GpuFormats.storageCapable(format);
+			if (this.storageTargets.contains(index) && !storage && this.storageRefused.add(index)) {
+				Vulture.logger().warn("{} is stored into as an image by a program of the pack, and "
+						+ "this device makes no storage image of {}, so what stores into it is not run",
+						name, format);
+			}
+			// Named before it is allocated, on purpose. RG11B10_FLOAT as a colour attachment is
+			// not something the Vulkan specification guarantees and nothing in the game asks the
+			// driver whether it has it, so the last line written has to name the format asked for.
+			// The declaration comes with it, because a wrong image starts at a wrong declaration
+			// and reading it off the picture is what has to stop being necessary.
+			Vulture.logger().info("Allocating {} as {} at {}x{}, {} level(s), declared {} at {}{}", name,
+					format, width, height, TargetSurface.levelsFor(mipped, width, height),
+					directives.format(index).declared(), directives.formatSource(index),
+					storage ? ", writable as a storage image" : "");
+			side.put(index, new TargetSurface("Vulture " + name, format, mipped, storage, width,
+					height));
+		} else {
+			surface.resize(width, height);
+		}
+
+		return true;
+	}
+
+	private void announceSize() {
+		long bytes = bytes();
+		long base = baseBytes();
+		long single = this.plan.bytesAt(this.screenWidth, this.screenHeight, Set.of());
+
+		// Dragging a window edge reallocates at every step the game reports, and each of those used
+		// to copy this whole block out again, the memory warning with it, until a line that means
+		// "this pack is expensive" read as an alarm going off ten times a second. The screen moves
+		// by the pixel and the figure this block is about moves by the megabyte, so that figure is
+		// what decides whether any of it is worth saying twice.
+		long total = megabytes(bytes);
+		if (total == this.announcedMegabytes) {
+			return;
+		}
+
+		this.announcedMegabytes = total;
+		Vulture.logger().info("Colour targets of {} sized for {}x{}: {} targets, {} MiB",
+				this.plan.packName(), this.screenWidth, this.screenHeight, this.mainSide.size(),
+				megabytes(bytes));
+
+		// Named and not counted. Which targets take part in the ping pong is the one thing a wrong
+		// picture is read back against, and the cost of the second half is the price of the chain.
+		// Read against the cost of level nought alone, so that this line stays about the doubling:
+		// the mip chains are the next one's to account for.
+		if (!this.doubled.isEmpty()) {
+			Vulture.logger().info("{} targets doubled: {}, {} MiB instead of {}",
+					this.doubled.size(), this.doubled, megabytes(base), megabytes(single));
+		}
+
+		if (!this.mipmapped.isEmpty()) {
+			Vulture.logger().info("{} targets carry a mip chain because a program reads them at a "
+					+ "lod: {}, {} MiB more", this.mipmapped.size(), this.mipmapped,
+					megabytes(bytes - base));
+		}
+
+		if (bytes > LOUD_BYTES) {
+			// The second halves cost base minus single, NOT bytes minus single: bytes carries the
+			// mip chains as well, and charging them to the ping pong would name the wrong cause to
+			// somebody reading this line to decide what to turn off. The chains are named on their
+			// own line above.
+			Vulture.logger().warn("{} takes {} MiB of colour targets at {}x{}, {} of them for the "
+					+ "second halves of {} and {} for the mip chains", this.plan.packName(),
+					megabytes(bytes), this.screenWidth, this.screenHeight, megabytes(base - single),
+					this.doubled, megabytes(bytes - base));
+		}
+	}
+
+	private static long megabytes(long bytes) {
+		return bytes / (1024L * 1024L);
+	}
+
+	private TargetSurface target(int index, TargetSchedule.Side side) {
+		// A target nothing flips has one texture, and a schedule asking for its other side is
+		// asking for the only one there is.
+		if (side == TargetSchedule.Side.ALT) {
+			TargetSurface alt = this.altSide.get(index);
+			if (alt != null) {
+				return alt;
+			}
+
+			// Said once per target, because past this point it must never happen: the schedule
+			// doubles everything a running program turns over, so a fall back here means the halves
+			// the samplers were bound against and the halves that exist are two different answers.
+			// Left silent it is the one place such a disagreement can hide.
+			if (this.formats.containsKey(index) && this.fellBack.add(index)) {
+				Vulture.logger().warn("{} was read from its alternate half and only one half of it "
+						+ "exists, so both sides of the ping pong are the same texture",
+						TargetName.canonical(index));
+			}
+		}
+
+		return this.mainSide.get(index);
+	}
+
+	private void note(String text) {
+		if (!this.notes.contains(text)) {
+			this.notes.add(text);
+		}
+	}
+
+	/**
+	 * Remembers a clear for the first pass that writes this surface. A standalone texture clear is
+	 * a full GPU stop on this backend; a load-op on the pass that first attaches it is not.
+	 */
+	private void defer(TargetSurface surface, Vector4fc colour) {
+		GpuTexture texture = surface == null ? null : surface.texture();
+		if (texture != null) {
+			this.pendingClears.put(texture, colour);
+		}
+	}
+
+	/**
+	 * Clears the whole chain, and that is the backend's choice rather than ours: there is no level
+	 * argument on {@code clearColorTexture}, and {@code VulkanCommandEncoder} sets the subresource
+	 * range's {@code levelCount} to the texture's full mip count. So a mipmapped target costs about
+	 * four thirds of a clear rather than one.
+	 * <p>
+	 * Used for the one-pixel constants, which no pack pass writes and which therefore cannot fold
+	 * into a load-op, and once per reallocation for both halves of every target, where the load-op
+	 * the round records may never be paid.
+	 */
+	private static void clear(CommandEncoder encoder, TargetSurface surface, Vector4fc colour) {
+		GpuTexture texture = surface == null ? null : surface.texture();
+		if (texture != null) {
+			encoder.clearColorTexture(texture, colour);
+		}
+	}
+
+	private static TargetSurface release(TargetSurface surface) {
+		if (surface != null) {
+			surface.close();
+		}
+
+		return null;
+	}
+}

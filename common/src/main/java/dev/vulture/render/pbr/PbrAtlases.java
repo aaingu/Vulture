@@ -1,0 +1,258 @@
+package dev.vulture.render.pbr;
+
+import dev.vulture.pack.option.EngineDefines;
+import dev.vulture.render.PackDefines;
+import dev.vulture.Vulture;
+
+import com.mojang.blaze3d.GpuDeviceLossException;
+import com.mojang.blaze3d.textures.GpuTexture;
+import com.mojang.blaze3d.textures.GpuTextureView;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.packs.resources.Resource;
+import net.minecraft.server.packs.resources.ResourceManager;
+
+import java.io.InputStream;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Properties;
+
+/**
+ * What a resource pack ships beside its block textures, one companion image per atlas of the game,
+ * kept from the moment an atlas is stitched until the next reload replaces it.
+ * <p>
+ * The lookup is by the image a pass is really drawing with rather than by the family of the pass,
+ * and that is Iris's rule rather than a simplification of it: it resolves the maps from the albedo
+ * texture the draw has bound ({@code pipeline/IrisRenderingPipeline.java:849-871}), so the block
+ * atlas, the item atlas and the particle atlas each answer for themselves without anything having
+ * to know which is which.
+ * <p>
+ * <strong>A texture that is not an atlas is not this file's business, and it is not lost either.</strong>
+ * Iris registers a second loader for a plain texture
+ * ({@code pbr/loader/PBRTextureLoaderRegistry.java:15} onto
+ * {@code pbr/loader/SimplePBRLoader.java:19-31}), resolved per bound albedo at
+ * {@code pbr/texture/PBRTextureManager.java:126-141}, so an entity skin and an armour layer read
+ * their own {@code _n} and {@code _s} there. {@link PbrTextures} is that second door, and
+ * {@code GeometryProgram} asks this one first and it second. What decides between them here is not
+ * the class of the texture but the answer: these maps are built against one image and follow it
+ * alone, so an atlas the pack ships nothing for and a texture that is no atlas at all both fall
+ * through to the same place.
+ * <p>
+ * Only the geometry programs are served, which is Iris's shape: {@code normals} and
+ * {@code specular} are added by {@code IrisSamplers.addLevelSamplers} and by nothing else
+ * ({@code samplers/IrisSamplers.java:215-216}). What a composite declaring one of the names reads
+ * is NOT the same on both sides and this file does not claim it is: here the full screen binding
+ * resolves such a name to one black pixel ({@code render/PackPass.java:646}), where Iris leaves the
+ * sampler unassigned and it falls to whatever texture unit nought holds. The flat texel this class
+ * falls back on answers a different question, which is a GEOMETRY program reading a sprite the
+ * resource pack ships no map for.
+ */
+public final class PbrAtlases {
+
+	/** Where a resource pack says which convention its maps are drawn in. OptiFine's location. */
+	private static final Identifier FORMAT = Identifier.withDefaultNamespace(
+			"optifine/texture.properties");
+
+	/**
+	 * By atlas name rather than by texture, because the texture is what a reload replaces: the game
+	 * closes the old one and builds another under the same name, so a map keyed on the texture would
+	 * hold a companion nothing can ever reach again.
+	 */
+	private static final Map<Identifier, PbrAtlas> ATLASES = new HashMap<>();
+
+	/** The one convention this engine knows a symbol and a reduction for. */
+	private static final String LAB_PBR = "lab-pbr";
+
+	private static EngineDefines.TextureFormat format;
+
+	private PbrAtlases() {
+	}
+
+	/**
+	 * Reads the maps for one atlas the game has just stitched, and lets go of whatever it had for
+	 * that atlas before.
+	 * <p>
+	 * Called for every atlas and not only the block one. An atlas that no pack ships a map for costs
+	 * two lookups per sprite, one for each map, and nothing else: no image is decoded and no texture
+	 * is created, which is what an ordinary install without a material pack pays.
+	 * <p>
+	 * Not gated on a shader pack being loaded, where Iris builds nothing until one is and asks for
+	 * the two names ({@code pipeline/IrisRenderingPipeline.java:855} off
+	 * {@code samplers/IrisSamplers.hasPBRSamplers}). What that gate would buy is measured and small:
+	 * all eight packs of the corpus declare at least one of the names, so it only ever spares the
+	 * player who has a material resource pack and no shader pack running at all. What it would cost
+	 * is a question this side cannot answer at the moment it is asked - an atlas is stitched during
+	 * the resource reload, before any pack is chosen for the place being entered.
+	 *
+	 * @param atlas   what the atlas is called
+	 * @param texture the texture the game stitched
+	 * @param sprites every sprite of that atlas
+	 */
+	public static void stitched(Identifier atlas, GpuTexture texture,
+			Collection<TextureAtlasSprite> sprites) {
+		Minecraft minecraft = Minecraft.getInstance();
+		if (minecraft == null) {
+			return;
+		}
+
+		ResourceManager resources = minecraft.getResourceManager();
+
+		// The record already held is kept where the file still names the same thing, rather than
+		// replaced by an equal one. What asks whether this moved is
+		// PackDefines#textureFormatMoved(), which runs once a frame: given the same object it stops
+		// at the reference, where a fresh record each stitch would have it compare two strings for
+		// the whole session.
+		EngineDefines.TextureFormat declared = format(resources);
+		if (!Objects.equals(declared, format)) {
+			format = declared;
+		}
+
+		PbrAtlas previous = ATLASES.remove(atlas);
+		if (previous != null) {
+			previous.close();
+		}
+
+		try {
+			PbrAtlas read = PbrAtlas.read(atlas, texture, sprites, resources, labPbr());
+			if (read != null) {
+				ATLASES.put(atlas, read);
+			}
+		} catch (GpuDeviceLossException e) {
+			throw e;
+		} catch (RuntimeException e) {
+			// Named and swallowed. Every one of these images is an improvement on a flat texel and
+			// none of them is owed: a pack that cannot get one still draws, and taking the world
+			// down over a resource pack's texture would be the worse answer by a distance.
+			Vulture.logger().error("The material maps of {} could not be built, so its sprites keep "
+					+ "the flat values", atlas, e);
+		}
+	}
+
+	/**
+	 * The map behind one of the two names for the image a pass is drawing with, or null where the
+	 * resource pack ships none for it.
+	 *
+	 * @param atlas the image the pass draws with, which is null for every family that has none
+	 */
+	public static GpuTextureView view(GpuTextureView atlas, PbrMap map) {
+		if (atlas == null) {
+			return null;
+		}
+
+		for (PbrAtlas built : ATLASES.values()) {
+			if (built.follows(atlas)) {
+				return built.view(map);
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Whether the resource pack fills one of the two names for any atlas at all.
+	 * <p>
+	 * A coarser question than {@link #view}, and it exists because the report a program prints once
+	 * at load cannot ask the finer one. Four families choose their image per DRAW and not per
+	 * program - the particles alone come off the block atlas, the item atlas and the particle atlas
+	 * inside one pass - so there is no single answer a latched line could give. What that line can
+	 * say without lying is whether anything fills the name this session; which atlases really answer
+	 * is said exactly, once each, by {@link PbrAtlas} as they are built.
+	 */
+	public static boolean supplies(PbrMap map) {
+		for (PbrAtlas built : ATLASES.values()) {
+			if (built.view(map) != null) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Whether the resource pack declares the labPBR convention, which decides how the specular map is
+	 * reduced and how it is filtered. Read once per stitch and answered from there.
+	 * <p>
+	 * A declaration at all is a labPBR declaration: {@link #format} keeps nothing else, because
+	 * {@code lab-pbr} is the only convention Iris registers a factory for either
+	 * ({@code pbr/format/TextureFormatRegistry.java:12}).
+	 */
+	public static boolean labPbr() {
+		return format != null;
+	}
+
+	/**
+	 * What the resource pack declares, for the symbols the pack branches on. Null where it declares
+	 * nothing.
+	 * <p>
+	 * Answered from the last stitch rather than from the file, which is Iris's moment translated:
+	 * it refreshes the same answer at the tail of the texture manager's own reload
+	 * ({@code mixin/texture/MixinTextureManager.java:32}) and reloads the whole pipeline when it
+	 * comes back different ({@code pbr/format/TextureFormatLoader.java:28-32}). Here the stitch is
+	 * the reload, and {@link PackDefines#textureFormatMoved()} is the reload that follows.
+	 */
+	public static EngineDefines.TextureFormat format() {
+		return format;
+	}
+
+	/**
+	 * Hands back every image built for every atlas. Called where the device is still alive, which is
+	 * the whole reason it is a call and not a finaliser.
+	 */
+	public static void close() {
+		ATLASES.values().forEach(PbrAtlas::close);
+		ATLASES.clear();
+	}
+
+	/**
+	 * What {@code optifine/texture.properties} names, or null where the resource pack ships no such
+	 * file, names no convention in it, or names one this engine has nothing to say about.
+	 * <p>
+	 * The version after the slash is kept although nothing here reduces or filters differently for
+	 * it: the two versions differ in what the channels mean to the PACK, which is the pack's
+	 * business, and the pack reaches that business through {@code MC_TEXTURE_FORMAT_LAB_PBR_1_3},
+	 * built from this string ({@code pbr/format/TextureFormat.java:25-30}). Iris keeps it for the
+	 * same reason and for one more, which is comparing it to decide a reload
+	 * ({@code pbr/format/LabPBRTextureFormat.java:34-44}); {@link PackDefines#textureFormatMoved()}
+	 * is where that comparison lands here.
+	 */
+	static EngineDefines.TextureFormat format(ResourceManager resources) {
+		Optional<Resource> resource = resources.getResource(FORMAT);
+		if (resource.isEmpty()) {
+			return null;
+		}
+
+		Properties properties = new Properties();
+		try (InputStream stream = resource.get().open()) {
+			properties.load(stream);
+		} catch (Exception e) {
+			Vulture.logger().warn("{} could not be read, so the material maps are reduced and "
+					+ "filtered as if it named no format", FORMAT, e);
+
+			return null;
+		}
+
+		String declared = properties.getProperty("format", "").trim();
+		int slash = declared.indexOf('/');
+		if (!LAB_PBR.equals(slash < 0 ? declared : declared.substring(0, slash))) {
+			return null;
+		}
+
+		return new EngineDefines.TextureFormat(LAB_PBR, version(declared, slash));
+	}
+
+	/** The field between the first slash and the next, or null where there is nothing between. */
+	private static String version(String declared, int slash) {
+		if (slash < 0) {
+			return null;
+		}
+
+		int next = declared.indexOf('/', slash + 1);
+		String version = declared.substring(slash + 1, next < 0 ? declared.length() : next);
+
+		return version.isEmpty() ? null : version;
+	}
+}

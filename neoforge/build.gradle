@@ -1,0 +1,62 @@
+plugins {
+	id "net.neoforged.moddev" version "${moddev_version}"
+}
+
+evaluationDependsOn(":common")
+
+base {
+	archivesName = "vulture-neoforge"
+}
+
+neoForge {
+	version = project.neoforge_version
+
+	runs {
+		client {
+			client()
+		}
+	}
+
+	mods {
+		"${project.mod_id}" {
+			sourceSet sourceSets.main
+			sourceSet project(":common").sourceSets.main
+		}
+	}
+}
+
+dependencies {
+	// Sodium is not named here and does not have to be: everything that reaches into it lives in
+	// the common module, which declares it, and nothing this module calls has a Sodium type in its
+	// signature.
+	compileOnly project(":common")
+}
+
+tasks.named("processResources", ProcessResources).configure {
+	def metadata = [
+		mod_id: project.mod_id,
+		mod_version: rootProject.effectiveVersion,
+		minecraft_version: project.minecraft_version,
+		minecraft_next: project.minecraft_next,
+		neoforge_min_version: project.neoforge_min_version
+	]
+
+	inputs.properties(metadata)
+
+	filesMatching("META-INF/neoforge.mods.toml") {
+		expand(metadata)
+	}
+}
+
+tasks.named("jar", Jar).configure {
+	archiveVersion = "${rootProject.effectiveVersion}+mc${project.minecraft_version}"
+	from project(":common").sourceSets.main.output
+
+	// The licence has to reach whoever receives the program, and what they receive is this jar.
+	// A licence field in the metadata is a declaration, not a copy.
+	from(rootDir) {
+		include "LICENSE"
+		include "GPL-3.0.txt"
+		include "NOTICE"
+	}
+}

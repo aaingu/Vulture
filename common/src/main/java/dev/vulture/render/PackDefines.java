@@ -1,0 +1,205 @@
+package dev.vulture.render;
+
+import dev.vulture.dh.DhDepth;
+import dev.vulture.pack.option.EngineDefines;
+import dev.vulture.render.pbr.PbrAtlases;
+import dev.vulture.uniform.BiomeCategory;
+
+import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.blaze3d.systems.RenderSystem;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.util.Util;
+import net.minecraft.world.level.biome.Biomes;
+
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+
+/**
+ * Gathers what the machine is and hands it to {@link EngineDefines}, which is the one thing in
+ * this engine that cannot be worked out without the game.
+ * <p>
+ * The biome symbols are the reason this exists. A pack writes {@code if (biome == BIOME_DESERT)}
+ * in its GLSL and {@code in(biome, BIOME_SAVANNA, BIOME_SAVANNA_PLATEAU)} in its properties, so
+ * the number behind the symbol and the number the {@code biome} uniform carries have to be the
+ * same one. {@link BiomeClassifier} is that number, and it is asked here rather than copied. Its
+ * table is filled from the {@code Biomes} class as it initialises, so the symbols exist from the
+ * first read of the first pack, before any world does; that is Iris's arrangement, whose map is
+ * filled the same way ({@code mixin/MixinBiomes.java:14-22}) and whose defines are written from it
+ * ({@code shaderpack/IrisDefines.java:28}).
+ * <p>
+ * The world-join reload stays even though the biome symbols do not need it, because the
+ * symbols were never the only thing riding it: {@code block.properties} may name block TAGS, and
+ * {@code BlockStateIds} can only resolve those once the world's own registries exist
+ * ({@code BlockStateIds.java:86-88}, resolving through {@code BuiltInRegistries.BLOCK.getTags()}
+ * at {@code :249}). At startup there are none, so the first read of a session still has to be
+ * made again when a world arrives, and {@link #stale()}'s registry stamp is what notices that.
+ * <p>
+ * Two of these move without the world moving, so {@link #stale()} watches them beside the registry
+ * rather than trusting what was true when the pack was read: Distant Horizons, which the player
+ * switches from that mod's own screen, and the material convention a resource pack declares, which
+ * a resource reload replaces.
+ */
+public final class PackDefines {
+
+	/** Which registry the last read was against, so that joining a world is noticed. */
+	private static volatile long installed;
+
+	/** And whether the far terrain was there, which the player can change without leaving. */
+	private static volatile boolean distant;
+
+	/** And what the resource packs declared their material maps in, which a reload replaces. */
+	private static volatile EngineDefines.TextureFormat format;
+
+	private PackDefines() {
+	}
+
+	/**
+	 * Reads the machine and installs it. Called once before a pack is read, and never per frame:
+	 * every symbol here is fixed for as long as the world is.
+	 */
+	public static void install() {
+		// Beside the machine table because it is the same moment: a launch-wide answer the
+		// translation has to hold before the first unit is read, and this is the one caller that
+		// stands before every read with the game directory in reach.
+		ShadowCompare.armIfAsked();
+		EngineDefines.machine(gather());
+		settle();
+	}
+
+	/**
+	 * Takes this world's registry as the one the last read was against, without rebuilding
+	 * anything. For a read that could not happen at all: an empty pack folder must not be looked
+	 * at again every second for the rest of the session.
+	 */
+	public static void settle() {
+		installed = stamp();
+		distant = DhDepth.present();
+		format = PbrAtlases.format();
+	}
+
+	/**
+	 * Whether the pack was last read against a world that is not this one, which is what decides
+	 * the one reload nobody can ask for.
+	 */
+	public static boolean stale() {
+		return stamp() != installed || distantHorizonsMoved() || textureFormatMoved();
+	}
+
+	/**
+	 * Whether the resource packs now declare a different material convention from the one the pack
+	 * was read against, which is what {@code MC_TEXTURE_FORMAT_LAB_PBR} and its version are posed
+	 * from. Iris asks the same question and answers it the same way, reloading the whole pipeline
+	 * on the difference ({@code pbr/format/TextureFormatLoader.java:28-32}).
+	 * <p>
+	 * It earns its keep at the first read of a NeoForge session as much as at a reload the player
+	 * asks for: client setup runs on a mod loading worker there, before the initial resource reload
+	 * exists, so no atlas has been stitched and the answer is nothing whatever the resource packs
+	 * hold. The stitch that follows is what makes it right.
+	 * <p>
+	 * The value is the one the last stitch read rather than the file, and the stitch keeps the
+	 * record it already holds where the declaration has not changed, so this costs a reference
+	 * comparison per frame and no lookup.
+	 */
+	public static boolean textureFormatMoved() {
+		return !Objects.equals(PbrAtlases.format(), format);
+	}
+
+	/**
+	 * Whether it is the far terrain that moved rather than the world, which is the other half of
+	 * what Iris does with {@code DISTANT_HORIZONS}: it reads DH's rendering switch every frame
+	 * and reloads on the flip, {@code compat/dh/DHCompatInternal.java:143} and {@code :148}.
+	 * Without this the symbol would be whatever it was when the pack was read, and a player who
+	 * switches that mod's rendering off would keep a pack lighting a far terrain that is no longer
+	 * drawn.
+	 * <p>
+	 * What {@link #settle()} records is the live answer and not the one {@link #gather} compiled
+	 * with, so a flip inside the half second a pack takes to read is not noticed until the next
+	 * flip. Recording what the read compiled with instead would mean recording nothing when the
+	 * read could not happen at all, and that is the case this pair exists to keep out of a reload
+	 * every frame.
+	 */
+	public static boolean distantHorizonsMoved() {
+		return DhDepth.present() != distant;
+	}
+
+	/**
+	 * Whether the far terrain was there when the pack in force was read, which is whether it was
+	 * handed {@code DISTANT_HORIZONS}, short of the flip inside the read that
+	 * {@link #distantHorizonsMoved} owns. The recorded answer rather than a live one, so it costs no
+	 * reflective read, and any other flip is a reload anyway.
+	 */
+	public static boolean distantHorizons() {
+		return distant;
+	}
+
+	private static long stamp() {
+		Minecraft minecraft = Minecraft.getInstance();
+		ClientLevel level = minecraft == null ? null : minecraft.level;
+
+		return level == null ? 0L : System.identityHashCode(level.registryAccess());
+	}
+
+	private static EngineDefines.Environment gather() {
+		Minecraft minecraft = Minecraft.getInstance();
+		GpuDevice device = RenderSystem.tryGetDevice();
+		String vendor = "";
+		String renderer = "";
+		if (device != null) {
+			// The device name is what OptiFine classifies as the renderer: the vendor string
+			// names who made the chip, the device name names which one it is.
+			vendor = device.getDeviceInfo().vendorName();
+			renderer = device.getDeviceInfo().name();
+		}
+
+		int mipmap = minecraft == null ? 4 : minecraft.options.mipmapLevels().get();
+
+		// Asked of the one class that knows whether the far terrain reaches the pack at all, and not
+		// of the loader's mod list. An installed Distant Horizons this engine cannot get a depth
+		// image or a projection out, or whose own rendering is switched off, leaves the far terrain
+		// flat, and a pack told otherwise would light a picture that has none.
+		// The material convention comes from the last stitch rather than from the file, which is the
+		// same answer the reduction and the sampler already run on: a pack told one thing and a
+		// specular map reduced under another would be two conventions in one picture.
+		return new EngineDefines.Environment(EngineDefines.DEFAULT_MC_VERSION, os(), vendor,
+				renderer, mipmap, DhDepth.present(), biomeIds(), categories(), PbrAtlases.format(),
+				BufferBlending.served());
+	}
+
+	private static Map<String, Integer> biomeIds() {
+		// Touches the game's class so that its registration has run by now: the table fills as
+		// Biomes initialises, nothing on a client's boot path promises that has happened before
+		// the first pack is read, and an empty table here would write no symbol and notice
+		// nothing later. Initialising it is free of everything but interning some keys.
+		Objects.requireNonNull(Biomes.THE_VOID);
+
+		Map<String, Integer> ids = new LinkedHashMap<>();
+		List<String> names = BiomeClassifier.names();
+		for (int id = 0; id < names.size(); id++) {
+			ids.put(names.get(id), id);
+		}
+
+		return ids;
+	}
+
+	/** The category names in ordinal order, which is what makes CAT_DESERT the number carried. */
+	private static List<String> categories() {
+		return Arrays.stream(BiomeCategory.values())
+				.map(category -> category.name().toUpperCase(Locale.ROOT))
+				.toList();
+	}
+
+	private static EngineDefines.Os os() {
+		return switch (Util.getPlatform()) {
+			case WINDOWS -> EngineDefines.Os.WINDOWS;
+			case OSX -> EngineDefines.Os.MAC;
+			case LINUX -> EngineDefines.Os.LINUX;
+			// Solaris has no OptiFine symbol of its own, so it lands on the same one as unknown.
+			case SOLARIS, UNKNOWN -> EngineDefines.Os.OTHER;
+		};
+	}
+}

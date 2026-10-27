@@ -1,0 +1,6006 @@
+package dev.vulture.glsl;
+
+import dev.vulture.glsl.GlslLexer.Kind;
+import dev.vulture.glsl.GlslLexer.Token;
+import dev.vulture.glsl.TokenStream.Closing;
+import dev.vulture.pack.option.EngineDefines;
+import dev.vulture.pack.model.AlphaTest;
+import dev.vulture.pack.model.ProgramNames;
+import dev.vulture.pack.model.ProgramStage;
+import dev.vulture.pack.source.IncludeExpander.ExpandedUnit;
+import dev.vulture.pack.target.ConstDirectives;
+import dev.vulture.pack.target.DrawBuffers;
+import dev.vulture.pack.target.SamplerPlan;
+import dev.vulture.pack.target.SamplerTypes;
+import dev.vulture.pack.model.TargetName;
+import dev.vulture.pack.texture.CustomImages;
+import dev.vulture.pack.texture.CustomImageView;
+import dev.vulture.pack.texture.VolumeAtlas;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
+
+/**
+ * Turns one flattened pack unit into GLSL a Vulkan compiler will take.
+ * <p>
+ * The pack dialect is GLSL 120 with OptiFine's additions: fixed function state, {@code varying}
+ * and {@code attribute}, texture lookups renamed twenty years ago, and plain uniforms declared
+ * loose at file scope, which Vulkan does not allow at all. None of that needs the program to be
+ * understood, only read, so the work here is a rewrite over a token stream rather than a compiler.
+ * <p>
+ * The tokens themselves, and every way of reading them or changing them, belong to
+ * {@link TokenStream} rather than to this class, and the header written in front of what the
+ * passes leave belongs to {@link Emitter}. What is left here is the pipeline: one pass per rule,
+ * in the order {@link #rewrite} runs them. Two of those passes carry enough state out of the text
+ * to be classes of their own, {@link VaryingSplit} and {@link VolumeFlattening}, and the pipeline
+ * calls them where it would have run them.
+ * <p>
+ * Two things are deliberately left undone, and both were done by the measuring prototype.
+ * No {@code layout(binding = )} is emitted, and no {@code layout(location = )} except on fragment
+ * outputs. The game's own compiler assigns both from SPIR-V reflection and rewrites them
+ * afterwards, so a number chosen here is at best ignored and at worst collides with a number
+ * chosen for another unit of the same pack. When the prototype was made to number them across a
+ * whole pack rather than per file, colliding locations became its largest class of failure by
+ * far. Fragment outputs keep theirs, because their order is what maps a write onto a colour
+ * attachment and nothing else records that.
+ * <p>
+ * Conditionals are left standing. The unit that arrives here still carries every {@code #if} of
+ * every file that was spliced into it, and the compiler will evaluate them again, so the engine's
+ * own symbols are written into the header rather than assumed: if the compiler read them
+ * differently from the expander, it would take a different branch and fail somewhere unrelated.
+ * <p>
+ * Depth is the other rule that is not the language's. The game rasterises with a reversed Z over
+ * zero to one and a pack is written for the OpenGL volume, minus one to one with the near plane at
+ * minus one; Iris ends by putting the old volume back with {@code glClipControl}, which Vulkan has
+ * no equivalent of. So the conversion is emitted into the shader, in both directions, out of the
+ * one uniform {@code of_DepthConv}: {@code .xy} says how to write a clip depth, {@code .zw} how to
+ * read a window depth back. What it costs to leave undone was measured rather than argued: Body
+ * Camera's motion blur asks for a depth past 0.6 and, reading a reversed depth, would only blur
+ * what stands within eight centimetres of the camera, so it blurred nothing at all.
+ * <p>
+ * The fragment outputs carry one rule that is not GLSL's and cannot be read off the language.
+ * 26.2 does not keep the location a stage declares: {@code IntermediaryShaderModule.createFromSpirv}
+ * asks SPIR-V reflection for the outputs and writes the rank of each one over its own location
+ * decoration. The order reflection answers in is the order the compiler first met the names in, so
+ * a stage that writes output one before output zero has the two swapped, and nothing says a word
+ * about it. Everything below about outputs exists for that: they are all declared here, from zero
+ * up with no gaps, and named once each in ascending order by a function ahead of anything the pack
+ * wrote and called first thing in {@code main}. The rank is then the location and the rewrite is
+ * the identity.
+ * <p>
+ * The same rank-is-location rewrite is why a {@code varying mat3} cannot be left as one variable.
+ * A GLSL matrix occupies one location per column, three for a {@code mat3}, but it is still one
+ * reflected name, so the next varying is numbered onto column two. OpenGL links by name and
+ * never asks the question; the workaround here is to split each matrix varying into that many
+ * vectors before compilation and rebuild the matrix as a local. A struct varying is the same
+ * case with a member per location and an array varying with an element per location, and
+ * {@link VaryingSplit} answers all three. Iris is not copied.
+ */
+public final class GlslTranslator {
+
+	/** The one varying the engine names itself, so the one both stages have to agree about. */
+	static final String FOG_COORD = "of_FogFragCoord";
+
+	/**
+	 * The fixed function front colour, kept as a name to write into and read by nothing.
+	 * <p>
+	 * A vertex stage of GLSL 1.20 wrote its colour there and the fragment stage read it back as
+	 * {@code gl_Color}. Neither survived the core profile, and a pack that still writes the one
+	 * without reading the other only needs somewhere for the value to land: RedHat's three shadow
+	 * vertex stages are the whole of it on this corpus, and the pass was lost outright for a name
+	 * the body never reads again. Iris answers it the same way and says as much,
+	 * {@code pipeline/transform/transformer/CommonTransformer.java:172-180} declaring
+	 * {@code vec4 iris_FrontColor;} and renaming onto it, its own comment calling that the bare
+	 * minimum and resting on the packs not reading it back.
+	 * <p>
+	 * A plain global and not an {@code out}, which is what makes it cost nothing: an output would
+	 * take a location the fragment stage never declares, and the two sides would part company over
+	 * a value neither of them uses. VERTEX only, for the same reason Iris stops there, a fragment
+	 * stage naming it having nowhere to have read it from.
+	 */
+	static final String FRONT_COLOUR = "of_FrontColor";
+
+	/**
+	 * The hit flash and the damage tint, which is a varying wherever the mesh carries the overlay and
+	 * a uniform everywhere else.
+	 * <p>
+	 * The name is the pack's and not ours, unlike {@link #FOG_COORD}, which is the whole reason it is
+	 * handled here rather than left in the block: a pack declares {@code uniform vec4 entityColor}
+	 * and Iris deletes that declaration outright on this mesh, makes the value in the vertex stage
+	 * and hands it on ({@code pipeline/transform/transformer/EntityPatcher.java:39-56}). Answering it
+	 * from the block instead is one number for every mob on screen, which is a mob that never flashes.
+	 */
+	static final String ENTITY_COLOR = "entityColor";
+
+	/**
+	 * The three identifiers, which are varyings wherever the mesh carries them and uniforms
+	 * everywhere else, exactly as {@link #ENTITY_COLOR} is.
+	 * <p>
+	 * <strong>The order is the order of the lanes of the element</strong> and not a list of its own:
+	 * these are {@link LegacyGlsl#ENTITY_UNIFORMS}'s keys, which that table writes in that order for
+	 * this reason. A second list here would be the same three names with nothing tying it to the
+	 * mesh.
+	 * <p>
+	 * <strong>The same door as the colour, and it is one gate narrower.</strong> Iris asks its inputs
+	 * for the overlay once and calls both patchers on the answer, but the colour carries a second
+	 * condition the identifiers have not got: {@code if (!parameters.inputs.isText())}
+	 * ({@code pipeline/transform/transformer/VanillaCoreTransformer.java:21-25}). Its other path is
+	 * plainer about the same split, calling the identifiers on the overlay OR on text alone
+	 * ({@code VanillaTransformer.java:20-24}). The two agree here today for one reason: no text
+	 * family is served, so {@code VertexInputs.overlay} answers for both, and the day one is served
+	 * this door has to grow that second gate for the colour and open for the identifiers on text.
+	 * <p>
+	 * <strong>Where Iris rewrites, this renames.</strong> Iris deletes the three declarations and
+	 * puts {@code iris_entityInfo.x} and its two neighbours in the place of every read
+	 * ({@code EntityPatcher.java:124-152}); here each name stays the name it was and becomes a
+	 * varying of its own, which is the same value under the same spelling and one location apiece
+	 * instead of one for the three. What it costs is a pack that declared one of them under another
+	 * type than {@code int}: Iris would keep that declaration and lose the pass to a redefinition,
+	 * and this loses the type. No pack of the corpus writes one.
+	 */
+	static final List<String> ENTITY_IDS = List.copyOf(LegacyGlsl.ENTITY_UNIFORMS.keySet());
+
+	/**
+	 * The game's own overlay image, sixteen by sixteen, under a name no pack writes.
+	 * <p>
+	 * What the two coordinates mean is the game's: {@code OverlayTexture.pack} puts the white
+	 * progress in u and the red flash in v, and the element the mesh carries is that pair.
+	 */
+	static final String OVERLAY = LegacyGlsl.OVERLAY_SAMPLER;
+
+	/**
+	 * How many outputs a fragment stage may declare. Not OptiFine's sixteen colour targets, which
+	 * is the other question: a pipeline in 26.2 carries eight colour target states and no more,
+	 * {@code ColorTargetState.MAX_COLOR_TARGETS}, and its builder holds them in an array of that
+	 * length, so a ninth output has nowhere to land.
+	 */
+	private static final int MAX_FRAGMENT_OUTPUTS = 8;
+
+	/** Names the ascending prologue, which nothing else in a pack is going to be called. */
+	static final String ORDER_OUTPUTS = "ofOrderOutputs";
+
+	/** What the pack's own {@code main} is called once the epilogue has taken the name over. */
+	static final String PACK_MAIN = "ofPackMain";
+
+	/** {@code (clipA, clipB, readA, readB)}: how to write a depth, then how to read one. */
+	static final String DEPTH_CONV = "of_DepthConv";
+
+	/** The comparison a {@code sampler2DShadow} would have had the hardware make. */
+	static final String SHADOW_COMPARE = "ofShadowCompare";
+
+	/**
+	 * The lookups the arithmetic road takes over, {@link #SHADOW_COMPARE} carrying an overload for
+	 * every shape each of them can be written in, the bias forms included.
+	 * <p>
+	 * A projective or a gathered comparison is not among them and is counted instead: what those
+	 * need is a different expression and not a different name, a projective one dividing before it
+	 * compares and a gather answering four results rather than one.
+	 */
+	private static final Set<String> COMPARABLE_LOOKUPS = Set.of("texture", "textureLod",
+			"textureOffset", "textureLodOffset");
+
+	/**
+	 * Whether every comparison goes back to the arithmetic of {@link #SHADOW_COMPARE} instead of
+	 * staying on the sampler. The hardware road cannot be watched from inside: a comparison bound
+	 * wrong does not fail, it hands back a fraction of the wrong thing, and the picture stays
+	 * credible. So the trade is on a switch, the way the pass barrier is: an image that comes right
+	 * with this on has named the comparison sampler rather than the pass that shows it, in one
+	 * launch and without a build.
+	 * <p>
+	 * The property is read here so that the harness answers it too; the file in the game directory
+	 * is the render side's to see, which is what {@link #askSoftCompare} is for.
+	 */
+	private static final boolean SOFT_COMPARE = Boolean.getBoolean("vulture.softShadowCompare");
+
+	private static volatile boolean softCompareArmed;
+
+	/**
+	 * Whether the loaded pack asked for a mip chain on each depth image of its shadow map,
+	 * {@code shadowtex0} at nought and {@code shadowtex1} at one.
+	 * <p>
+	 * It decides one thing here and one only: whether a lookup that WROTE its own level on the map
+	 * keeps what it wrote, or has it overwritten with the base along with the undirected reads. A
+	 * directive of the pack and not of a program, folded over every fragment stage of the
+	 * dimension, which is why it arrives on a switch instead of off the unit in hand:
+	 * {@code colortexNMipmapEnabled} is a program's own word and is read from the text, where
+	 * {@code generateShadowMipmap} belongs to the pack and the unit that declares it need not be
+	 * the unit that reads at a level. iterationT is exactly that shape, declaring it in
+	 * {@code composite.fsh} and reading at a level inside an include.
+	 * <p>
+	 * Armed at every pack read, before a unit is translated, and false where nobody armed it, which
+	 * is every harness run: a tool measuring the text alone then sees the pinned form, which is the
+	 * translation of a pack that asked for no chain.
+	 * <p>
+	 * <strong>A pack read while another pack's families are still being warmed can hand them this
+	 * answer</strong>, the switch being one pair for the process. What bounds it is the second gate:
+	 * a lookup only reaches a level past nought if {@code ShadowTargets.depthMipmapped} also says
+	 * so, and that asks the map really bound, so the worst case is a written level clamped back to
+	 * the base by the sampler. The disk cache is not exposed to it at all, this pair being part of
+	 * {@link #emissionSwitches} and therefore of the key.
+	 */
+	private static volatile boolean shadowChainZero;
+	private static volatile boolean shadowChainOne;
+
+	/**
+	 * What a call to {@code sin} or {@code cos} becomes: a sine of this translation's own, and
+	 * never the driver's.
+	 * <p>
+	 * Packs feed these two whole world coordinates. A single fp32 two-pi sheds the low bits of a
+	 * large argument, and the uniformity test rejects the field that reduction leaves at 427 where
+	 * white noise scores 15. The form emitted here, a Cody-Waite reduction through two constants,
+	 * a fold to the quarter turn, and an odd polynomial, scores 11 to 14 alongside an exact-sine
+	 * reference. No driver sine is left anywhere in the call.
+	 * <p>
+	 * The goldberg hash {@code fract(sin(dot(p, K)) * 43758.5453)} is not sent through this helper.
+	 * See {@link #HASH}.
+	 * <p>
+	 * The substitution can be taken off for a measurement, which leaves the driver's own two in
+	 * place and emits neither of these. See {@code reduceTrig} below, which is on wherever nobody
+	 * has said otherwise.
+	 */
+	static final String REDUCED_SIN = "ofReducedSin";
+
+	/** See {@link #REDUCED_SIN}. */
+	static final String REDUCED_COS = "ofReducedCos";
+
+	/**
+	 * Whether a pack's {@code sin} and {@code cos} are sent through {@link #REDUCED_SIN} at all.
+	 * On, which is what a player gets and what every reading taken so far was taken under.
+	 * <p>
+	 * <strong>It is an instrument, and not a preference anybody is meant to keep.</strong> The
+	 * substitution above is unconditional: it does not look at the argument, so a call on a small
+	 * one pays the reduction and the polynomial for a value the driver's own sine would have got
+	 * right, and one pack of the corpus writes a hundred and thirty six of them in its text,
+	 * multiplied by every stage whose includes pull them in. What that costs a
+	 * frame has never been measured, and it cannot be measured across two jars: a rate read on one
+	 * build and set beside a rate read on another carries every difference between the two runs and
+	 * not this one. Both states in one jar, a pack load apart, is what makes the number mean
+	 * something.
+	 * <p>
+	 * What turning it off gives up is the whole reason the helper exists. Packs feed these two
+	 * whole world coordinates, and a single fp32 two-pi sheds the low bits of a large argument long
+	 * before anybody watching can say where the shimmer came from. {@code DriverTrig} carries how
+	 * it is armed, and the line it writes to the log in both directions at every pack load.
+	 */
+	private static volatile boolean reduceTrig = true;
+
+	/**
+	 * The call sites matched since the switch was last set, added up over every unit translated.
+	 * <p>
+	 * Matched and not substituted, which is the point of it: a reading taken with the driver's own
+	 * sine in place still has to be able to say the pack had something for the substitution to bite
+	 * on, and a count that only rose in one of the two states would say nothing at all there.
+	 * <p>
+	 * One window makes it a tally and not an exact figure: a family of the chain that has just
+	 * been released finishes translating on its worker (the prefetch only tests for release
+	 * between families), and its sites land here after the reset. Nothing of that reaches a live
+	 * program, the released chain is never active again; it moves this count and no more.
+	 */
+	private static final AtomicInteger TRIG_SITES = new AtomicInteger();
+
+	/**
+	 * Set at the head of a pack load, before a program of it is translated, and it empties the
+	 * count with it: a tally belongs to the load whose state it was taken under.
+	 */
+	public static void reduceTrig(boolean on) {
+		reduceTrig = on;
+		TRIG_SITES.set(0);
+	}
+
+	/** How many {@code sin} and {@code cos} call sites have been matched since that call. */
+	public static int trigSites() {
+		return TRIG_SITES.get();
+	}
+
+	/**
+	 * What the goldberg hash idiom becomes.
+	 * <p>
+	 * Iris leaves {@code fract(sin(dot(p, K)) * 43758.5453)} as written; the GL driver computes it.
+	 * This backend compiles through shaderc to SPIR-V. Feeding that idiom to {@link #REDUCED_SIN}
+	 * still jumps in game on BSL: a time-only waving pack that keeps the hash skips, and the same
+	 * pack with {@code sin} in place of the hash does not. Complementary never writes the idiom and
+	 * was already smooth. Nested {@code fma} on the reduction does not change that. So the call is
+	 * replaced by a hash of the argument's bits, which is stable from frame to frame and
+	 * uncorrelated from one lattice point to the next.
+	 * <p>
+	 * What it costs the image is a different noise field, not Iris's gusts. The interpolation
+	 * around the lattice, and the amplitude the pack asked for, stay the pack's.
+	 */
+	static final String HASH = "ofHash";
+
+	/** The depth at the centre of the screen, which is accumulated in a texel rather than in a value. */
+	private static final String CENTER_DEPTH = "centerDepthSmooth";
+
+	/** The type a pack declares {@link #CENTER_DEPTH} under, and the only one this moves. */
+	private static final String CENTER_DEPTH_TYPE = "float";
+
+	/** What the engine declares in place of a value it keeps in a texture. */
+	private static final String SAMPLER_2D = "sampler2D";
+
+	/**
+	 * The model view a pass drawn from a game prepared draw reads, written once and spelled into
+	 * three rewrites so that they cannot drift: the bob this engine publishes in the model view,
+	 * times the matrix the game prepared that draw with. {@link #rewriteGameModelView} carries the
+	 * whole argument.
+	 */
+	private static final String DRAW_MODEL_VIEW =
+			"(" + LegacyGlsl.CAMERA_BOB + " * " + LegacyGlsl.GAME_MODEL_VIEW + ")";
+
+	/** The two calls a volume lookup may be written as, the second carrying a level or a bias. */
+	static final String LOOKUP = "texture";
+
+	static final String LEVELLED_LOOKUP = "textureLod";
+
+	/** What the word sampler is followed by when the declaration asks for a comparison. */
+	private static final String SHADOW_SHAPE = "Shadow";
+
+	/**
+	 * The comparison shapes GLSL gives a lookup that names its level, and so the only ones a
+	 * compared read can be pinned on at all. Asked of glslangValidator and of shaderc, which answer
+	 * the same: {@code textureLod} and {@code textureLodOffset} take these three and refuse
+	 * {@code sampler2DArrayShadow}, {@code samplerCubeShadow} and {@code samplerCubeArrayShadow},
+	 * for which the language offers no explicit-level form to write.
+	 * <p>
+	 * Only the two-dimensional one can carry the shadow map. The names a declaration must introduce
+	 * for the binding to put a comparison sampler under it are the map's own, which are 2D, and
+	 * {@code SamplerTypes} refuses a one-dimensional sampler its pipeline whatever it reads. A read
+	 * through one of the three shapes left out keeps an implicit level, and no unit of the corpus
+	 * writes one.
+	 */
+	private static final Set<String> LEVELLED_SHADOW_SHAPES =
+			Set.of("1DShadow", "1DArrayShadow", "2DShadow");
+
+	/** The level {@link #pinLookupLevels} writes into a lookup, as GLSL text. */
+	private static final String BASE_LEVEL = "0.0";
+
+	/** The suffix of the const directive that asks a chain for a target, {@code TargetDirectives}'s. */
+	private static final String MIPMAP_SUFFIX = "MipmapEnabled";
+
+	/** How far into a sprite a chunk mesh's texture coordinate has to be pulled. */
+	private static final String TEX_SHRINK = "of_TexShrink";
+
+	/** The colour a sky pass is modulated by, which the sky prologue folds into of_Color. */
+	private static final String PASS_COLOUR = "of_PassColour";
+
+	/** Matches the expander's own ceiling: nothing it produces should ever reach this. */
+	private static final int MAX_SOURCE_CHARACTERS = 4_000_000;
+
+	/**
+	 * How far one macro may lead to another before the name is taken as non-constant, the same
+	 * figure {@code PreprocessorExpression} allows a chain of settings.
+	 */
+	private static final int MAX_MACRO_HOPS = 8;
+
+
+	private final ExpandedUnit unit;
+	private final ProgramStage stage;
+	private final Map<String, String> engineDefines;
+
+	/** A pass drawn over a quad rather than over a chunk mesh takes its attributes differently. */
+	private final VertexInputs inputs;
+
+	/**
+	 * The elements of the vertex format this pass actually binds, which is only ever different from
+	 * {@code inputs.elements()} for {@link VertexInputs#SKY} and {@link VertexInputs#GLYPH}: the sky
+	 * binds four formats between its passes and the text binds four between its pipelines, and a
+	 * stage has to declare the one it is drawn with, exactly, or the locations shift.
+	 */
+	private final List<String> bound;
+
+	/** The program the pass wants, which decides what the engine supplies it undeclared. */
+	private final String program;
+
+	/**
+	 * The volumes the pack ships and this engine serves flat, and what moving them onto an atlas
+	 * left behind. Nothing to do everywhere but the two packs of the corpus that ship one.
+	 */
+	private final VolumeFlattening volumes;
+
+	/** What the fragment stage discards at, which the fixed function pipeline used to hold. */
+	private final AlphaTest alphaTest;
+
+	/** Whether the fragment stage is asked for the coverage mask on top of what the pack writes. */
+	private final boolean coverage;
+	private final TokenStream tokens;
+
+	/** The varyings this stage had to hand over one location at a time. */
+	private final VaryingSplit splits;
+
+	/** Names the pack defines as macros. Their uses belong to the preprocessor, not to us. */
+	private final Set<String> packMacros = new HashSet<>();
+
+	/**
+	 * Tokens of a {@code #define} that name a parameter of it, by index. See
+	 * {@link #markMacroParameters} for what renaming one would cost.
+	 */
+	private final Set<Integer> macroParameterTokens = new HashSet<>();
+
+	/**
+	 * What the replacement text of each macro names, its own parameters left out. Read where a
+	 * name has to be judged as the compiler will see it, once the macro is gone.
+	 */
+	private final Map<String, Set<String>> macroBodies = new HashMap<>();
+
+	/**
+	 * The macros whose replacement text is exactly one name, by macro: a second spelling of that
+	 * name. Photon declares {@code uniform sampler3D depthtex0} and reads it as
+	 * {@code ATMOSPHERE_SCATTERING_LUT}, so a lookup written through the alias is a lookup of the
+	 * volume. A macro defined twice to two different names stands for neither here.
+	 */
+	private final Map<String, String> macroAliases = new HashMap<>();
+
+	/**
+	 * What {@link #constantName} answered for each macro, so that a macro named from many places
+	 * is judged once: eighty macros naming each other ten at a time would otherwise be walked a
+	 * hundred million times within the hop bound.
+	 */
+	private final Map<String, Boolean> macroConstant = new HashMap<>();
+
+	/** Names the unit declares under a built-in type, which is how a declaration is told apart. */
+	private final Set<String> declaredNames = new HashSet<>();
+
+	/** Built-ins added after GLSL 120 that this unit defines a function of its own for. */
+	private final Set<String> shadowedBuiltins = new HashSet<>();
+
+	private final Map<String, String> blockMembers = new LinkedHashMap<>();
+	private final Map<String, String> samplers = new LinkedHashMap<>();
+
+	/**
+	 * What a pack wrote in front of an opaque uniform's type, by the name it declared:
+	 * {@code writeonly}, {@code readonly}, {@code coherent} and their kind. Lifting the
+	 * declaration into the header rebuilds it from the type onwards, so anything in front of the
+	 * type is only still in the shader because it is kept here.
+	 */
+	private final Map<String, String> memoryQualifiers = new LinkedHashMap<>();
+
+	/**
+	 * The format a pack wrote in the {@code layout} of a storage image, by the name it declared.
+	 * Kept for the same reason as the memory qualifiers: the lifting rebuilds the declaration from
+	 * the type onwards, so a format nobody kept here is a format the shader no longer carries.
+	 */
+	private final Map<String, String> imageFormats = new LinkedHashMap<>();
+
+	/** Storage blocks this unit declares at file scope, each under the binding it was written at. */
+	private final List<TranslatedUnit.StorageBlock> storageBlocks = new ArrayList<>();
+
+	/**
+	 * The comparison samplers whose comparison is made in arithmetic, their declarations rewritten
+	 * ordinary. {@link #collectComparisonSamplers} says how a name lands here rather than below.
+	 */
+	private final List<Scoped> comparisonSamplers = new ArrayList<>();
+
+	/**
+	 * The comparison samplers that keep their spelling, so the lookup compiles to a depth-reference
+	 * sample and the binding owes each name a comparison sampler.
+	 */
+	private final List<Scoped> hardwareComparisonSamplers = new ArrayList<>();
+
+	/**
+	 * The FILE SCOPE declarations whose type this translation really rewrote, and nothing else.
+	 * <p>
+	 * It is the one set a reader can compare the pack's own text against: the type the translated
+	 * unit carries for these names is not the type the pack wrote. A parameter is kept out however
+	 * its type ends up, because a parameter is a name inside a function and the declaration it
+	 * shadows is untouched: Bliss declares {@code sampler2D tex} at file scope and takes
+	 * {@code in sampler2DShadow tex} in a helper of {@code lib/texFiltering.glsl}, and counting that
+	 * helper would say the pack's own {@code tex} had been retyped when nothing touched it.
+	 */
+	private final List<Scoped> retypedSamplers = new ArrayList<>();
+
+	/**
+	 * The samplers a function takes as a parameter, over the lines of that function. Nothing is
+	 * rewritten from them; they are what {@link #countDepthLookup} measures the blind spot with.
+	 */
+	private final List<Scoped> samplerParameters = new ArrayList<>();
+
+	/**
+	 * Those of {@link #samplerParameters} whose type has no level to pin, a rectangle, a buffer or
+	 * a multisample sampler, so that {@link #pinLookupLevels} leaves a lookup through one alone.
+	 */
+	private final Set<Scoped> unlevelledParameters = new LinkedHashSet<>();
+
+	/**
+	 * The same parameters again, each with the function that takes it and its place in that
+	 * function's list, which is what lets {@link #pinLookupLevels} read the call sites and learn
+	 * what a parameter can stand for.
+	 */
+	private final List<SamplerParameter> typedParameters = new ArrayList<>();
+
+	/** Outputs the pack declares itself, by the location it asked for, moved into the header. */
+	private final Map<Integer, Output> packOutputs = new TreeMap<>();
+
+	private final Set<String> injectedNames = new HashSet<>();
+	private final List<String> conflicts = new ArrayList<>();
+	private final List<Integer> drawBuffers = new ArrayList<>();
+
+	/** Vertex inputs the mesh has not got, taken out of the body with the type the pack gave them. */
+	private final Map<String, String> synthesized = new LinkedHashMap<>();
+
+	/**
+	 * Whether the unit's version line sends it down Iris's core path: a {@code core} profile, or
+	 * version 150 and up with no profile named ({@code TransformPatcher.java:151}).
+	 */
+	private boolean coreProfile;
+
+	/**
+	 * Varyings this stage takes in, declared at file scope on a branch that is taken. Empty for a
+	 * vertex stage, whose file scope {@code in} is an attribute and a different matter entirely.
+	 */
+	private final List<FileScope> declaredInputs = new ArrayList<>();
+
+	/** Varyings this stage hands the next one, which is what says whether an input is provided. */
+	private final Set<String> declaredOutputs = new LinkedHashSet<>();
+
+	/** The same, as the declarations they came from, so that one can be taken back out whole. */
+	private final List<FileScope> declaredOutputScopes = new ArrayList<>();
+
+	/** Inputs {@link #dropUnprovidedInputs} took out, which this stage no longer declares. */
+	private final Set<String> droppedInputs = new LinkedHashSet<>();
+
+	/**
+	 * Inputs nothing before this stage writes and that the body reads anyway, so that they could not
+	 * be taken back out: by the name, the interpolation qualifier and the type it was declared
+	 * under. What the stage before has to declare for the module to be built at all.
+	 */
+	private final Map<String, String> unprovidedInputs = new LinkedHashMap<>();
+
+	/** Declarations this stage owes the next one although its own body writes none of them. */
+	private final Map<String, String> owedOutputs = new LinkedHashMap<>();
+
+	private Set<String> declaredAfter = Set.of();
+	private Set<String> used = Set.of();
+
+	/** Whether the body's own main has been renamed, so that the header carries the one that runs. */
+	private boolean mainWrapped;
+
+	private int maxFragmentOutput = -1;
+
+	/**
+	 * Whether this fragment stage writes draw buffer nought the way the fixed function pipeline
+	 * did, which is {@code gl_FragColor} or {@code gl_FragData[0]} at a literal subscript.
+	 * <p>
+	 * Counted from every branch, taken or not, for the reason {@link #rewriteFragmentOutputs}
+	 * measured about the count beside it. It is what decides whether the pass's alpha test is
+	 * written in at all, and {@link #planAlphaEpilogue} says why.
+	 */
+	private boolean legacySlotZero;
+
+	private boolean ordered;
+	private int dynamicFragData;
+	private int shadowCalls;
+	private int unwrappedShadowCalls;
+
+	/** The lookups of those that were really rewritten onto {@link #SHADOW_COMPARE}, which is what
+	 * says whether the header owes the helper at all. */
+	private int softRewrites;
+
+	/** Calls to {@code sin} or {@code cos} sent through the reduced-argument helpers. */
+	private int trigCalls;
+
+	/**
+	 * Call sites to those two this unit matched, whether or not they were substituted. The same
+	 * number as {@link #trigCalls} wherever {@code reduceTrig} is on, which is everywhere a player
+	 * is, and the only one of the two that says anything at all when it is off.
+	 */
+	private int trigSites;
+
+	/** Goldberg hash idioms rewritten onto {@link #HASH} instead of through a sine. */
+	private int hashCalls;
+
+	/** The float packing builtins this unit's calls were sent to {@link PackBuiltins} from. */
+	private final Set<String> packBuiltinCalls = new HashSet<>();
+
+	/**
+	 * Reads of {@code gl_TextureMatrix[0]} sent to the game's own per draw block instead of to the
+	 * uniform block this engine writes.
+	 *
+	 * @see dev.vulture.glsl.PackProgram.Loaded#readsGameTransforms
+	 */
+	private int gameTextureMatrix;
+
+	/**
+	 * Reads of the model view sent to that same block, which is the glint alone and covers all three
+	 * spellings of it: the matrix, the combined one and {@code ftransform()}.
+	 *
+	 * @see LegacyGlsl#GAME_MODEL_VIEW
+	 */
+	private int gameModelView;
+
+	private int strippedExtensions;
+
+	/**
+	 * The extensions this unit named, in the order it named them, to be re-emitted by the header.
+	 * See {@link #dropVersionAndExtensions} for why they cannot stay where the pack wrote them.
+	 */
+	private final Set<String> extensions = new LinkedHashSet<>();
+	private boolean depthEpilogue;
+	private boolean terrainPrologue;
+
+	/** Whether the far terrain's own head is called before the pack's body, for the same reason. */
+	private boolean distantPrologue;
+	private boolean alphaEpilogue;
+
+	/**
+	 * Whether this vertex body was wrapped because it is drawn from the game's own entity mesh, which
+	 * is decided while the text is rewritten and before anything knows what of that mesh is wanted.
+	 * <p>
+	 * One flag for the two things that wrapper carries, the overlay colour and the three identifiers,
+	 * because the question it answers belongs to neither of them: it is whether this is that mesh.
+	 * <p>
+	 * Two flags and not one for the colour, and the reason is when each is knowable. Wrapping renames
+	 * the pack's {@code main} and cannot be undone afterwards, so it is settled here off the MESH
+	 * alone; whether the colour is really made is a property of the whole program, since a pack
+	 * commonly reads {@code entityColor} in its fragment stage and never in its vertex stage, and
+	 * that is only known once every stage has been asked. The wrapper standing with nothing in it
+	 * costs a call the compiler inlines; the two disagreeing would cost the pass. The identifiers
+	 * need no second flag of their own, owing no sampler: what the wrapper writes for them is read
+	 * off the union of the varyings, which the header already holds.
+	 */
+	private boolean entityWrapped;
+
+	/**
+	 * Whether the pack's main is run twice and its clip position widened, which is what a lines
+	 * mesh asks of its vertex stage. {@link LinesVertex} says why the mesh needs it.
+	 */
+	private boolean linesWrapped;
+
+	/** Whether this stage really makes the overlay colour, which only the whole program can say. */
+	private boolean makesOverlayColour;
+
+	/** Whether the mask was really given a rank of its own. {@link #planCoverage} says when it is not. */
+	private boolean covers;
+
+	/**
+	 * Whether the fragment stage names {@code gl_FragDepth} anywhere at all, live branch or not.
+	 * <p>
+	 * Anywhere at all, because what it decides is which value the mask is filled from, and a stage
+	 * that writes its own depth in one branch writes the attachment from that branch and from
+	 * {@code gl_FragCoord.z} in the others. The two have to be told apart by the text, since the
+	 * branch is the preprocessor's answer and not this pass's: Bliss writes it under {@code POM}
+	 * alone, and a mask filled from the interpolated depth there would say the geometry stands
+	 * where the surface was before the parallax moved it.
+	 */
+	private boolean namesFragDepth;
+
+	/** Where the fragment stage's own {@code main} stands, once the alpha test has claimed it. */
+	private int packMainName = -1;
+
+	/** Which function each token sits in, read while every brace is still the pack's own. */
+	private int[] regions = new int[0];
+
+	private int depthLookups;
+	private int parameterLookups;
+
+	/** Lookups {@link #pinLookupLevels} pinned to the base level of their image. */
+	private int pinnedLookups;
+
+	/**
+	 * Lookups through a sampler the enclosing function was handed that the same pass left as they
+	 * stood, some call of the function handing that parameter something the pass could not read as
+	 * a sampler bound at the base, or the parameter having no level to pin.
+	 */
+	private int unpinnedParameterLookups;
+	private int fragCoordZ;
+	private int fragCoordXyz;
+	private int fragCoordUnhandled;
+	private int fragDepthWrites;
+	private int fragDepthUnhandled;
+
+	private GlslTranslator(ExpandedUnit unit, ProgramStage stage, Map<String, String> engineDefines,
+			VertexInputs inputs, List<String> bound, AlphaTest alphaTest, boolean coverage,
+			String program, Map<String, VolumeAtlas> volumes) {
+		this.unit = unit;
+		this.stage = stage;
+		this.engineDefines = engineDefines;
+		this.inputs = inputs;
+		this.bound = List.copyOf(bound);
+		this.alphaTest = alphaTest;
+		this.coverage = coverage;
+		this.program = program;
+
+		// Tokens cost far more than the text they came from, roughly seventy bytes each, so a unit
+		// the expander should never have produced has to be refused before it is read rather than
+		// after. Running out of memory here throws an Error, and an Error goes straight past the
+		// catch that is supposed to turn a bad pack into a report.
+		String text = unit.text();
+		if (text.length() > MAX_SOURCE_CHARACTERS) {
+			throw new IllegalStateException(unit.entry() + " expands to " + text.length()
+					+ " characters, past the " + MAX_SOURCE_CHARACTERS + " a unit is allowed");
+		}
+
+		this.tokens = new TokenStream(GlslLexer.lex(text));
+		this.splits = new VaryingSplit(this.tokens, unit, stage, this::fileScopeDeclaration,
+				this.macroAliases);
+		this.volumes = new VolumeFlattening(this.tokens, unit, volumes, this.packMacros,
+				this.macroAliases);
+	}
+
+	/**
+	 * Rewrites one stage on its own, agreeing with nothing but itself. Fine for measuring, and
+	 * wrong for rendering: see {@link ProgramTranslator} for why the stages of one program have to
+	 * be given a header together.
+	 */
+	public static TranslatedUnit translate(ExpandedUnit unit, ProgramStage stage) {
+		return translate(unit, stage, "");
+	}
+
+	/**
+	 * Translates one expanded file into the unit a pipeline is built from.
+	 *
+	 * @param program the bare name of the program this file is the entry point of, or empty where
+	 *                the file is an include and serves no pass of its own
+	 */
+	public static TranslatedUnit translate(ExpandedUnit unit, ProgramStage stage, String program) {
+		Stage prepared = prepare(unit, stage, VertexInputs.WORLD, AlphaTest.OFF, program);
+
+		return prepared.render(prepared.uniforms(), prepared.samplers(), prepared.varyings());
+	}
+
+	/**
+	 * Rewrites one stage and stops short of the header, so that a caller can settle it.
+	 *
+	 * @param inputs    where this program's vertex stage takes its inputs from
+	 * @param alphaTest what the fragment stage discards at. {@link AlphaTest#OFF} for every pass
+	 *                  drawn over a quad, and for the solid half of the terrain
+	 * @param program   the bare name of the program the pass wants, which is what decides the
+	 *                  uniforms the engine supplies undeclared
+	 */
+	public static Stage prepare(ExpandedUnit unit, ProgramStage stage, VertexInputs inputs,
+			AlphaTest alphaTest, String program) {
+		return prepare(unit, stage, inputs, inputs.elements(), alphaTest, false, program);
+	}
+
+	/**
+	 * The same, for a family that binds more than one vertex format and therefore cannot take the
+	 * elements to declare from {@link VertexInputs} alone.
+	 *
+	 * @param bound    the elements of the format this pass binds, in the format's own order. Exactly
+	 *                 these are declared: a name declared that the format has not got is refused, and
+	 *                 an element left undeclared shifts every location after it in silence
+	 * @param coverage whether the fragment stage writes the coverage mask on top of what the pack
+	 *                 declared. A property of the pass and not of the file: one
+	 *                 {@code gbuffers_terrain} serves an opaque half that writes it and a translucent
+	 *                 half that does not
+	 */
+	public static Stage prepare(ExpandedUnit unit, ProgramStage stage, VertexInputs inputs,
+			List<String> bound, AlphaTest alphaTest, boolean coverage, String program) {
+		return prepare(unit, stage, inputs, bound, alphaTest, coverage, program, Map.of());
+	}
+
+	/**
+	 * The same again, told what the pack ships behind the names it samples as volumes.
+	 *
+	 * @param volumes the volumes the pack supplies with a file, by the name it samples them under,
+	 *                each with the layout the upload will use. A name missing from it is one nothing
+	 *                can be moved onto, and its declaration stays what the pack wrote, which is what
+	 *                keeps the program refused rather than drawn against nothing
+	 */
+	public static Stage prepare(ExpandedUnit unit, ProgramStage stage, VertexInputs inputs,
+			List<String> bound, AlphaTest alphaTest, boolean coverage, String program,
+			Map<String, VolumeAtlas> volumes) {
+		GlslTranslator translator = new GlslTranslator(unit, stage,
+				EngineDefines.table(EngineDefines.machine()), inputs, bound, alphaTest, coverage,
+				program, volumes);
+		translator.rewrite();
+
+		return new Stage(translator);
+	}
+
+	/**
+	 * Sends every unit translated from here on down the {@link #SHADOW_COMPARE} road, or lets it
+	 * back off it, which matters as much: the switch is read again at every pack load, so removing
+	 * the arming file and reloading has to put the comparison back on the sampler without a
+	 * restart. Called by whoever can see the game directory; the system property is this class's
+	 * own to read, so a harness run answers it without a game around.
+	 */
+	public static void askSoftCompare(boolean asked) {
+		softCompareArmed = asked;
+	}
+
+	/**
+	 * Says which depth images of this pack's shadow map carry a chain, which is what lets a lookup
+	 * on them keep the level the pack wrote. Called once per pack read, from where the directives
+	 * were just folded, and before a unit is translated.
+	 */
+	public static void askShadowChains(boolean shadowtex0, boolean shadowtex1) {
+		shadowChainZero = shadowtex0;
+		shadowChainOne = shadowtex1;
+	}
+
+	private static boolean softCompare() {
+		return SOFT_COMPARE || softCompareArmed;
+	}
+
+	/**
+	 * The state of every switch that changes what this translator EMITS, as one word.
+	 * <p>
+	 * It exists for {@link TranslationCache}, and it is the whole of what that cache cannot work
+	 * out from the arguments it is handed: a translation kept on disk is the same answer only while
+	 * these are the same, and a switch missing from this line would serve a unit emitted under the
+	 * other state, which is a wrong picture with no error anywhere to point at it.
+	 * <p>
+	 * <strong>It lives here, beside the switches, because that is the only place it stays
+	 * true.</strong> A switch added to this class is a line away from this method; a list of them
+	 * kept over in the cache is a file away, and the day somebody adds the next one that file is
+	 * the one they will not open.
+	 */
+	public static String emissionSwitches() {
+		return (reduceTrig ? "trig-reduced" : "trig-driver")
+				+ (softCompare() ? " compare-in-shader" : " compare-on-sampler")
+				+ " shadow-chain-" + (shadowChainZero ? '1' : '0') + (shadowChainOne ? '1' : '0')
+				+ " custom-views-v1:" + CustomImages.key();
+	}
+
+	private void rewrite() {
+		collectMacroNames();
+		collectDeclarations();
+		// Before anything reads a lookup, because that is what it changes. The uniforms are lifted
+		// much later, after the depth conversion, and a set filled there would be empty at the one
+		// moment it decides something.
+		collectComparisonSamplers();
+		// After it, and for the same reason: the road has been settled by then, so a compared
+		// parameter is collected here like any other sampler, under whichever spelling it kept.
+		collectSamplerParameters();
+		collectStorageBlocks();
+		collectDrawBuffers();
+		synthesizeAttributes();
+		dropVersionAndExtensions();
+		settleRedefinedMacros();
+		dropRedeclaredVertexBlock();
+		flattenInterfaceBlocks();
+		hideAbsentExtensionMacros();
+		rewriteIdentifiers();
+		// After the identifiers, because the goldberg idiom's sine has become ofReducedSin by then
+		// and that is one of the two names the site is recognised under, the other being the plain
+		// sin that reduceTrig off leaves standing. Taking it earlier would leave the sine standing
+		// and the helper below would wrap a call this pass was about to erase.
+		rewriteGoldbergHash();
+		// After the identifiers and before the depth, and both halves of that matter: the legacy
+		// spellings have to have become texture() before a lookup can be recognised, and what comes
+		// out of here is a call under a name of ours that the depth pass will not look at twice.
+		this.volumes.flatten();
+		convertDepth();
+		dropPrecision();
+		// After precision, so a leftover highp does not sit between const and the type this pass
+		// matches on, and before outputs are rewritten, which do not use const.
+		demoteNonConstantInitialisers();
+		rewriteFragmentOutputs();
+		liftFragmentOutputs();
+		// Before the lifting and after the depth, and both halves matter: the declarator it takes out
+		// has to be gone before the lifting reads the statement, or the name would be carried into the
+		// block after all, and the lookup it writes is text of ours that the depth conversion must not
+		// have had a chance to wrap.
+		moveCenterDepth();
+		liftUniforms();
+		nameCustomImageViews();
+		// After the lifting, which is where the samplers of the file are recorded by name and type,
+		// and after the depth, so that a comparison that road rewrote is under a name of ours by
+		// now and the lookups left standing are the ones that really sample an image.
+		pinLookupLevels();
+		// Decided before the outputs are ordered and applied after: whether the fragment body is
+		// wrapped is what decides where the ascending call goes, and both are settled from the one
+		// answer rather than each asking again.
+		planAlphaEpilogue();
+		planCoverage();
+		// Before the ascending call goes in, and that is the whole point: the call replaces the
+		// opening brace of main with text of ours, which is no longer an operator, so a brace
+		// counter run afterwards would walk past main without opening it and close one brace too
+		// many at its end. Every function written after main would then read as file scope, where
+		// nothing shadows anything. The token indices are stable from here on, so an array taken
+		// now still describes the tokens dropUnprovidedInputs is handed later.
+		this.regions = regions();
+		orderFragmentOutputs();
+		wrapMain();
+		// After wrapMain, because the wrapper is where the columns are copied and reconstructed, and
+		// before collectVaryings, because a matrix left as one out is one SPIR-V variable occupying
+		// three locations and createFromSpirv then numbers the next name onto the second column.
+		this.splits.split();
+		wrapMainForSplits();
+		// Last, and it has to be: rewriteIdentifiers is where varying becomes in or out, and
+		// dropUnprovidedInputs blanks the ranges recorded here, so nothing may move between the two.
+		collectVaryings();
+
+		this.used = usedNames();
+		this.declaredAfter = declaredUnderAType();
+		// Once per unit and only here, after the goldberg rewrite has taken its own sites back off.
+		// The families translate on a worker while the chain is already read, so a counter each of
+		// them walked up and down itself would be read mid-flight; one addition at the end of a
+		// unit is the whole of what crosses a thread.
+		TRIG_SITES.addAndGet(this.trigSites);
+	}
+
+	/**
+	 * One stage rewritten, waiting for a header. What it asks for is separate from what it is
+	 * given: a stage that asks for six uniforms may be handed twelve, because a sibling stage of
+	 * the same program needs the other six and the block has to be the same on both sides.
+	 */
+	public static final class Stage {
+
+		private final GlslTranslator translator;
+
+		private Stage(GlslTranslator translator) {
+			this.translator = translator;
+		}
+
+		public ProgramStage stage() {
+			return this.translator.stage;
+		}
+
+		/** The block members this stage reads, fixed function state first. */
+		public List<TranslatedUnit.Uniform> uniforms() {
+			return this.translator.ownBlock();
+		}
+
+		public List<TranslatedUnit.Uniform> samplers() {
+			return asUniforms(this.translator.samplers);
+		}
+
+		/**
+		 * Sampler names this stage reads, not merely declares. A pack include can name twenty
+		 * textures of which the body samples one; those unused names still occupy a Metal slot if
+		 * they are declared first, and only sixteen exist.
+		 */
+		public Set<String> sampled() {
+			return this.translator.sampledNames();
+		}
+
+		/** The memory qualifiers a sibling stage also needs for shared opaque declarations. */
+		public Map<String, String> memoryQualifiers() {
+			return Collections.unmodifiableMap(new LinkedHashMap<>(this.translator.memoryQualifiers));
+		}
+
+		/** The format qualifiers a sibling stage also needs for shared image declarations. */
+		public Map<String, String> imageFormats() {
+			return Collections.unmodifiableMap(new LinkedHashMap<>(this.translator.imageFormats));
+		}
+
+		/**
+		 * Vertex inputs this stage declared that the mesh it is drawn from has not got, with the type
+		 * the pack gave them. Empty for anything not drawn from a mesh of the engine's own, and the
+		 * list of what the picture will be wrong about when it is not.
+		 */
+		public Map<String, String> synthesized() {
+			return Collections.unmodifiableMap(new LinkedHashMap<>(this.translator.synthesized));
+		}
+
+		/**
+		 * Which elements of the mesh this stage really reads, out of the ones its family may leave
+		 * off. Empty for every family that carries one format for all packs, which is all of them
+		 * but the chunk mesh.
+		 * <p>
+		 * Asked between {@link #prepare} and {@link #render}, and that is the whole reason it is a
+		 * method of this class: the answer is what the format is built from, and the format is what
+		 * the header then declares. Nothing here reads {@code bound}, so the value handed to
+		 * {@code prepare} for a stage that will only ever be asked this is not yet settled.
+		 */
+		public Set<String> reads() {
+			if (this.translator.inputs == VertexInputs.DISTANT) {
+				return DistantVertex.reads(this.translator.used, this.translator.synthesized);
+			}
+
+			return this.translator.inputs.terrain()
+					? SodiumVertex.reads(this.translator.used, this.translator.synthesized,
+							this.translator.inputs.separateAo())
+					: Set.of();
+		}
+
+		/** Varyings the engine names, which both sides of a program have to declare or neither. */
+		public Set<String> varyings() {
+			Set<String> named = new LinkedHashSet<>();
+			if (this.translator.used.contains(FOG_COORD)) {
+				named.add(FOG_COORD);
+			}
+
+			// Asked of the mesh and of the body together. A pack that declares the name and never
+			// reads it is left alone, where Iris hands the varying over regardless: the two draw the
+			// same picture, and declaring nothing is the one that cannot shift a location.
+			if (this.translator.inputs.overlay()) {
+				if (this.translator.used.contains(ENTITY_COLOR)) {
+					named.add(ENTITY_COLOR);
+				}
+
+				for (String identifier : ENTITY_IDS) {
+					if (this.translator.used.contains(identifier)) {
+						named.add(identifier);
+					}
+				}
+			}
+
+			return Set.copyOf(named);
+		}
+
+		/**
+		 * Tells this stage whether the program it belongs to wants the overlay colour, which is what
+		 * makes its vertex stage declare the texture it is fetched from.
+		 * <p>
+		 * Handed the union of {@link #varyings} over every stage, and it has to be: a pack commonly
+		 * reads {@code entityColor} in its fragment stage alone, and it is the VERTEX stage that owes
+		 * the value. To be called once every stage has been asked for its varyings and before any is
+		 * asked for its samplers, the answer being one of them.
+		 * <p>
+		 * Only a stage whose body was really wrapped can answer, which is what keeps the declaration
+		 * and the value together: the two sides declare the varying off the union, and a vertex stage
+		 * with no {@code main} to wrap would leave the fragment reading one nothing ever wrote.
+		 * <p>
+		 * Between the vertex stage and the fragment stage and no further. Iris carries the colour
+		 * through a tessellation or geometry stage as well
+		 * ({@code pipeline/transform/transformer/EntityPatcher.java:63-106}); no entity program of
+		 * the corpus ships either, iterationT's two geometry stages being its terrain and its sky,
+		 * and {@link #FOG_COORD} stops at the same place for the same reason. One that did would be
+		 * refused by the game's own pairing, the fragment stage declaring a colour the stage before
+		 * it never wrote, rather than drawn without it.
+		 */
+		public void makesOverlayColour(Set<String> varyings) {
+			if (this.translator.entityWrapped && varyings.contains(ENTITY_COLOR)) {
+				this.translator.makesOverlayColour = true;
+				this.translator.samplers.put(OVERLAY, SAMPLER_2D + " " + OVERLAY);
+			}
+		}
+
+		/** Names this stage declares itself, and that a shared block must therefore not shadow. */
+		public Set<String> declared() {
+			return this.translator.declaredAfter;
+		}
+
+		/** Names this stage lifted into the block, where the block member is the real meaning. */
+		public Set<String> lifted() {
+			return this.translator.blockMembers.keySet();
+		}
+
+		/** The varyings this stage hands on, which is what says whether the next one is provided. */
+		public Set<String> provides() {
+			Set<String> names = new LinkedHashSet<>(this.translator.declaredOutputs);
+			// The columns of a split are handed on as surely as a plain out, and a walk of the text
+			// finds none of them: the declaration left the body when it was split and the header
+			// writes the columns. VaryingSplit.interfaceNames says what that hid.
+			names.addAll(this.translator.splits.interfaceNames(false));
+
+			return Set.copyOf(names);
+		}
+
+		/**
+		 * The varyings this stage still takes in, which is what says whether the stage before it is
+		 * handing on one nobody declares.
+		 * <p>
+		 * What {@link #dropUnprovidedInputs} took out is left out here, and has to be: it is no
+		 * longer in the text, so the game will not count it either.
+		 */
+		public Set<String> requires() {
+			Set<String> names = new LinkedHashSet<>();
+			this.translator.declaredInputs.forEach(declared -> names.addAll(declared.names()));
+			// The other half of what provides() adds, and for the same reason.
+			names.addAll(this.translator.splits.interfaceNames(true));
+			names.removeAll(this.translator.droppedInputs);
+
+			return Set.copyOf(names);
+		}
+
+		/**
+		 * Stops this stage handing on the varyings the next one does not declare.
+		 * See {@link GlslTranslator#withholdUndeclaredOutputs}.
+		 * <p>
+		 * After {@link #owe}, which adds to what this stage hands on, and before anything is
+		 * rendered: it changes both the text and the answer {@link #provides} gives.
+		 */
+		public void withhold(Set<String> declared) {
+			this.translator.withholdUndeclaredOutputs(declared);
+		}
+
+		/**
+		 * Takes back out the inputs this stage declares that no stage before it writes and that its
+		 * own body never reads. See {@link GlslTranslator#dropUnprovidedInputs}.
+		 * <p>
+		 * To be called before anything else on this stage is read. It changes what the body says, so
+		 * what {@link #uniforms}, {@link #varyings}, {@link #declared} and {@link #render} answer
+		 * afterwards is not what they would have answered before, and a caller that renders first
+		 * and drops second emits the text the drop was meant to repair.
+		 */
+		public void dropUnprovidedInputs(Set<String> provided) {
+			this.translator.dropUnprovidedInputs(provided);
+		}
+
+		/**
+		 * What {@link #dropUnprovidedInputs} could not take out, by name, each with the text that
+		 * declares it again. Empty until that has run.
+		 */
+		public Map<String, String> unprovided() {
+			return Collections.unmodifiableMap(new LinkedHashMap<>(this.translator.unprovidedInputs));
+		}
+
+		/**
+		 * Makes this stage declare these as outputs and assign each one its zero, so that the stage
+		 * after it is provided for.
+		 * <p>
+		 * A name this stage already hands on is skipped, which is the test Iris makes at
+		 * {@code CompatibilityTransformer.java:467} against the out declarations it gathered at
+		 * :425-440. Compared against those and not against every name the stage declares: a vertex
+		 * stage that happens to call a function parameter {@code ViewPos} would otherwise make this
+		 * give up, and the pass would be lost for a name that clashes with nothing.
+		 * <p>
+		 * A name opening with {@code gl_} is skipped as well, as it is on both of Iris's sides at
+		 * :435 and :462. Redeclaring a built-in as a varying of ours is a compile error, and the
+		 * game provides them itself.
+		 */
+		public void owe(Map<String, String> declarations) {
+			declarations.forEach((name, qualified) -> {
+				if (!name.startsWith("gl_") && !this.translator.declaredOutputs.contains(name)) {
+					this.translator.owedOutputs.put(name, qualified);
+					this.translator.declaredOutputs.add(name);
+				}
+			});
+
+			if (!this.translator.owedOutputs.isEmpty()) {
+				this.translator.wrapMainForOwedOutputs();
+			}
+		}
+
+		public TranslatedUnit render(List<TranslatedUnit.Uniform> block,
+				List<TranslatedUnit.Uniform> samplers, Set<String> varyings) {
+			return render(block, samplers, varyings, Set.of());
+		}
+
+		public TranslatedUnit render(List<TranslatedUnit.Uniform> block,
+				List<TranslatedUnit.Uniform> samplers, Set<String> varyings, Set<String> shadowed) {
+			return this.translator.render(block, samplers, varyings, shadowed,
+					this.translator.memoryQualifiers, this.translator.imageFormats);
+		}
+
+		public TranslatedUnit render(List<TranslatedUnit.Uniform> block,
+				List<TranslatedUnit.Uniform> samplers, Set<String> varyings, Set<String> shadowed,
+				Map<String, String> sharedMemory, Map<String, String> sharedFormats) {
+			return this.translator.render(block, samplers, varyings, shadowed, sharedMemory, sharedFormats);
+		}
+	}
+
+	private TranslatedUnit render(List<TranslatedUnit.Uniform> block,
+			List<TranslatedUnit.Uniform> samplers, Set<String> varyings, Set<String> shadowed,
+			Map<String, String> sharedMemory, Map<String, String> sharedFormats) {
+		Map<String, String> memory = new LinkedHashMap<>(sharedMemory);
+		memory.putAll(this.memoryQualifiers);
+		Map<String, String> formats = new LinkedHashMap<>(sharedFormats);
+		formats.putAll(this.imageFormats);
+		Emitter emitter = emitter(memory, formats);
+
+		return new TranslatedUnit(this.unit.entry(), this.stage,
+				emitter.header(block, samplers, varyings, shadowed) + body(shadowed) + "\n"
+						+ emitter.wrapper(varyings, shadowed), notes(),
+				List.copyOf(this.drawBuffers), List.copyOf(block), List.copyOf(samplers));
+	}
+
+	/**
+	 * The rewritten text, with any name the caller flagged moved out of the way.
+	 * <p>
+	 * A shared block carries members some of its stages never asked for, and one of those stages
+	 * may already use that name for a value of its own: Bliss works out {@code sunVec} in its
+	 * vertex shader and takes it as a uniform in its fragment shader. Renaming is safe precisely
+	 * where it is needed, because a stage that never declared the name as a uniform has only one
+	 * meaning for it, its own.
+	 */
+	private String body(Set<String> shadowed) {
+		undefineRedefinedMacros();
+		if (shadowed.isEmpty()) {
+			return this.tokens.join();
+		}
+
+		StringBuilder text = new StringBuilder();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			boolean rename = token.kind() == Kind.IDENTIFIER
+					&& shadowed.contains(token.text())
+					&& !token.macroName()
+					&& (token.directive() == null
+							|| !LegacyGlsl.OPAQUE_DIRECTIVES.contains(token.directive()));
+
+			text.append(rename ? "ofOwn_" + token.text() : token.text());
+		}
+
+		return text.toString();
+	}
+
+	private List<TranslatedUnit.Uniform> ownBlock() {
+		List<TranslatedUnit.Uniform> block = new ArrayList<>();
+
+		for (Map.Entry<String, String> member : LegacyGlsl.FIXED_FUNCTION_MEMBERS.entrySet()) {
+			if (this.used.contains(member.getKey())) {
+				block.add(TranslatedUnit.Uniform.of(member.getKey(), member.getValue()));
+			}
+		}
+
+		// A name the pack did declare is already on its way into the block through liftUniforms,
+		// under the type the pack chose, so only a name it never declares is supplied here. That
+		// holds for the entity trio below as well.
+		for (Map.Entry<String, String> member : LegacyGlsl.CORE_MATRICES.entrySet()) {
+			if (this.used.contains(member.getKey()) && !this.declaredNames.contains(member.getKey())) {
+				block.add(TranslatedUnit.Uniform.of(member.getKey(), member.getValue()));
+			}
+		}
+
+		// Not where the mesh carries them, which is the answer liftUniforms gives for a pack that
+		// declared one of the three itself, given here for a pack that never declares them. The two
+		// halves have to agree: a name offered here and taken out of the block there would be a
+		// declaration in the block that the varying of the same name then redeclares.
+		if (LegacyGlsl.drawsEntities(this.program) && !this.inputs.overlay()) {
+			for (Map.Entry<String, String> member : LegacyGlsl.ENTITY_UNIFORMS.entrySet()) {
+				if (this.used.contains(member.getKey())
+						&& !this.declaredNames.contains(member.getKey())) {
+					block.add(TranslatedUnit.Uniform.of(member.getKey(), member.getValue()));
+				}
+			}
+		}
+
+		// The strength a glint's vertex colour is made of. Asked of the inputs and not of the program
+		// name, unlike everything above: what it answers for belongs to the MESH, and the same
+		// gbuffers_textured serves a glint under this constant and a sky pass under another. Each
+		// stage adds what it names and the union hands both to both, the block being the program's
+		// rather than the stage's.
+		if (this.inputs == VertexInputs.GLINT && this.used.contains("of_Color")) {
+			block.add(TranslatedUnit.Uniform.of(LegacyGlsl.GLINT_ALPHA,
+					"float " + LegacyGlsl.GLINT_ALPHA));
+		}
+
+		// The bob every pass that builds its model view in the shader multiplies by, and asked of
+		// nothing but the name: it is a name no pack writes, so it is here only where this
+		// translation put it, which rewriteGameModelView does and only for the passes
+		// LegacyGlsl.readsDrawModelView answers for.
+		if (this.used.contains(LegacyGlsl.CAMERA_BOB)) {
+			block.add(TranslatedUnit.Uniform.of(LegacyGlsl.CAMERA_BOB,
+					"mat4 " + LegacyGlsl.CAMERA_BOB));
+		}
+
+		// The screen size the lines wrapper widens with, supplied under the pack's own two names
+		// wherever the pack did not declare them itself; declared ones come through liftUniforms.
+		// Declared anywhere: collectDeclarations does not know a scope, so a pack naming a local
+		// viewWidth would keep the member out and leave the wrapper reading a name nobody
+		// declared, the trap LegacyGlsl records for projectionMatrix. No pack of the corpus does.
+		if (this.linesWrapped) {
+			for (String name : List.of("viewWidth", "viewHeight")) {
+				if (!this.declaredNames.contains(name)) {
+					block.add(TranslatedUnit.Uniform.of(name, "float " + name));
+				}
+			}
+		}
+
+		block.addAll(asUniforms(this.blockMembers));
+
+		return block;
+	}
+
+	static List<TranslatedUnit.Uniform> asUniforms(Map<String, String> declarations) {
+		return declarations.entrySet().stream()
+				.map(entry -> TranslatedUnit.Uniform.of(entry.getKey(), entry.getValue()))
+				.toList();
+	}
+
+
+	/**
+	 * Marks the name each naming directive gives, so that later passes leave it spelled as the
+	 * preprocessor needs it.
+	 * <p>
+	 * The mark goes on the token and not into a set of positions, and that is the whole point of
+	 * {@link Token#macroName()}. This runs first, before anything inserts, and two passes do insert:
+	 * {@link #rewriteIdentifiers} closes the legacy shadow lookups it wrapped and {@link #convertDepth}
+	 * closes the depth writes it wrapped. Each insertion moves every index after it, so a position
+	 * taken here would name a different token by the time {@link #body(Set)} reads it, and rename a
+	 * macro name or leave a shadowed read on the block value with nothing logged either way.
+	 */
+	private void collectMacroNames() {
+		int[] lines = this.tokens.lineNumbers();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.HASH || !LegacyGlsl.NAMING_DIRECTIVES.contains(token.directive())) {
+				continue;
+			}
+
+			int name = this.tokens.macroNameAfter(index);
+			if (name < 0) {
+				continue;
+			}
+
+			this.tokens.naming(name);
+			if (token.directive().equals("define")) {
+				markMacroParameters(name);
+				String macro = this.tokens.get(name).text();
+				this.packMacros.add(macro);
+				this.macroBodies.computeIfAbsent(macro, _ -> new HashSet<>()).addAll(bodyNames(name));
+				// Only a live line says what the macro stands for where the lookups are: a define
+				// in a branch nobody took would otherwise hand a live name to a volume. A live
+				// define of anything else unsays an alias, and two aliases that disagree stand for
+				// neither, which the empty text records.
+				if (this.unit.isLive(lines[index])) {
+					this.macroAliases.merge(macro, aliasOf(name).orElse(""),
+							(first, second) -> first.equals(second) ? first : "");
+				}
+			}
+		}
+	}
+
+	/**
+	 * The one name a macro's replacement text consists of, or empty when the text is anything
+	 * else: several tokens, a parameter list, or nothing at all.
+	 */
+	private Optional<String> aliasOf(int name) {
+		String target = null;
+		for (int scan = name + 1; scan < this.tokens.size(); scan++) {
+			Token token = this.tokens.get(scan);
+			if (token.kind() == Kind.NEWLINE) {
+				break;
+			}
+
+			if (token.trivia()) {
+				continue;
+			}
+
+			if (token.kind() != Kind.IDENTIFIER || target != null) {
+				return Optional.empty();
+			}
+
+			target = token.text();
+		}
+
+		return Optional.ofNullable(target);
+	}
+
+	/**
+	 * The storage word a token stands for, {@code in} or {@code out}, or null where it is
+	 * neither.
+	 * <p>
+	 * A macro whose live replacement text is exactly one of the two is that word, since the
+	 * compiler never sees the macro. I Like Vanilla writes each varying once for both stages, as
+	 * {@code in_out mat3 tbn} with {@code in_out} defined to {@code in} under {@code FSH} and to
+	 * {@code out} otherwise. Read as the literal word alone, that matrix stays whole, its water
+	 * vertex stage numbers {@code fogAmount} onto a column of {@code tbn}, and Metal refuses two
+	 * outputs on one location outright.
+	 *
+	 * @param aliases the macros whose replacement text is one name, by macro, which is what the
+	 *                translator collects before any pass reads a storage word
+	 */
+	static String storageWord(Token token, Map<String, String> aliases) {
+		if (token.kind() != Kind.IDENTIFIER) {
+			return null;
+		}
+
+		String word = token.text().equals("in") || token.text().equals("out")
+				? token.text()
+				: aliases.getOrDefault(token.text(), "");
+
+		return word.equals("in") || word.equals("out") ? word : null;
+	}
+
+	/**
+	 * Every identifier the replacement text of a macro names. The parameters of a function-like
+	 * macro are left out: they stand for the arguments, and the arguments are judged where they are
+	 * written. The parenthesis is a parameter list only when it touches the name, which is the
+	 * preprocessor's own rule; after a space it is the first token of the body.
+	 */
+	private Set<String> bodyNames(int name) {
+		Set<String> parameters = new HashSet<>();
+		int scan = macroParameters(name, parameters);
+
+		Set<String> names = new HashSet<>();
+		for (; scan < this.tokens.size(); scan++) {
+			Token token = this.tokens.get(scan);
+			if (token.kind() == Kind.NEWLINE) {
+				break;
+			}
+
+			if (token.kind() == Kind.IDENTIFIER && !parameters.contains(token.text())) {
+				names.add(token.text());
+			}
+		}
+
+		return names;
+	}
+
+	/**
+	 * The names in a function-like macro's parameter list, and where its replacement text begins.
+	 * <p>
+	 * A parameter is a binding local to the macro: it stands for the argument written at the call
+	 * and shadows anything of the same name outside. That is why {@link #bodyNames} leaves them out
+	 * of what a macro reads, and it is why nothing may rename one either.
+	 *
+	 * @param parameters filled with the names, left alone for an object-like macro
+	 * @return the index the replacement text starts at
+	 */
+	private int macroParameters(int name, Set<String> parameters) {
+		int scan = name + 1;
+		if (scan >= this.tokens.size() || !this.tokens.get(scan).operator("(")) {
+			return scan;
+		}
+
+		for (scan++; scan < this.tokens.size(); scan++) {
+			Token token = this.tokens.get(scan);
+			if (token.kind() == Kind.NEWLINE || token.operator(")")) {
+				break;
+			}
+
+			if (token.kind() == Kind.IDENTIFIER) {
+				parameters.add(token.text());
+			}
+		}
+
+		return scan;
+	}
+
+	/**
+	 * Marks every token of one {@code #define} that names a parameter of it, in the list and in the
+	 * replacement text alike, so that no later pass renames one.
+	 * <p>
+	 * A parameter shadows the name outside it, so renaming it says something the pack did not.
+	 * <strong>And a rename that reached only half of them would be worse than either.</strong>
+	 * {@code #define CALL(texture, uv) texture(uv)} is the shape: the parameter in the list is
+	 * followed by a comma and the same name in the body is followed by a parenthesis, so a rewrite
+	 * that spares a call and renames everything else takes the declaration and leaves the use. The
+	 * preprocessor then binds nothing at that use, and what comes out is the very undeclared name
+	 * the rewrite exists to prevent.
+	 */
+	private void markMacroParameters(int name) {
+		Set<String> parameters = new HashSet<>();
+		int scan = macroParameters(name, parameters);
+		if (parameters.isEmpty()) {
+			return;
+		}
+
+		for (int index = name + 1; index < scan; index++) {
+			this.macroParameterTokens.add(index);
+		}
+
+		for (; scan < this.tokens.size(); scan++) {
+			Token token = this.tokens.get(scan);
+			if (token.kind() == Kind.NEWLINE) {
+				return;
+			}
+
+			if (token.kind() == Kind.IDENTIFIER && parameters.contains(token.text())) {
+				this.macroParameterTokens.add(scan);
+			}
+		}
+	}
+
+	/**
+	 * Records every name the unit declares under a built-in type, and among them the functions
+	 * whose name GLSL has since taken for itself.
+	 * <p>
+	 * A declaration declares more than one name when it carries commas, and only the first of them
+	 * follows the type. E-LITE writes {@code uniform int frameCounter, isEyeInWater, entityId},
+	 * and reading the first alone left the other two as names the unit never declares, which is
+	 * what decides whether the block supplies one: {@code entityId} was then written into the
+	 * block twice, once by the lift and once as a name nobody had declared, and the compiler
+	 * refuses a member declared twice.
+	 */
+	private void collectDeclarations() {
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.IDENTIFIER || token.directive() != null) {
+				continue;
+			}
+
+			int before = this.tokens.significantBefore(index);
+			if (before < 0 || !LegacyGlsl.TYPE_NAMES.contains(this.tokens.get(before).text())) {
+				continue;
+			}
+
+			this.declaredNames.add(token.text());
+			this.declaredNames.addAll(continuationDeclarators(index));
+			if (LegacyGlsl.POST_120_BUILTINS.contains(token.text()) && this.tokens.callOpener(index) >= 0) {
+				this.shadowedBuiltins.add(token.text());
+			}
+		}
+	}
+
+	/**
+	 * The names a declaration declares after its first, which is every declarator past a comma.
+	 * <p>
+	 * A name is only taken where what FOLLOWS it says it is a declarator, which is a comma, a
+	 * semicolon, an initialiser or an array bracket. Reading the name alone is not enough, and a
+	 * parameter list is why: {@code TYPE_NAMES} carries no {@code const}, {@code in} or
+	 * {@code out}, so Bliss writing {@code float rayLength, const float steps} in a signature
+	 * ({@code lib/ROBOBO_sky.glsl:61}) offers {@code const} where a declarator would stand. What
+	 * follows it there is a type name and never one of the four, so it is refused.
+	 * <p>
+	 * Liveness is not consulted, here or anywhere else in this pass: a declaration is read whether
+	 * its branch is taken or not, and the tail of a list is read on the same terms as its head.
+	 * Making the pass live-aware would change what it answers for every declaration in the file
+	 * and belongs to a batch of its own.
+	 *
+	 * @param first the first declarator of the statement, the one the type stands in front of
+	 */
+	private List<String> continuationDeclarators(int first) {
+		int end = this.tokens.statementEnd(first);
+		if (end < 0) {
+			return List.of();
+		}
+
+		List<String> names = new ArrayList<>();
+		int depth = 0;
+		boolean expectName = false;
+
+		for (int index = this.tokens.significantAfter(first); index >= 0 && index <= end;
+				index = this.tokens.significantAfter(index)) {
+			Token token = this.tokens.get(index);
+			if (token.operator("(") || token.operator("[") || token.operator("{")) {
+				depth++;
+			} else if (token.operator(")") || token.operator("]") || token.operator("}")) {
+				if (depth == 0) {
+					return names;
+				}
+
+				depth--;
+			} else if (depth == 0 && token.operator(",")) {
+				expectName = true;
+			} else if (expectName) {
+				if (token.kind() != Kind.IDENTIFIER || !declaratorFollows(index)) {
+					return names;
+				}
+
+				names.add(token.text());
+				expectName = false;
+			}
+		}
+
+		return names;
+	}
+
+	/**
+	 * Whether the name at this position is followed by what only ever follows a declarator: the
+	 * comma before the next one, the semicolon that ends the declaration, an initialiser, or the
+	 * bracket of an array.
+	 */
+	private boolean declaratorFollows(int name) {
+		int next = this.tokens.significantAfter(name);
+		if (next < 0) {
+			return false;
+		}
+
+		Token token = this.tokens.get(next);
+
+		return token.operator(",") || token.operator(";") || token.operator("=")
+				|| token.operator("[");
+	}
+
+	/**
+	 * Which colour attachments this program writes, bounded to what a fragment stage may declare.
+	 * The rule itself is in {@link DrawBuffers}, next to the targets it decides the existence of;
+	 * all that belongs here is the ceiling, since a target that has to exist and an output that
+	 * can be declared are two different questions with two different answers.
+	 * <p>
+	 * The ceiling is on how many are kept and not on how far they count, which is the difference
+	 * between the two questions. Entry {@code n} of this list is where output {@code n} lands, so
+	 * an entry past the eighth belongs to an output that cannot exist; but the entries themselves
+	 * name colour targets and Reverie names {@code colortex19}, which a bound of sixteen on the
+	 * value would drop, moving every attachment declared after it.
+	 */
+	private void collectDrawBuffers() {
+		DrawBuffers.parse(this.unit).stream().limit(MAX_FRAGMENT_OUTPUTS).forEach(this.drawBuffers::add);
+	}
+
+	/**
+	 * Takes both directives out of the body, and remembers which extensions the unit named.
+	 * <p>
+	 * The version is replaced by ours and never comes back. The extensions cannot stay WHERE they
+	 * are, which is the half of the old reason that still holds: once includes are spliced in an
+	 * {@code #extension} line lands well past the first real token, and the language allows none
+	 * there. The other half, that every extension the corpus used was core in 4.60, is what the
+	 * wider corpus refuted. RenderPearl asks for the explicit arithmetic types, and the shape of
+	 * what it costs is worth writing down because nothing about it looks like an extension
+	 * problem: the pack guards its use on
+	 * {@code defined GL_EXT_shader_explicit_arithmetic_types_float16} and ships a fallback that
+	 * redefines {@code float16_t} to {@code float} when the macro is absent. The compiler defines
+	 * that macro for every extension it KNOWS, enabled or not, so the guarded branch is taken, the
+	 * fallback is skipped, and the {@code #extension} line that would have made the type real is
+	 * the one thing missing. Every one of the pack's 302 units died on {@code float16_t}, reported
+	 * as a syntax error hundreds of lines away from anything to do with extensions.
+	 * <p>
+	 * So they are hoisted instead: the header re-emits them straight after the version, where the
+	 * language wants them, and {@link #extensions} is what carries them there.
+	 * <p>
+	 * <strong>All the device has, and as {@code enable} rather than as the {@code require} the
+	 * pack wrote.</strong> Both halves are deliberate. A pack gates its extensions on the
+	 * compiler's own macros, and whether a line is live is this engine's reading of the pack's
+	 * conditionals where the compiler's reading is the one that counts, so every extension named is
+	 * kept rather than only the live ones; and a name the compiler does not know is a warning under
+	 * {@code enable} where {@code require} is an error, which turns a pack asking for a vendor
+	 * extension it will not get into a pack that still compiles. What decides whether the pack's
+	 * code USES an extension is unchanged either way: its own macro test, answered by the compiler,
+	 * which for a vendor
+	 * extension the device has not got is given the device's answer to read
+	 * ({@link #hideAbsentExtensionMacros}, {@link VendorExtensions}).
+	 */
+	private void dropVersionAndExtensions() {
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.HASH) {
+				continue;
+			}
+
+			if (token.directive().equals("extension")) {
+				this.strippedExtensions++;
+				String named = extensionNamed(index);
+				// Not hoisted where the device has not got it in this stage: the compiler would
+				// take the line and emit the instruction, which is the one thing the device cannot
+				// run (VendorExtensions). The pack's own guard on the macro is hidden further down,
+				// so its fallback is what compiles.
+				if (named != null && !VendorExtensions.absent(named, this.stage)) {
+					this.extensions.add(named);
+				}
+			} else if (!token.directive().equals("version")) {
+				continue;
+			} else {
+				this.coreProfile = declaresCoreProfile(index);
+			}
+
+			this.tokens.blankDirective(index);
+		}
+	}
+
+	/**
+	 * Leaves one definition standing where a unit defines the same macro twice under two different
+	 * bodies, which is the last of them.
+	 * <p>
+	 * The language calls that an error and the compiler here holds it to that. A GL driver does
+	 * not: it warns and takes the newer definition from that point on, which is why packs ship it
+	 * and why it reaches nobody's bug tracker. Pegasus declares {@code ROUGH_FRESNEL} twice in
+	 * {@code settings.glsl}, at 0.7 and again at 0.2 six hundred lines further down, and every one
+	 * of its 178 compilable units died on the pair.
+	 * <p>
+	 * <strong>The last and not the first, and it is only done where the two cannot be told
+	 * apart.</strong> A driver answers a use standing BETWEEN two definitions with the first body,
+	 * and this would answer it with the last, which is a wrong number rather than a lost pass. So a
+	 * name used anywhere between its first definition and its last is left exactly as the pack
+	 * wrote it, and the unit keeps the refusal it has today. That guard is not theory: I Like
+	 * Vanilla redefines four of its own settings around uses of them and Pegasus redefines
+	 * {@code texture} around a hundred, and taking the earlier definition out cost those two packs
+	 * a hundred and thirty units and fifty five between them, measured. What is left is the shape
+	 * the guard is for, a settings file declaring the same option twice with nothing between the
+	 * two but more declarations.
+	 * <p>
+	 * Only bodies that DIFFER. Repeating a definition word for word is legal, several packs do it
+	 * through an include reached twice, and taking one of those out would say something where the
+	 * language says nothing. Only live lines, for the same reason the rest of this class reads
+	 * liveness: two definitions in two branches of one conditional are one definition.
+	 */
+	private void settleRedefinedMacros() {
+		Map<String, List<Integer>> sites = new LinkedHashMap<>();
+		Map<String, List<String>> bodies = new LinkedHashMap<>();
+
+		int[] lines = this.tokens.lineNumbers();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.HASH || !"define".equals(token.directive())
+					|| !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			int name = this.tokens.macroNameAfter(index);
+			if (name < 0) {
+				continue;
+			}
+
+			String named = this.tokens.get(name).text();
+			sites.computeIfAbsent(named, ignored -> new ArrayList<>()).add(index);
+			bodies.computeIfAbsent(named, ignored -> new ArrayList<>()).add(macroBody(name));
+		}
+
+		sites.forEach((named, at) -> {
+			List<String> written = bodies.get(named);
+			if (at.size() < 2 || written.stream().allMatch(written.get(0)::equals)
+					|| usedBetween(named, at.get(0), at.get(at.size() - 1))) {
+				return;
+			}
+
+			for (int which = 0; which < at.size() - 1; which++) {
+				this.tokens.blankDirective(at.get(which));
+			}
+		});
+	}
+
+	/**
+	 * Puts an {@code #undef} in front of every live redefinition of a macro that
+	 * {@link #settleRedefinedMacros} had to leave standing, which is the reference's reading of it.
+	 * <p>
+	 * A driver that accepts the pair gives each use the body in force where it stands: the first
+	 * body before the redefinition and the second after it. An {@code #undef} right in front of the
+	 * redefinition says exactly that to a compiler that refuses the pair, so no use changes value.
+	 * The pairs left for this are the ones read in between, which settling cannot touch: Eclipse
+	 * writes {@code diagonal3} in its composite2 and reads it through {@code projMAD} for three
+	 * hundred lines before {@code lib/util.glsl} defines it again, a body apart, and the whole pack
+	 * was refused over it.
+	 * <p>
+	 * <strong>Here and not in the rewrite, because of what it costs.</strong> The {@code #undef}
+	 * needs a line of its own, and every pass of the rewrite reads liveness off line numbers
+	 * ({@link TokenStream#lineNumbers}) and indices it recorded earlier. So it is written into the
+	 * text of the {@code #} token of the redefinition, which keeps the tokens where they are, and
+	 * only when the body is joined, after which nothing reads a line number again. The one thing
+	 * that moves is the line the compiler names in its own messages, one per {@code #undef}.
+	 */
+	private void undefineRedefinedMacros() {
+		int[] lines = this.tokens.lineNumbers();
+		Map<String, String> inForce = new HashMap<>();
+		Map<Integer, String> redefinitions = new LinkedHashMap<>();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.HASH || !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			boolean define = "define".equals(token.directive());
+			if (!define && !"undef".equals(token.directive())) {
+				continue;
+			}
+
+			int name = this.tokens.macroNameAfter(index);
+			if (name < 0) {
+				continue;
+			}
+
+			String named = this.tokens.get(name).text();
+			if (!define) {
+				inForce.remove(named);
+				continue;
+			}
+
+			String body = macroBody(name);
+			String previous = inForce.put(named, body);
+			// Only the "#" the lexer gave, so that joining a second time does not undefine twice.
+			if (previous != null && !previous.equals(body) && token.text().equals("#")) {
+				redefinitions.put(index, named);
+			}
+		}
+
+		redefinitions.forEach((index, named) ->
+				this.tokens.replace(index, "#undef " + named + "\n" + this.tokens.get(index).text()));
+	}
+
+	/**
+	 * Whether anything between two definitions of a macro reads it, which is what decides whether
+	 * the two can be settled into one. The name a {@code #define} gives is not a read of it, and
+	 * neither is a line nobody takes.
+	 */
+	private boolean usedBetween(String named, int first, int last) {
+		int[] lines = this.tokens.lineNumbers();
+		for (int index = first + 1; index < last; index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() == Kind.IDENTIFIER && !token.macroName() && named.equals(token.text())
+					&& this.unit.isLive(lines[index])) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Takes out a vertex stage's own redeclaration of {@code gl_PerVertex}.
+	 * <p>
+	 * A core profile pack narrows the built-in block to the members it writes, which is legal and
+	 * which the language allows in ONE place only: before any use of the block. Splicing the
+	 * includes in moves it, exactly as it moves an {@code #extension} line, and there it is
+	 * refused. RenderPearl writes {@code out gl_PerVertex { vec4 gl_Position; };} in its shared
+	 * vertex prelude and loses every vertex stage to it, ninety nine of them.
+	 * <p>
+	 * Dropping it rather than hoisting it, and the two are not the same trade here. What the
+	 * declaration DOES is take members away, so the block left standing is the predeclared one,
+	 * which holds the narrowed one and everything else the pack did not ask for. Nothing the pack
+	 * writes can miss, where a member it writes and did not declare would have been an error under
+	 * its own narrowing; the cost is a shader interface one member wider than the pack asked for,
+	 * which no stage of this corpus reads.
+	 */
+	private void dropRedeclaredVertexBlock() {
+		if (this.stage != ProgramStage.VERTEX) {
+			return;
+		}
+
+		int[] lines = this.tokens.lineNumbers();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.directive() != null || !token.identifier("gl_PerVertex")
+					|| !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			int keyword = this.tokens.significantBefore(index);
+			if (keyword < 0 || !this.tokens.get(keyword).identifier("out")) {
+				continue;
+			}
+
+			int brace = this.tokens.significantAfter(index);
+			if (brace < 0 || !this.tokens.get(brace).operator("{")) {
+				continue;
+			}
+
+			int close = this.tokens.matchingBracket(brace);
+			int end = close < 0 ? -1 : this.tokens.significantAfter(close);
+			while (end >= 0 && !this.tokens.get(end).operator(";")) {
+				end = this.tokens.significantAfter(end);
+			}
+
+			if (end >= 0) {
+				this.tokens.blankRange(keyword, end);
+			}
+		}
+	}
+
+	/** The qualifiers a block or a member may carry in front of its type, interpolation apart. */
+	private static final Set<String> INTERPOLATION_QUALIFIERS = Set.of("flat", "smooth", "noperspective");
+	private static final Set<String> OTHER_QUALIFIERS = Set.of("centroid", "sample", "invariant", "precise",
+			"highp", "mediump", "lowp");
+
+	/** One member of a block as the pass read it, applied only once every member of the block read. */
+	private record BlockMember(int typeAt, List<Integer> names, int layoutAt, Set<String> qualifiers) {
+	}
+
+	/**
+	 * Turns a pack's own {@code in} or {@code out} block into one varying per member, named after
+	 * the block, and rewrites every {@code instance.member} of the unit to that name.
+	 * <p>
+	 * A workaround for the game's linker, paid in nothing the image can see. Iris leaves the block
+	 * as the pack wrote it, and OpenGL takes a block whose members carry their own locations and
+	 * components, which is how RenderPearl packs nine varyings into four slots ({@code
+	 * lib/v_data_lit.glsl}). The game numbers a stage's outputs itself, one location per output
+	 * VARIABLE in the order its reflection lists them, and rebinds the next stage's inputs by name
+	 * to those numbers ({@code IntermediaryShaderModule.java:112-116} and {@code rebind}). A block
+	 * is one variable there and spans as many locations as it has members, so whichever output
+	 * the reflection lists after it lands inside that span, two outputs on one location, which the
+	 * validator refuses ({@code VUID-StandaloneSpirv-OpEntryPoint-08722}). Which output that is
+	 * depends on the order the compiler met them in: the pack's own modules validated alone and
+	 * failed once the engine's {@code entityColor} joined them after the wrapping main moved below
+	 * the body. With the block gone, every member is a varying the game numbers like any other,
+	 * and the matrix split and the varying collection read it like any other too, since the
+	 * storage word put in front of it is a real token and not injected text.
+	 * <p>
+	 * The name is the block's and not the instance's, because the two stages need not agree on the
+	 * instance: Reverie writes {@code out Data {...} DataOut;} against {@code in Data {...}
+	 * DataIn;}, and the game matches the two sides by name. A member keeps its own qualifiers,
+	 * takes the block's where the block carries one it does not, and loses its location and
+	 * component, the game renumbering every location anyway: what the pack loses is the packing by
+	 * component. The preprocessor lines inside the block stay where they are, so a member behind
+	 * an {@code #ifdef} is declared under the same condition as before; the head may be written
+	 * across a conditional, {@code out} under one branch and {@code in} under the other, which is
+	 * read through, the live word deciding; and a read of the instance inside a macro body is
+	 * rewritten with the rest. A block with no instance name already reads its members as globals
+	 * and is only unwrapped. A geometry stage's input block is an array, one element per corner,
+	 * and each member becomes an array of its own ({@code data_in[i].color} to
+	 * {@code of_DATA_color[i]}): that stage is never bound, but a device without geometry shaders
+	 * folds a pass-through one into the fragment stage, and the fold reads varyings and not
+	 * blocks. Eclipse's terrain passes its corners that way and lost its terrain program to the
+	 * block. Left whole: any other block declared as an array, which only a tessellation stage
+	 * reads and this engine binds none; a {@code patch} block, for the same reason; {@code gl_PerVertex}, the compiler's block and not a pack's; and a block one of
+	 * whose members the pass cannot read, since half a block is worse than the whole one. What is
+	 * not told apart is a local named like the instance whose own field is named like a member,
+	 * which no pack of the corpus writes.
+	 */
+	private void flattenInterfaceBlocks() {
+		int[] lines = this.tokens.lineNumbers();
+		List<TokenStream.Insertion> insertions = new ArrayList<>();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.directive() != null || !(token.identifier("in") || token.identifier("out"))
+					|| !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			int name = blockNameAfter(index);
+			if (name < 0 || this.tokens.get(name).text().startsWith("gl_")) {
+				continue;
+			}
+
+			int brace = this.tokens.significantAfter(name);
+			if (brace < 0 || !this.tokens.get(brace).operator("{")) {
+				continue;
+			}
+
+			int close = this.tokens.matchingBracket(brace);
+			int after = close < 0 ? -1 : this.tokens.significantAfter(close);
+			if (after < 0) {
+				continue;
+			}
+
+			String instance = null;
+			int end = after;
+			List<Token> corners = List.of();
+			if (this.tokens.get(after).kind() == Kind.IDENTIFIER) {
+				instance = this.tokens.get(after).text();
+				end = this.tokens.significantAfter(after);
+				// A geometry stage reads its inputs one corner at a time, as an array of the
+				// block, and it is the one arrayed block read here: the fold reads that stage.
+				if (end >= 0 && this.tokens.get(end).operator("[") && token.identifier("in")
+						&& this.stage == ProgramStage.GEOMETRY) {
+					int closing = this.tokens.matchingBracket(end);
+					if (closing < 0) {
+						index = close;
+						continue;
+					}
+
+					List<Token> suffix = new ArrayList<>();
+					for (int at = end; at <= closing; at++) {
+						Token piece = this.tokens.get(at);
+						if (!piece.trivia() && piece.kind() != Kind.NEWLINE) {
+							suffix.add(piece);
+						}
+					}
+
+					corners = List.copyOf(suffix);
+					end = this.tokens.significantAfter(closing);
+				}
+			}
+
+			if (end < 0 || !this.tokens.get(end).operator(";")) {
+				index = close;
+				continue;
+			}
+
+			// The qualifiers the block carries as a whole, in front of its storage word: handed
+			// down to every member without them, and dropped with the head along with a layout,
+			// the members being numbered by the game. A patch block belongs to a stage this
+			// engine never binds.
+			int start = index;
+			List<String> carried = new ArrayList<>();
+			boolean patch = false;
+			for (int before = this.tokens.significantBefore(index); before >= 0;
+					before = this.tokens.significantBefore(before)) {
+				Token qualifier = this.tokens.get(before);
+				if (qualifier.identifier("patch")) {
+					patch = true;
+				} else if (qualifier.kind() == Kind.IDENTIFIER && (INTERPOLATION_QUALIFIERS.contains(qualifier.text())
+						|| OTHER_QUALIFIERS.contains(qualifier.text()))) {
+					carried.add(0, qualifier.text());
+				} else if (qualifier.operator(")")) {
+					int layout = layoutBefore(before);
+					if (layout < 0) {
+						break;
+					}
+
+					before = layout;
+				} else {
+					break;
+				}
+
+				start = before;
+			}
+
+			if (patch) {
+				index = close;
+				continue;
+			}
+
+			List<BlockMember> members = new ArrayList<>();
+			List<Integer> declaration = new ArrayList<>();
+			boolean readable = true;
+			for (int at = brace + 1; at < close && readable; at++) {
+				Token piece = this.tokens.get(at);
+				if (piece.directive() != null || piece.trivia() || piece.kind() == Kind.NEWLINE
+						|| piece.text().isEmpty()) {
+					continue;
+				}
+
+				if (!piece.operator(";")) {
+					declaration.add(at);
+					continue;
+				}
+
+				BlockMember member = readBlockMember(declaration);
+				readable = member != null;
+				members.add(member);
+				declaration.clear();
+			}
+
+			// A member that is an array of its own would become an array of arrays, a shape the
+			// fold does not read either, so such a block stays whole as before.
+			if (!corners.isEmpty() && members.stream().flatMap(member -> member.names().stream())
+					.anyMatch(at -> {
+						int next = this.tokens.significantAfter(at);
+						return next >= 0 && this.tokens.get(next).operator("[");
+					})) {
+				readable = false;
+			}
+
+			if (!readable || !declaration.isEmpty()) {
+				index = close;
+				continue;
+			}
+
+			String storage = token.text();
+			String prefix = instance == null ? "" : "of_" + this.tokens.get(name).text() + "_";
+			List<String> names = new ArrayList<>();
+			for (BlockMember member : members) {
+				flattenMember(member, storage, carried, prefix, corners, names, insertions);
+			}
+
+			blankCode(start, brace);
+			blankCode(close, end);
+			if (instance != null && corners.isEmpty()) {
+				rewriteBlockReads(instance, prefix, names);
+			} else if (instance != null) {
+				rewriteCornerReads(instance, prefix, names);
+			}
+
+			index = close;
+		}
+
+		this.tokens.insertTokens(insertions);
+	}
+
+	/**
+	 * The name of the block a storage word opens, or -1 where what follows is not a block. Only
+	 * trivia, directive lines and the other branch's storage word may stand between the two.
+	 */
+	private int blockNameAfter(int storage) {
+		for (int scan = storage + 1; scan < this.tokens.size(); scan++) {
+			Token token = this.tokens.get(scan);
+			if (token.trivia() || token.kind() == Kind.NEWLINE || token.directive() != null
+					|| token.identifier("in") || token.identifier("out")) {
+				continue;
+			}
+
+			return token.kind() == Kind.IDENTIFIER ? scan : -1;
+		}
+
+		return -1;
+	}
+
+	/** The {@code layout} a closing parenthesis ends, or -1 where it closes something else. */
+	private int layoutBefore(int closing) {
+		int depth = 0;
+		for (int scan = closing; scan >= 0; scan--) {
+			Token token = this.tokens.get(scan);
+			if (token.kind() != Kind.OPERATOR || token.directive() != null) {
+				continue;
+			}
+
+			if (token.operator(")")) {
+				depth++;
+			} else if (token.operator("(")) {
+				depth--;
+				if (depth == 0) {
+					int keyword = this.tokens.significantBefore(scan);
+					return keyword >= 0 && this.tokens.get(keyword).identifier("layout") ? keyword : -1;
+				}
+			}
+		}
+
+		return -1;
+	}
+
+	/**
+	 * One member of a block read off the significant tokens of its declaration: an optional
+	 * layout, qualifiers, a type, then one or more names each with an optional array size. Null
+	 * where the declaration is not of that shape.
+	 */
+	private BlockMember readBlockMember(List<Integer> declaration) {
+		int part = 0;
+		int layoutAt = -1;
+		Set<String> qualifiers = new HashSet<>();
+		while (part < declaration.size()) {
+			int at = declaration.get(part);
+			Token piece = this.tokens.get(at);
+			if (piece.identifier("layout")) {
+				int closing = this.tokens.matchingBracket(this.tokens.callOpener(at));
+				if (closing < 0 || layoutAt >= 0) {
+					return null;
+				}
+
+				layoutAt = at;
+				while (part < declaration.size() && declaration.get(part) <= closing) {
+					part++;
+				}
+			} else if (piece.kind() == Kind.IDENTIFIER && (INTERPOLATION_QUALIFIERS.contains(piece.text())
+					|| OTHER_QUALIFIERS.contains(piece.text()))) {
+				qualifiers.add(piece.text());
+				part++;
+			} else {
+				break;
+			}
+		}
+
+		if (part >= declaration.size() || this.tokens.get(declaration.get(part)).kind() != Kind.IDENTIFIER) {
+			return null;
+		}
+
+		int typeAt = declaration.get(part++);
+		List<Integer> names = new ArrayList<>();
+		boolean expectName = true;
+		for (; part < declaration.size(); part++) {
+			int at = declaration.get(part);
+			Token piece = this.tokens.get(at);
+			if (expectName) {
+				if (piece.kind() != Kind.IDENTIFIER) {
+					return null;
+				}
+
+				names.add(at);
+				expectName = false;
+			} else if (piece.operator("[")) {
+				int closing = this.tokens.matchingBracket(at);
+				if (closing < 0) {
+					return null;
+				}
+
+				while (part + 1 < declaration.size() && declaration.get(part + 1) <= closing) {
+					part++;
+				}
+			} else if (piece.operator(",")) {
+				expectName = true;
+			} else {
+				return null;
+			}
+		}
+
+		return names.isEmpty() || expectName ? null : new BlockMember(typeAt, names, layoutAt, qualifiers);
+	}
+
+	/**
+	 * A member becomes a varying of its own, or several where it lists several names: the storage
+	 * word goes in front of its type as a token of its own, the block's qualifiers before that
+	 * where the member lacks them, each name takes the block's prefix, and a location or component
+	 * layout on the member is dropped.
+	 */
+	private void flattenMember(BlockMember member, String storage, List<String> carried, String prefix,
+			List<Token> corners, List<String> names, List<TokenStream.Insertion> insertions) {
+		if (member.layoutAt() >= 0) {
+			dropLocationLayout(member.layoutAt());
+		}
+
+		for (int nameAt : member.names()) {
+			String name = this.tokens.get(nameAt).text();
+			names.add(name);
+			this.tokens.replace(nameAt, prefix + name);
+			// The block's corner array, handed to each member: in vec4 of_DATA_color[];
+			for (Token piece : corners) {
+				insertions.add(new TokenStream.Insertion(nameAt + 1, piece));
+			}
+		}
+
+		boolean interpolated = member.qualifiers().stream().anyMatch(INTERPOLATION_QUALIFIERS::contains);
+		for (String qualifier : carried) {
+			boolean interpolation = INTERPOLATION_QUALIFIERS.contains(qualifier);
+			if (interpolation ? !interpolated : !member.qualifiers().contains(qualifier)) {
+				insertions.add(new TokenStream.Insertion(member.typeAt(), new Token(Kind.IDENTIFIER, qualifier, null)));
+				insertions.add(new TokenStream.Insertion(member.typeAt(), new Token(Kind.SPACE, " ", null)));
+			}
+		}
+
+		insertions.add(new TokenStream.Insertion(member.typeAt(), new Token(Kind.IDENTIFIER, storage, null)));
+		insertions.add(new TokenStream.Insertion(member.typeAt(), new Token(Kind.SPACE, " ", null)));
+	}
+
+	/** Blanks a range of code, leaving the directive lines inside it standing. */
+	private void blankCode(int start, int end) {
+		for (int at = start; at <= end; at++) {
+			if (this.tokens.get(at).directive() == null) {
+				this.tokens.blankRange(at, at);
+			}
+		}
+	}
+
+	/**
+	 * {@link #rewriteBlockReads} for a block read one corner at a time: {@code data_in[i].color}
+	 * becomes {@code of_DATA_color[i]}. The instance takes the member's name and the access after
+	 * the bracket is blanked, which puts the index where the flattened array wants it without
+	 * moving a token.
+	 */
+	private void rewriteCornerReads(String instance, String prefix, List<String> members) {
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.macroName() || !token.identifier(instance) || fieldAccess(index)) {
+				continue;
+			}
+
+			int open = this.tokens.significantAfter(index);
+			if (open < 0 || !this.tokens.get(open).operator("[")) {
+				continue;
+			}
+
+			int closing = this.tokens.matchingBracket(open);
+			int dot = closing < 0 ? -1 : this.tokens.significantAfter(closing);
+			if (dot < 0 || !this.tokens.get(dot).operator(".")) {
+				continue;
+			}
+
+			int member = this.tokens.significantAfter(dot);
+			if (member < 0 || this.tokens.get(member).kind() != Kind.IDENTIFIER
+					|| !members.contains(this.tokens.get(member).text())) {
+				continue;
+			}
+
+			this.tokens.replace(index, prefix + this.tokens.get(member).text());
+			this.tokens.blank(dot);
+			this.tokens.blank(member);
+		}
+	}
+
+	/**
+	 * Rewrites every {@code instance.member} of a flattened block to the member's own name, in the
+	 * pack's macro bodies as well as in its code, and never the field of something else that
+	 * happens to be named like the instance. Only the two tokens of the access are blanked, one
+	 * by one, so that a spliced line inside a macro body keeps its splice.
+	 */
+	private void rewriteBlockReads(String instance, String prefix, List<String> members) {
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.macroName() || !token.identifier(instance) || fieldAccess(index)) {
+				continue;
+			}
+
+			int dot = this.tokens.significantAfter(index);
+			if (dot < 0 || !this.tokens.get(dot).operator(".")) {
+				continue;
+			}
+
+			int member = this.tokens.significantAfter(dot);
+			if (member < 0 || this.tokens.get(member).kind() != Kind.IDENTIFIER
+					|| !members.contains(this.tokens.get(member).text())) {
+				continue;
+			}
+
+			this.tokens.replace(index, prefix + this.tokens.get(member).text());
+			this.tokens.blank(dot);
+			this.tokens.blank(member);
+		}
+	}
+
+	/** Whether the token at this index is reached through a dot on its own line, a field of something. */
+	private boolean fieldAccess(int index) {
+		for (int scan = index - 1; scan >= 0; scan--) {
+			Token token = this.tokens.get(scan);
+			if (token.kind() == Kind.NEWLINE) {
+				return false;
+			}
+
+			if (!token.trivia()) {
+				return token.operator(".");
+			}
+		}
+
+		return false;
+	}
+
+	/** Blanks a {@code layout(...)} whose every key is {@code location} or {@code component}. */
+	private void dropLocationLayout(int layout) {
+		dropLayoutOf(layout, Set.of("location", "component"));
+	}
+
+	/**
+	 * Renames, in the pack's own preprocessor lines, the macro of every extension the device has not
+	 * got in this stage, so that the compiler answers {@code defined} the way the device would.
+	 * <p>
+	 * The reason is with {@link VendorExtensions}: the compiler defines the macro of every
+	 * extension it knows, and a pack gating a vendor instruction on that macro takes the branch on
+	 * a card that cannot run the instruction. Under a GL driver the macro is only defined where the
+	 * card has the extension, which is the answer restored here. Every line is rewritten, live or
+	 * not, since the question is what the compiler will read; the expander already read these names
+	 * as undefined in this stage ({@link CompilerMacros}), so the two agree afterwards.
+	 */
+	private void hideAbsentExtensionMacros() {
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.directive() != null && token.kind() == Kind.IDENTIFIER
+					&& VendorExtensions.absent(token.text(), this.stage)) {
+				this.tokens.replace(index, VendorExtensions.hidden(token.text()));
+			}
+		}
+	}
+
+	/** Blanks the {@code layout(...)} at this token when every key it carries is one of these. */
+	private void dropLayoutOf(int layout, Set<String> keys) {
+		int open = this.tokens.callOpener(layout);
+		int close = this.tokens.matchingBracket(open);
+		if (open < 0 || close < 0) {
+			return;
+		}
+
+		// A key is the identifier that opens an entry: the first inside the parenthesis and every
+		// one that follows a comma.
+		boolean opensEntry = true;
+		for (int part : this.tokens.significantRange(open + 1, close - 1)) {
+			Token token = this.tokens.get(part);
+			if (opensEntry && !(token.kind() == Kind.IDENTIFIER && keys.contains(token.text()))) {
+				return;
+			}
+
+			opensEntry = token.operator(",");
+		}
+
+		this.tokens.blankRange(layout, close);
+	}
+
+	/**
+	 * What one {@code #define} substitutes, as the compiler compares it: the tokens after the name
+	 * with the spacing and the comments left out, since neither is part of a substitution.
+	 */
+	private String macroBody(int name) {
+		StringBuilder body = new StringBuilder();
+		for (int index = name + 1; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() == Kind.NEWLINE) {
+				break;
+			}
+
+			if (!token.trivia()) {
+				body.append(token.text());
+			}
+		}
+
+		return body.toString();
+	}
+
+	/**
+	 * The extension one {@code #extension} directive names, or null for {@code all}, which is the
+	 * one name that is a state and not an extension: hoisting it would turn every extension the
+	 * compiler knows on at once.
+	 */
+	private boolean declaresCoreProfile(int directive) {
+		int version = 0;
+		String profile = null;
+		for (int index = directive + 1; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() == Kind.NEWLINE) {
+				break;
+			}
+
+			if (token.kind() == Kind.NUMBER && version == 0
+					&& token.text().chars().allMatch(Character::isDigit)) {
+				version = Integer.parseInt(token.text());
+			} else if (token.kind() == Kind.IDENTIFIER && !token.text().equals("version")) {
+				profile = token.text();
+			}
+		}
+
+		return "core".equals(profile) || (profile == null && version >= 150);
+	}
+
+	private String extensionNamed(int directive) {
+		for (int index = directive + 1; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() == Kind.NEWLINE) {
+				return null;
+			}
+
+			// The directive's own keyword is a token of the line like any other, so the name is the
+			// first identifier that is not it.
+			if (token.kind() == Kind.IDENTIFIER && !token.text().equals("extension")) {
+				return token.text().equals("all") ? null : token.text();
+			}
+		}
+
+		return null;
+	}
+
+	private void rewriteIdentifiers() {
+		List<Closing> closings = new ArrayList<>();
+		int[] lines = this.tokens.lineNumbers();
+
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.IDENTIFIER) {
+				continue;
+			}
+
+			String directive = token.directive();
+			if (directive != null
+					&& (LegacyGlsl.OPAQUE_DIRECTIVES.contains(directive) || token.macroName())) {
+				continue;
+			}
+
+			String name = token.text();
+
+			// A pack that shims a legacy name itself has already said what it means. Renaming its
+			// uses would leave the macro behind, pointing at something no longer there.
+			if (this.packMacros.contains(name)) {
+				continue;
+			}
+
+			if (this.shadowedBuiltins.contains(name)) {
+				this.tokens.replace(index, "of_" + name);
+				continue;
+			}
+
+			if (name.equals("gl_TextureMatrix") && LegacyGlsl.bindsGameTransforms(this.program)
+					&& rewriteGameTextureMatrix(index)) {
+				continue;
+			}
+
+			if (name.equals("gl_TextureMatrix") && this.inputs == VertexInputs.DISTANT
+					&& rewriteDistantTextureMatrix(index)) {
+				continue;
+			}
+
+			if (LegacyGlsl.readsDrawModelView(this.program) && rewriteGameModelView(index, name)) {
+				continue;
+			}
+
+			// Before the table, which carries no entry for it: the name is not a member of the block
+			// and not a varying either, and what it becomes is a global the header declares.
+			if (name.equals("gl_FrontColor") && this.stage == ProgramStage.VERTEX) {
+				this.tokens.replace(index, FRONT_COLOUR);
+				continue;
+			}
+
+			String fixed = LegacyGlsl.FIXED_FUNCTION.get(name);
+			if (fixed != null) {
+				this.tokens.replace(index, fixed);
+				continue;
+			}
+
+			if (name.equals("gl_VertexID") || name.equals("gl_InstanceID")) {
+				this.tokens.replace(index,
+						name.equals("gl_VertexID") ? "gl_VertexIndex" : "gl_InstanceIndex");
+				continue;
+			}
+
+			if (name.equals("ftransform") && rewriteFtransform(index)) {
+				continue;
+			}
+
+			String shadow = LegacyGlsl.SHADOW_FUNCTIONS.get(name);
+			if (shadow != null && this.tokens.callOpener(index) >= 0) {
+				int close = this.tokens.matchingBracket(this.tokens.callOpener(index));
+				if (close < 0) {
+					// Unbalanced from here, usually because a macro opened the parenthesis. The
+					// call is left alone and the compiler will say so, but silence here would
+					// mean a lookup nobody wrapped and nobody counted.
+					this.unwrappedShadowCalls++;
+				}
+
+				if (close >= 0) {
+					// A legacy shadow lookup is rewritten here rather than later: the injection
+					// below fuses the name into one token with the parenthesis, and the depth
+					// conversion matches names.
+					int first = this.tokens.significantAfter(this.tokens.callOpener(index));
+					String argument = first >= 0
+							&& this.tokens.get(first).kind() == Kind.IDENTIFIER
+							? this.tokens.get(first).text() : null;
+					boolean hardware = argument != null
+							&& hardwareComparisonAt(argument, lines[index]);
+					boolean compared = argument != null && !hardware
+							&& comparisonAt(argument, lines[index]);
+
+					// Only the plain lookups are the arithmetic road's to make, as in
+					// rewriteShadowCompare and for the same reason: a projective comparison divides
+					// before it compares, which is a different expression and not a different name.
+					// It keeps the modern spelling and is counted rather than quietly turned into
+					// something it is not. The hardware road has no such edge: textureProj on a
+					// comparison sampler is the division and the comparison in one call, so it
+					// counts as a comparison made rather than as one left on the floor.
+					if (compared && shadow.equals("textureProj")) {
+						this.unwrappedShadowCalls++;
+						compared = false;
+					}
+
+					if (compared) {
+						this.softRewrites++;
+					}
+
+					// The wrap adds an opening parenthesis, so it has to add a closing one too.
+					// Substituting the head alone is what left the prototype with eighty-six
+					// units ending in "unexpected SEMICOLON, expecting RIGHT_PAREN".
+					//
+					// The wrap goes in as a token of its own and the NAME is replaced rather than
+					// fused into it, so that what stands there afterwards is the modern call this
+					// has become, readable by name like any other. It has to be: the level pinning
+					// matches names, and both Complementary packs write their four tap shadow
+					// filter in this spelling, so a fused head left every one of those taps on an
+					// implicit level. The two parentheses are raw text, which the bracket walks
+					// step over, reading operators only, so the call still opens and closes where
+					// it did.
+					closings.add(new Closing(index, "vec4(", directive));
+					this.tokens.replace(index, compared ? SHADOW_COMPARE : shadow);
+					closings.add(new Closing(close + 1, ")", null));
+					this.shadowCalls++;
+					continue;
+				}
+			}
+
+			String modern = LegacyGlsl.DEPRECATED_FUNCTIONS.get(name);
+			if (modern != null && this.tokens.callOpener(index) >= 0) {
+				this.tokens.replace(index, modern);
+				continue;
+			}
+
+			// Calls only, and never a name the pack declared for itself: a unit shipping its own
+			// sin has already said what it means by it. See REDUCED_SIN for why the builtin cannot
+			// be left to take the argument raw.
+			//
+			// The site is counted before the switch is asked and not after, so that a load running
+			// on the driver's own two can still say what the substitution would have had to bite
+			// on. With the switch off nothing is replaced and the token falls through to the
+			// readings below, exactly as any other name the pack calls does.
+			if ((name.equals("sin") || name.equals("cos")) && this.tokens.callOpener(index) >= 0
+					&& !this.declaredNames.contains(name)) {
+				this.trigSites++;
+				if (reduceTrig) {
+					this.tokens.replace(index, name.equals("sin") ? REDUCED_SIN : REDUCED_COS);
+					this.trigCalls++;
+					continue;
+				}
+			}
+
+			// The same two exclusions, and on MoltenVK alone: PackBuiltins says what Metal does with
+			// these calls. Above the directive guard like the sine, a call in a #define body being
+			// code the preprocessor pastes into the program.
+			String packed = PackBuiltins.helper(name);
+			if (packed != null && VendorExtensions.moltenVk() && this.tokens.callOpener(index) >= 0
+					&& !this.declaredNames.contains(name)) {
+				this.tokens.replace(index, packed);
+				this.packBuiltinCalls.add(name);
+				continue;
+			}
+
+			// Above the guard below, and it is the one rewrite that belongs there. The body of a
+			// #define is code: it is substituted into the program, so a reserved name inside it has
+			// to be renamed with the declaration or the two part company. Pegasus builds its whole
+			// albedo read out of macros, {@code #define ALBEDO_TEXTURE_CALL_PREFIX textureGrad(texture, }
+			// among fourteen of them, and its own {@code uniform sampler2D texture} was renamed
+			// while those bodies were not: every terrain, water, entity and particle pass of the
+			// pack was refused on an undeclared {@code texture}, 760 times in one load.
+			//
+			// {@code define} alone, and never the conditionals. A name in {@code #ifdef} or
+			// {@code #if defined} is a question about a macro rather than code, and renaming it
+			// would ask about a name nobody defines. The macro's OWN name is already out, being a
+			// naming directive's first identifier.
+			String named = LegacyGlsl.RESERVED_NAMES.get(name);
+			if (named != null && "define".equals(directive)
+					&& !this.macroParameterTokens.contains(index)
+					&& this.tokens.callOpener(index) < 0) {
+				this.tokens.replace(index, named);
+				continue;
+			}
+
+			if (directive != null) {
+				continue;
+			}
+
+			if (name.equals("varying")) {
+				// A geometry shader has varyings running both ways and the keyword cannot say
+				// which, so this guesses in. Every other stage is unambiguous, and the keyword
+				// belongs to a GLSL older than the one that has a geometry stage at all, so a
+				// pack that writes both is writing something no compiler accepted either.
+				this.tokens.replace(index, this.stage == ProgramStage.VERTEX ? "out" : "in");
+				continue;
+			}
+
+			if (name.equals("attribute")) {
+				this.tokens.replace(index, "in");
+				continue;
+			}
+
+			String reserved = LegacyGlsl.RESERVED_NAMES.get(name);
+			if (reserved != null && this.tokens.callOpener(index) < 0) {
+				this.tokens.replace(index, reserved);
+			}
+		}
+
+		// Inserting shifts every index after it, so the last insertion is made first. It also ends
+		// every position taken before it, insertClosings being the one place that moves a token, so
+		// anything a later pass still has to know about a token is carried on the token, as
+		// Token#macroName is. A position kept across here would be read against somebody else's
+		// token, and the reading pass has no way to notice.
+		this.tokens.insertClosings(closings);
+	}
+
+	/**
+	 * Replaces {@code fract(sin(dot(p, K)) * 43758.5453)} with a hash of {@code p}'s bits.
+	 * <p>
+	 * The constant is the fingerprint. Packs copy this one number into a hash they mean as white
+	 * noise on a lattice; a sine that then fails is not a sine they asked to see, and feeding it
+	 * to {@link #REDUCED_SIN} still skips in game. The first argument of {@code dot} is the lattice
+	 * point (or the continuous coordinate, for the same idiom on stars and puddles). The second
+	 * argument is thrown away: it exists only to mix those two channels into the sine.
+	 * <p>
+	 * Only while that second argument is a literal. Body Camera writes the frame time into it,
+	 * {@code vec2(12.9898, 78.233 * frameTimeCounter)}, and means its film grain to move: a hash of
+	 * the first argument alone would freeze it. Such a call is not the lattice idiom and keeps its
+	 * sine.
+	 */
+	private void rewriteGoldbergHash() {
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (!token.identifier("fract") || token.directive() != null) {
+				continue;
+			}
+
+			int fractOpen = this.tokens.callOpener(index);
+			int sine = fractOpen < 0 ? -1 : this.tokens.significantAfter(fractOpen);
+			if (sine < 0 || !goldbergSine(this.tokens.get(sine))) {
+				continue;
+			}
+
+			int sineOpen = this.tokens.callOpener(sine);
+			int dot = sineOpen < 0 ? -1 : this.tokens.significantAfter(sineOpen);
+			if (dot < 0 || !this.tokens.get(dot).identifier("dot")) {
+				continue;
+			}
+
+			int dotOpen = this.tokens.callOpener(dot);
+			int dotClose = this.tokens.matchingBracket(dotOpen);
+			int comma = firstCallComma(dotOpen);
+			int argStart = dotOpen < 0 ? -1 : this.tokens.significantAfter(dotOpen);
+			int argEnd = comma < 0 ? -1 : this.tokens.significantBefore(comma);
+			int sineClose = this.tokens.matchingBracket(sineOpen);
+			int times = sineClose < 0 ? -1 : this.tokens.significantAfter(sineClose);
+			int scale = times < 0 ? -1 : this.tokens.significantAfter(times);
+			int fractClose = this.tokens.matchingBracket(fractOpen);
+			if (argStart < 0 || argEnd < argStart || times < 0 || scale < 0 || fractClose < 0
+					|| !this.tokens.get(times).operator("*")
+					|| !goldbergScale(this.tokens.get(scale))
+					|| !literalVector(comma + 1, dotClose - 1)) {
+				continue;
+			}
+
+			int afterScale = this.tokens.significantAfter(scale);
+			if (afterScale != fractClose) {
+				continue;
+			}
+
+			boolean reduced = this.tokens.get(sine).identifier(REDUCED_SIN);
+			String argument = tokenText(argStart, argEnd);
+			this.tokens.blankRange(index, fractClose);
+			this.tokens.inject(index, HASH + "(" + argument + ")");
+			// Off both counts, and the site comes off whichever name its sine still went under: the
+			// idiom is erased here, so it is not a call either helper was ever going to take.
+			if (this.trigSites > 0) {
+				this.trigSites--;
+			}
+
+			if (reduced && this.trigCalls > 0) {
+				this.trigCalls--;
+			}
+
+			this.hashCalls++;
+		}
+	}
+
+	private boolean goldbergSine(Token token) {
+		// The plain arm carries BOTH exclusions the substitution itself applies, the pack macro
+		// one included: a pack that defines sin for itself keeps its idiom whatever the switch
+		// says, exactly as it kept it before the switch existed.
+		return token.identifier(REDUCED_SIN)
+				|| (token.identifier("sin") && !this.declaredNames.contains("sin")
+						&& !this.packMacros.contains("sin"));
+	}
+
+	/**
+	 * Whether the tokens in this range spell a vector of numbers and nothing else, such as
+	 * {@code vec2(12.9898, 4.1414)}. A name in there is a value that moves.
+	 */
+	private boolean literalVector(int start, int end) {
+		boolean number = false;
+		for (int at = start; at <= end; at++) {
+			Token token = this.tokens.get(at);
+			if (token.trivia() || token.kind() == Kind.NEWLINE) {
+				continue;
+			}
+
+			if (token.kind() == Kind.NUMBER) {
+				number = true;
+			} else if (token.kind() == Kind.IDENTIFIER) {
+				if (!token.identifier("vec2") && !token.identifier("vec3") && !token.identifier("vec4")) {
+					return false;
+				}
+			} else if (!token.operator("(") && !token.operator(")") && !token.operator(",")
+					&& !token.operator("-") && !token.operator("+")) {
+				return false;
+			}
+		}
+
+		return number;
+	}
+
+	/**
+	 * The goldberg scale is this one number, copied through the corpus. Anything else multiplied
+	 * by a sine is a sine the pack meant to keep.
+	 */
+	private static boolean goldbergScale(Token token) {
+		if (token.kind() != Kind.NUMBER) {
+			return false;
+		}
+
+		String text = token.text();
+		if (text.endsWith("f") || text.endsWith("F")) {
+			text = text.substring(0, text.length() - 1);
+		}
+
+		try {
+			return Math.abs(Double.parseDouble(text) - 43758.5453) < 2.0;
+		} catch (NumberFormatException ignored) {
+			return false;
+		}
+	}
+
+	/** The comma that separates the first argument of the call that opens here, or -1. */
+	private int firstCallComma(int open) {
+		int close = this.tokens.matchingBracket(open);
+		if (open < 0 || close < 0) {
+			return -1;
+		}
+
+		int depth = 0;
+		for (int scan = open; scan < close; scan++) {
+			Token inner = this.tokens.get(scan);
+			if (inner.kind() != Kind.OPERATOR) {
+				continue;
+			}
+
+			if (inner.operator("(") || inner.operator("[") || inner.operator("{")) {
+				depth++;
+			} else if (inner.operator(")") || inner.operator("]") || inner.operator("}")) {
+				depth--;
+			} else if (inner.operator(",") && depth == 1) {
+				return scan;
+			}
+		}
+
+		return -1;
+	}
+
+	private String tokenText(int start, int end) {
+		StringBuilder text = new StringBuilder();
+		for (int at = start; at <= end; at++) {
+			text.append(this.tokens.get(at).text());
+		}
+
+		return text.toString();
+	}
+
+	/**
+	 * Sends one read of {@code gl_TextureMatrix[0]} to the game's own block, which is where the
+	 * matrix that draw was really prepared with lives.
+	 * <p>
+	 * <strong>Unit nought and no other, which is the whole shape of it.</strong> The one thing the
+	 * fixed function pipeline put in unit nought is what a render type animates its texture by, and
+	 * six of the game's render types set one that is not the identity: the four glints, the breeze's
+	 * wind and the energy swirl ({@code rendertype/RenderTypes.java:251,259,267,274,524,536}, the last
+	 * two an offset built afresh per draw). Unit one is the light map's and is answered from this
+	 * engine's own table, which is Iris's split as well: {@code gl_TextureMatrix[1]} goes to
+	 * {@code iris_LightmapTextureMatrix} beside the line that sends nought to the block
+	 * ({@code VanillaTransformer.java:163-164}).
+	 * <p>
+	 * Only where the pass is drawn from a draw the game prepared, which is what
+	 * {@link LegacyGlsl#bindsGameTransforms} answers and what {@link LegacyGlsl#GAME_TEXTURE_MATRIX}
+	 * weighs against Iris's wider reach.
+	 * <p>
+	 * The three bracket tokens are blanked rather than kept, because what replaces the name is a
+	 * matrix and not an array: leaving {@code [0]} standing would read its first COLUMN. Any other
+	 * index, and any index that is not a literal, is left alone and reaches the array as before,
+	 * <strong>which for unit nought means the identity beside a neighbour that reads the real
+	 * matrix</strong>. The corpus writes the name two hundred and fifty seven times, all of them
+	 * {@code [0]} or {@code [1]} and none of them computed, so nothing rests on that today; it is
+	 * written down because a pack that computes an index has to keep working rather than read a
+	 * column, and because two answers for one unit inside one file is the kind of thing that is only
+	 * ever noticed if it was said in advance.
+	 *
+	 * @return whether this was a read of unit nought, false leaving the name to the ordinary rename
+	 */
+	private boolean rewriteGameTextureMatrix(int index) {
+		int open = this.tokens.significantAfter(index);
+		if (open < 0 || !this.tokens.get(open).operator("[")) {
+			return false;
+		}
+
+		int unit = this.tokens.significantAfter(open);
+		int close = this.tokens.matchingBracket(open);
+		if (unit < 0 || close < 0 || this.tokens.significantAfter(unit) != close
+				|| !this.tokens.get(unit).text().equals("0")) {
+			return false;
+		}
+
+		this.tokens.inject(index, LegacyGlsl.GAME_TEXTURE_MATRIX);
+		this.tokens.blank(open);
+		this.tokens.blank(unit);
+		this.tokens.blank(close);
+		this.injectedNames.add(LegacyGlsl.GAME_TEXTURE_MATRIX);
+		this.gameTextureMatrix++;
+
+		return true;
+	}
+
+	/**
+	 * Answers a far terrain program's read of {@code gl_TextureMatrix[0]}, {@code [1]} or
+	 * {@code [2]} with the identity, which is Iris's answer for this family and the other half of
+	 * the light pair {@link DistantVertex} hands over normalised.
+	 * <p>
+	 * <strong>Iris replaces the first two expressions on its DH road,</strong>
+	 * {@code DHTerrainTransformer.java:23-24}, because the light coordinate its vertex init builds
+	 * is already {@code (i + 0.5) / 16} ({@code :135}) and unit nought's coordinate is a constant:
+	 * neither has a fixed function scale left to undo. The packs split over which way they read the
+	 * light, BSL and Complementary through the matrix and Bliss raw, so the matrix and the
+	 * coordinate have to change convention together or one of the two camps reads a number two
+	 * hundred and fifty six times off.
+	 * <p>
+	 * <strong>Unit two rides along because it is this engine's second name for unit one</strong>,
+	 * {@code of_MultiTexCoord2} answering the same pair in the head and
+	 * {@code GeometryValues.LIGHTMAP_UNITS} holding both, where Iris spells the aliasing on the
+	 * coordinate instead and renames {@code gl_MultiTexCoord2} to one on this family
+	 * ({@code DHTerrainTransformer.java:30}), leaving its {@code gl_TextureMatrix[2]} to fail the
+	 * compile. Leaving two out here would put the light matrix under a coordinate already
+	 * normalised, the exact mismatch this method exists to close. The corpus names neither the
+	 * coordinate nor the matrix of unit two in a {@code dh_} program, so nothing rests on the
+	 * difference from Iris's refusal.
+	 * <p>
+	 * Any other index, and any index that is not one of the three literals spelled plainly, falls
+	 * through to the ordinary rename and reads the engine's real table. Iris leaves those reads
+	 * untouched on this family, where they fail to compile; the corpus never writes one in a
+	 * {@code dh_} program, so nothing rests on that today either, and it is written down here for
+	 * the pack that one day does.
+	 *
+	 * @return whether this was a read of unit nought, one or two, false leaving the name to the
+	 *         ordinary rename
+	 */
+	private boolean rewriteDistantTextureMatrix(int index) {
+		int open = this.tokens.significantAfter(index);
+		if (open < 0 || !this.tokens.get(open).operator("[")) {
+			return false;
+		}
+
+		int unit = this.tokens.significantAfter(open);
+		int close = this.tokens.matchingBracket(open);
+		if (unit < 0 || close < 0 || this.tokens.significantAfter(unit) != close
+				|| !(this.tokens.get(unit).text().equals("0")
+						|| this.tokens.get(unit).text().equals("1")
+						|| this.tokens.get(unit).text().equals("2"))) {
+			return false;
+		}
+
+		this.tokens.inject(index, "mat4(1.0)");
+		this.tokens.blank(open);
+		this.tokens.blank(unit);
+		this.tokens.blank(close);
+
+		return true;
+	}
+
+	/**
+	 * Sends the model view of a pass drawn from the camera to the game's own block, with the bob put
+	 * back on the front.
+	 * <p>
+	 * <strong>It is what Iris does for every program it patches as VANILLA</strong>, its vanilla
+	 * transformer rewriting {@code gl_ModelViewMatrix} as
+	 * {@code (iris_transforms.ModelViewMat * _iris_internal_translate(iris_transforms.ModelOffset))}
+	 * ({@code transform/transformer/VanillaTransformer.java:354-366}, the second factor built under
+	 * {@code parameters.hasChunkOffset} and a {@code iris_VIEW_SCALE} put in front for lines). Not
+	 * every gbuffers program: the terrain family goes down the SODIUM road instead, where the same
+	 * name becomes {@code u_ModelViewMatrix}
+	 * ({@code transform/transformer/SodiumTransformer.java:72}), which is the same split this engine
+	 * has. {@link LegacyGlsl#readsDrawModelView} carries which passes reach it here and why the
+	 * shadow map is not one of them.
+	 * <p>
+	 * <strong>What it buys is that a piece and whatever is drawn at its own depth read the same
+	 * matrix from the same place.</strong> A pass matrix is one per RUN and is built on the
+	 * processor; the game writes one per DRAW, with the render type's own nudge in it. So long as
+	 * only the glint read the second, an enchanted armour piece and the glint over it were two
+	 * matrices meant to be equal, and the glint's depth test is an EQUALITY:
+	 * {@link LegacyGlsl#GAME_MODEL_VIEW} sets out what that costs and how it was measured.
+	 * <p>
+	 * <strong>The bob is the half that is not Iris's line</strong>, and leaving it out is geometry
+	 * that stands still while the camera walks: this engine leaves the game's matrices alone and
+	 * splits them only where a pack reads them, so the matrix the game wrote for this draw has no bob
+	 * in it and the projection a pack is handed has none either. {@link LegacyGlsl#CAMERA_BOB} is the
+	 * factor that puts it back, and the product is what
+	 * {@link dev.vulture.uniform.ViewSource#passModelView} would have held for this draw.
+	 * {@link LegacyGlsl#GAME_MODEL_VIEW} carries where Iris does the same move instead.
+	 * <p>
+	 * <strong>Every spelling of the product, because the fallback tree makes any of them reachable.</strong>
+	 * {@code ftransform()} is the one the corpus's glints really write and the named matrices are what
+	 * its entity programs write; whichever a pack chose, a piece left on the pass's matrix is a piece
+	 * whose neighbour reads another. The core profile spelling {@code modelViewMatrix} is the only one
+	 * a pack may also DECLARE, the {@code gl_} prefix being reserved:
+	 * {@link LegacyGlsl#CORE_MATRICES} exists because OptiFine's core mode writes it.
+	 * <p>
+	 * <strong>What is deliberately left on the pass is everything DERIVED from the model view</strong>,
+	 * which is the inverse and the normal matrix. Iris leaves them there too, and not as an oversight
+	 * it would have tidied: {@code gl_ModelViewMatrixInverse} and {@code gl_NormalMatrix} become
+	 * {@code iris_ModelViewMatInverse} and {@code iris_NormalMat}
+	 * ({@code transform/transformer/VanillaTransformer.java:168-178}), both filled from
+	 * {@code RenderSystem.getModelViewMatrix()} at program setup
+	 * ({@code pipeline/programs/ExtendedShader.java:183} and {@code :188}), which is the stack and
+	 * carries no nudge. So a pack that multiplies the matrix by its own inverse is a hair off in both
+	 * engines, by the same hair.
+	 * <p>
+	 * <strong>On the hand it is not a hair, and it is the same difference twice rather than two
+	 * findings.</strong> Both derived names come off one matrix,
+	 * {@code dev.vulture.uniform.ViewSource#passModelView}, so what separates them from the
+	 * reference's separates them together: the hand's carries that pass's bob and Iris's stack does
+	 * not. {@code dev.vulture.render.EntityDraw.Element.modelView} carries the whole argument and
+	 * what it costs the image; it is written down as a divergence rather than closed, because the
+	 * answer that would close it is Iris's number against this engine's placement of the bob.
+	 *
+	 * @return whether the name was one this rewrites, false leaving it to the ordinary rename
+	 */
+	private boolean rewriteGameModelView(int index, String name) {
+		if (name.equals("gl_ModelViewMatrix")) {
+			this.tokens.inject(index, DRAW_MODEL_VIEW);
+		} else if (name.equals("modelViewMatrix")) {
+			// The one name here a pack may declare for itself, the {@code gl_} prefix being reserved,
+			// so the one that has to tell a use from a declaration. Without this the declarator is
+			// rewritten too and the unit reads "uniform mat4 (of_CameraBob * of_GameModelView);",
+			// which costs the whole family and says only that a program would not compile: this loop
+			// runs long before the uniforms are lifted, so nothing downstream would catch it.
+			// The declaration is left standing and lifted like any other; what it declares is then a
+			// member nobody reads, since every USE below has gone to the game's block.
+			if (declaring(index)) {
+				return false;
+			}
+
+			this.tokens.inject(index, DRAW_MODEL_VIEW);
+		} else if (name.equals("gl_ModelViewProjectionMatrix")) {
+			this.tokens.inject(index, "(of_ProjectionMatrix * " + DRAW_MODEL_VIEW + ")");
+			this.injectedNames.add("of_ProjectionMatrix");
+		} else {
+			return false;
+		}
+
+		this.injectedNames.add(LegacyGlsl.CAMERA_BOB);
+		this.injectedNames.add(LegacyGlsl.GAME_MODEL_VIEW);
+		this.gameModelView++;
+
+		return true;
+	}
+
+	/**
+	 * Whether the identifier at this position is being DECLARED rather than read: an identifier
+	 * straight after a built-in type name is being named, anywhere else it is being used.
+	 * <p>
+	 * It answers for the head of a declaration and for nothing else, where
+	 * {@link #collectDeclarations} reads the whole list. A pack writing
+	 * {@code uniform mat4 gbufferModelView, modelViewMatrix} would be told the second name is a
+	 * use, and the injection below would land on the declarator. No pack of the corpus writes the
+	 * shape, and closing it is not this method's alone: {@code declaredUnderAType} makes the same
+	 * first-name-only test for the block, so the two move together or neither does.
+	 */
+	private boolean declaring(int index) {
+		int before = this.tokens.significantBefore(index);
+
+		return before >= 0 && LegacyGlsl.TYPE_NAMES.contains(this.tokens.get(before).text());
+	}
+
+	private boolean rewriteFtransform(int index) {
+		int open = this.tokens.callOpener(index);
+		int close = this.tokens.matchingBracket(open);
+		if (close < 0 || this.tokens.significantAfter(open) != close) {
+			return false;
+		}
+
+		// A pass drawn from the camera takes the draw's model view here too, and it has to: this is
+		// the spelling the corpus really uses for a glint, and a pack writing ftransform() would
+		// otherwise get the pass's matrix back through the door rewriteGameModelView closed.
+		if (LegacyGlsl.readsDrawModelView(this.program)) {
+			this.tokens.inject(index, "(of_ProjectionMatrix * " + DRAW_MODEL_VIEW + " * of_Vertex)");
+			this.injectedNames.add("of_ProjectionMatrix");
+			this.injectedNames.add(LegacyGlsl.CAMERA_BOB);
+			this.injectedNames.add(LegacyGlsl.GAME_MODEL_VIEW);
+			this.gameModelView++;
+		} else {
+			this.tokens.inject(index, "(of_ModelViewProjectionMatrix * of_Vertex)");
+			this.injectedNames.add("of_ModelViewProjectionMatrix");
+		}
+
+		this.injectedNames.add("of_Vertex");
+		this.tokens.blank(open);
+		this.tokens.blank(close);
+
+		return true;
+	}
+
+	/** A sampler parameter, by the function taking it and its position in that function's list. */
+	private record SamplerParameter(String function, int position, Scoped scope) {
+	}
+
+	/**
+	 * One name that means something particular over the lines where it does. A uniform reaches the
+	 * end of the unit and a parameter stops at its own closing brace.
+	 * <p>
+	 * Lines and not token positions, because the passes that ask this insert tokens and shift every
+	 * index after them, and not one of them inserts a line break.
+	 */
+	private record Scoped(String name, int from, int to) {
+	}
+
+	/**
+	 * Puts the builtins back into the window the pack was written for: what
+	 * {@code gl_FragCoord} reports of the target being rasterised, and what {@code gl_FragDepth}
+	 * writes back into it.
+	 * <p>
+	 * <strong>A depth a lookup reads is not converted here, and that is the whole point.</strong> A
+	 * rewrite can only match the name of the sampler, and the name is not enough to decide by: Bliss
+	 * declares {@code BilateralUpscale_REUSE_Z(sampler2D tex1, sampler2D tex2, sampler2D depth, ...)}
+	 * and hands it {@code colortex12} at {@code composite1.fsh:987} and {@code depthtex0} two lines
+	 * below, both live in the same token stream. One of the two has to be converted and the other
+	 * must not, and the body cannot be written twice. So the images are served already converted
+	 * instead, which is what {@link dev.vulture.pack.target.SamplerPlan.Kind#DEPTH} binds, and every
+	 * lookup is right whatever it is reached through. {@link #countDepthLookup} keeps the two counts
+	 * that say how big the name rule's blind spot was.
+	 * <p>
+	 * Runs after {@link #rewriteIdentifiers} because it matches lookups by name and that is where
+	 * {@code texture2D} becomes {@code texture}.
+	 * <p>
+	 * Hardware comparison samplers are out of scope and cannot be done here at all: what comes back
+	 * from a {@code sampler2DShadow} is the result of a comparison the hardware already made, not a
+	 * depth, so the shadow map has to be written in the convention the comparison expects instead.
+	 * The legacy {@code shadow2D} calls are safe by construction, since they have already been
+	 * turned into {@code Kind#RAW} text that no later pass matches.
+	 */
+	private void convertDepth() {
+		List<Closing> closings = new ArrayList<>();
+		int[] lines = this.tokens.lineNumbers();
+
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.IDENTIFIER) {
+				continue;
+			}
+
+			// Above every skip below, and the bias is deliberate. A stage wrongly thought to write
+			// its own depth pays the early depth test and nothing else, since the wrapper then fills
+			// the mask from a value it wrote there itself; a stage wrongly thought not to fills the
+			// mask from a depth the attachment never received, and that is a picture.
+			if (this.stage == ProgramStage.FRAGMENT && token.identifier("gl_FragDepth")) {
+				this.namesFragDepth = true;
+			}
+
+			String directive = token.directive();
+			if (directive != null
+					&& (LegacyGlsl.OPAQUE_DIRECTIVES.contains(directive) || token.macroName())) {
+				continue;
+			}
+
+			// A pack that has taken one of these names for a macro of its own is left alone, both
+			// for what the macro body does and for what its uses do: the preprocessor owns them.
+			if (this.packMacros.contains(token.text())) {
+				continue;
+			}
+
+			if (LegacyGlsl.DEPTH_LOOKUPS.contains(token.text())) {
+				// The comparison first: what a comparison sampler hands back is not a depth, so it
+				// is neither rewritten as a lookup nor counted as one.
+				if (!rewriteShadowCompare(index, lines[index])) {
+					countDepthLookup(index, lines[index]);
+				}
+
+				continue;
+			}
+
+			if (this.stage != ProgramStage.FRAGMENT) {
+				continue;
+			}
+
+			if (token.identifier("gl_FragCoord")) {
+				convertFragCoord(index);
+			} else if (token.identifier("gl_FragDepth")) {
+				convertFragDepth(index, closings);
+			}
+		}
+
+		this.tokens.insertClosings(closings);
+	}
+
+	/**
+	 * Recognises a lookup on a comparison sampler, and on the arithmetic road puts
+	 * {@link #SHADOW_COMPARE} in its place.
+	 * <p>
+	 * <strong>On the hardware road nothing is rewritten at all.</strong> The declaration kept its
+	 * spelling, so the lookup compiles to a depth-reference sample and the comparison is made by
+	 * the sampler the binding put under the name, {@code GL_COMPARE_REF_TO_TEXTURE} in the terms
+	 * Iris binds it in. The call is still counted and still answers true, because whatever road
+	 * makes the comparison, what comes back is a fraction of the light and not a depth. Its LEVEL
+	 * is another pass's: {@link #pinLookupLevels} reaches such a call like any other, the hardware
+	 * working the level out from the derivatives of the coordinate here as it does for an ordinary
+	 * read.
+	 * <p>
+	 * The arithmetic road exists because {@code GpuSampler} carries no comparison at all: two
+	 * address modes, two filters, an anisotropy and a maximum level of detail. Bound as an ordinary
+	 * sampler the comparison means nothing, and what a pack gets back is not a wrong shadow but no
+	 * shadow information whatever, which reads on screen as a world entirely in shadow. On that
+	 * road only the plain lookups are rewritten; a projective or gathered comparison is left as it
+	 * stands and counted, since what it needs is a different expression, not a different name.
+	 *
+	 * @param line where the call stands, since a comparison sampler taken as a parameter only means
+	 *             one inside the function that took it
+	 * @return whether this call was a comparison, in which case it is not a depth read as well
+	 */
+	private boolean rewriteShadowCompare(int index, int line) {
+		if (this.comparisonSamplers.isEmpty() && this.hardwareComparisonSamplers.isEmpty()) {
+			return false;
+		}
+
+		int open = this.tokens.callOpener(index);
+		int first = open < 0 ? -1 : this.tokens.significantAfter(open);
+		if (first < 0 || this.tokens.get(first).kind() != Kind.IDENTIFIER) {
+			return false;
+		}
+
+		String argument = this.tokens.get(first).text();
+		if (hardwareComparisonAt(argument, line)) {
+			return true;
+		}
+
+		if (!comparisonAt(argument, line)) {
+			return false;
+		}
+
+		String name = this.tokens.get(index).text();
+		if (!COMPARABLE_LOOKUPS.contains(name)) {
+			this.unwrappedShadowCalls++;
+
+			return true;
+		}
+
+		// The name alone: the arguments of texture(sampler, vec3) are the arguments the comparison
+		// takes, so nothing has to be found or balanced, and the same holds of the other three
+		// shapes because the helper is written with an overload for each. A level is ignored, which
+		// is what a comparison sampler with no mipmaps would have done with it anyway; an OFFSET
+		// is not, and dropping one would turn a pack's neighbourhood of taps into the same tap
+		// taken over and over, which is a shadow with no filtering and looks like one that has it.
+		this.tokens.replace(index, SHADOW_COMPARE);
+		this.softRewrites++;
+
+		return true;
+	}
+
+	/**
+	 * Files one lookup on a depth texture under what its sampler is reached through. Nothing is
+	 * rewritten: both counts describe the source, and one of them is the reason the source is left
+	 * alone.
+	 * <p>
+	 * A name the plan classifies says what it reads and could be rewritten by name. A sampler the
+	 * enclosing function was handed says nothing at all, and no rule on names ever could tell those
+	 * apart: it is the same call for a colour target and for a depth. That count is what makes the
+	 * blind spot a number rather than a claim, and it is why the engine converts the image instead.
+	 * The lookups it does not reach either way, through a macro parameter or a local of some kind,
+	 * fall in neither count and are the reason the two are read together rather than differenced.
+	 */
+	private void countDepthLookup(int index, int line) {
+		int open = this.tokens.callOpener(index);
+		int first = open < 0 ? -1 : this.tokens.significantAfter(open);
+		if (first < 0 || this.tokens.get(first).kind() != Kind.IDENTIFIER) {
+			return;
+		}
+
+		String name = this.tokens.get(first).text();
+		if (SamplerPlan.classify(name) == SamplerPlan.Kind.DEPTH) {
+			this.depthLookups++;
+		} else if (scoped(this.samplerParameters, name, line)) {
+			this.parameterLookups++;
+		}
+	}
+
+	/**
+	 * Pins every lookup through a sampler bound without a mip chain to the base level of its image:
+	 * {@code texture(s, uv)} becomes {@code textureLod(s, uv, 0.0)}, a level the pack wrote out
+	 * becomes nought, and a bias or a pair of derivatives, which only ever chose a level, is
+	 * dropped.
+	 * <p>
+	 * <strong>What it restores is the reference's own filtering.</strong> Iris binds the three
+	 * depth textures nearest and never mipmapped ({@code IrisSamplers.addWorldDepthSamplers} and
+	 * {@code addCompositeSamplers}), the noise linear ({@code addNoiseSampler}), and a colour target
+	 * through the target's own sampler, linear or nearest as its format allows and mipmapped only
+	 * once a program's {@code colortexNMipmapEnabled} turned the chain on
+	 * ({@code CompositeRenderer.setupMipmapping}). Under OpenGL a minification filter without a
+	 * mipmap in its name never selects a level: whatever level of detail a lookup computes from its
+	 * derivatives, or carries as an argument, the base image answers it. Vulkan has no such filter.
+	 * Every sampler selects a level, and the one this engine binds where no chain exists is told to
+	 * stay within a quarter of a level of the base, which ought to come to the same thing.
+	 * Measured, it does not: AstraLex marches a reflection ray across {@code depthtex1} in its
+	 * translucent pass, thirty steps with a {@code break}, reading the depth with {@code texture}
+	 * at a coordinate each step computes, and what came back on some of those steps was not the
+	 * depth, so the ray landed on a pixel it never reached and every glass pane of a village
+	 * bloomed a saturated blue over its wall, on some frames and not others. The same read at an
+	 * explicit level of nought came back right on every frame, as its first composite's re-read of
+	 * the depth at a refracted coordinate did. Whether it is the derivatives of a coordinate made
+	 * under a divergent branch or the clamp itself that the driver answers with something other
+	 * than the base is the driver's to know. Pinning the level is what the reference's filter
+	 * amounts to, and it is decidable here, from the text.
+	 * <p>
+	 * <strong>Which lookups.</strong> In a program drawn over the screen, every sampler declared at
+	 * file scope that the program asks no chain for, the request being read off the same
+	 * {@code colortexNMipmapEnabled} directives {@code TargetDirectives} reads; in a geometry
+	 * program, the names the engine serves out of a colour target, a depth, the noise or the shadow
+	 * map, and never the atlas or a material map, which carry chains and are read through them.
+	 * The shadow map's samplers are pinned with the rest, and one read of them is not: a lookup that
+	 * WROTE its own level on an image the pack asked for a chain on keeps what it wrote, which is
+	 * {@link #keepsWrittenLevel}. That is narrower than the exemption a colour target gets, and the
+	 * reason it has to be is in that method. A sampler a
+	 * function takes as a parameter has no name to classify, as {@link #countDepthLookup} says,
+	 * so its call sites are read instead: the parameter is pinned when every call of its function
+	 * hands it a sampler already pinned or a parameter already proven, and outright, call sites
+	 * unread, in a program drawn over the screen that asks for no chain at all, since every image
+	 * such a parameter could stand for is read at the base there. A parameter one call hands
+	 * something else, or one that some macro calls its function through, is left as it stood and
+	 * its lookups counted. A name the pack made a macro of is left to the preprocessor, and a
+	 * rectangle, buffer or multisample sampler has no levelled lookup to pin.
+	 * <p>
+	 * <strong>A comparison read is pinned with the rest, and it is the one this pass was missing.</strong>
+	 * Where {@link #rewriteShadowCompare} sent the lookup to the arithmetic, there is nothing left
+	 * to pin: what it wrote gathers four texels, and a gather names no level. Where the comparison
+	 * stayed on the sampler the lookup compiles to a depth-reference sample, whose level the
+	 * hardware works out from the derivatives of the coordinate exactly as an ordinary read's, so it
+	 * is the same undefined read under a loop or a branch, and the shadow map is where a pack
+	 * computes its coordinate the most. The comparison sampler's own ceiling of nought is not the
+	 * answer to it: an equal ceiling on the ordinary samplers is what was measured not to hold, and
+	 * it is why this pass exists. {@link #LEVELLED_SHADOW_SHAPES} says which shapes can be written
+	 * that way at all.
+	 * <p>
+	 * A pack image laid over the name of a colour target is classified as the target in a geometry
+	 * program, since only the binding knows the difference, and is pinned with it; nothing fills a
+	 * chain on such an image either, so it reads the same.
+	 */
+	private void pinLookupLevels() {
+		if (this.stage != ProgramStage.FRAGMENT || this.program.isEmpty()) {
+			return;
+		}
+
+		boolean fullScreen = fullScreenPass();
+		Set<String> chained = chainedSamplers();
+		Set<String> pinned = new HashSet<>();
+		for (Map.Entry<String, String> sampler : this.samplers.entrySet()) {
+			String name = sampler.getKey();
+			if (chained.contains(name) || !levelled(sampler.getValue())) {
+				continue;
+			}
+
+			if (fullScreen || servedOutOfATarget(name)) {
+				pinned.add(name);
+			}
+		}
+
+		Set<Scoped> proven = provenParameters(pinned, fullScreen && chained.isEmpty());
+		int[] lines = this.tokens.lineNumbers();
+		List<Closing> levels = new ArrayList<>();
+
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.IDENTIFIER || token.directive() != null || token.macroName()
+					|| !LegacyGlsl.LEVELLED_LOOKUPS.contains(token.text())
+					|| this.packMacros.contains(token.text())) {
+				continue;
+			}
+
+			int open = this.tokens.callOpener(index);
+			int close = this.tokens.matchingBracket(open);
+			int first = this.tokens.significantAfter(open);
+			if (close < 0 || first < 0 || this.tokens.get(first).kind() != Kind.IDENTIFIER) {
+				continue;
+			}
+
+			String name = this.tokens.get(first).text();
+			int line = lines[index];
+			// The arithmetic road only. What it left standing reads through a sampler this class
+			// has already declared ordinary, over a coordinate that still carries the reference to
+			// compare against, and no explicit-level form takes that pair. A comparison kept on the
+			// sampler is pinned like anything else below.
+			if (this.packMacros.contains(name) || comparisonAt(name, line)) {
+				continue;
+			}
+
+			// The parameter first, because a function may name one after a sampler of the file's
+			// and mean its own inside its body.
+			if (scoped(this.samplerParameters, name, line)) {
+				if (!scoped(proven, name, line)) {
+					this.unpinnedParameterLookups++;
+					continue;
+				}
+			} else if (!pinned.contains(name)) {
+				continue;
+			} else if (writesItsOwnLevel(token.text()) && keepsWrittenLevel(name)) {
+				// Inside this branch and not after it, so that it can only ever reach a name the
+				// FILE declares. A parameter spelled after one of the map's names is bound to
+				// whatever its call sites hand it, which may be a target with one level, and the
+				// name would say otherwise.
+				continue;
+			}
+
+			if (pinLookup(index, open, close, levels)) {
+				this.pinnedLookups++;
+			}
+		}
+
+		this.tokens.insertClosings(levels);
+	}
+
+	/**
+	 * The sampler parameters every call site of whose function hands a sampler read at the base:
+	 * a pinned name of the file, or a parameter already proven the same way, until nothing more
+	 * can be proven. On that road a function nothing calls proves nothing, and a call whose
+	 * argument is anything else, an expression, a macro, a name nothing classifies, keeps its
+	 * parameter out.
+	 *
+	 * @param all whether every parameter of a levelled type is proven outright, call sites unread,
+	 *            which is the case of a program drawn over the screen asking for no chain
+	 */
+	private Set<Scoped> provenParameters(Set<String> pinned, boolean all) {
+		Set<Scoped> proven = new LinkedHashSet<>();
+		if (all) {
+			for (Scoped parameter : this.samplerParameters) {
+				if (!this.unlevelledParameters.contains(parameter)) {
+					proven.add(parameter);
+				}
+			}
+
+			return proven;
+		}
+
+		// One walk that records where each of these functions is named, rather than a walk of the
+		// whole token list per parameter and per round. The rounds are bounded by the number of
+		// parameters, each one proving at least one or ending the loop, so a stage taking a
+		// hundred samplers as parameters walked its few hundred thousand tokens a hundred times.
+		List<SamplerParameter> waiting = new ArrayList<>();
+		Set<String> functions = new HashSet<>();
+		for (SamplerParameter parameter : this.typedParameters) {
+			if (!this.unlevelledParameters.contains(parameter.scope())) {
+				waiting.add(parameter);
+				functions.add(parameter.function());
+			}
+		}
+
+		Map<String, List<Integer>> sites = sitesOf(functions);
+		int[] lines = this.tokens.lineNumbers();
+		boolean grew = true;
+		while (grew) {
+			grew = false;
+			for (Iterator<SamplerParameter> pending = waiting.iterator(); pending.hasNext(); ) {
+				SamplerParameter parameter = pending.next();
+				if (proven.contains(parameter.scope())) {
+					pending.remove();
+					continue;
+				}
+
+				if (!callsHandOver(parameter, pinned, proven, lines,
+						sites.getOrDefault(parameter.function(), List.of()))) {
+					continue;
+				}
+
+				proven.add(parameter.scope());
+				pending.remove();
+				grew = true;
+			}
+		}
+
+		return proven;
+	}
+
+	/** Where each of these names is written, in the order the tokens run. */
+	private Map<String, List<Integer>> sitesOf(Set<String> names) {
+		Map<String, List<Integer>> found = new HashMap<>();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() == Kind.IDENTIFIER && names.contains(token.text())) {
+				found.computeIfAbsent(token.text(), _ -> new ArrayList<>()).add(index);
+			}
+		}
+
+		return found;
+	}
+
+	/**
+	 * Whether every call of this parameter's function hands it a sampler read at the base, and
+	 * there is at least one call. A definition or a prototype of the function is told from a call
+	 * by what precedes the name, a builtin type or {@code void}; anything else, an operator, a
+	 * keyword, a struct's name, is read as a call, and a definition read that way refuses the
+	 * parameter, its declaration being no sampler's name. A function named on a preprocessor line
+	 * is called from wherever that macro is used, which no scan of the tokens can see, so such a
+	 * function proves nothing.
+	 *
+	 * @param sites every place the function is named, in the order the tokens run, which is what
+	 *              this used to walk the whole list for
+	 */
+	private boolean callsHandOver(SamplerParameter parameter, Set<String> pinned,
+			Set<Scoped> proven, int[] lines, List<Integer> sites) {
+		boolean called = false;
+		for (int index : sites) {
+			Token token = this.tokens.get(index);
+			if (token.directive() != null) {
+				return false;
+			}
+
+			int open = this.tokens.callOpener(index);
+			int before = this.tokens.significantBefore(index);
+			if (open < 0 || (before >= 0 && this.tokens.get(before).kind() == Kind.IDENTIFIER
+					&& returnsAType(this.tokens.get(before).text()))) {
+				continue;
+			}
+
+			int close = this.tokens.matchingBracket(open);
+			if (close < 0) {
+				return false;
+			}
+
+			List<Integer> commas = topLevelCommas(open, close);
+			if (commas.size() < parameter.position()) {
+				return false;
+			}
+
+			int start = parameter.position() == 0 ? open : commas.get(parameter.position() - 1);
+			int end = commas.size() > parameter.position() ? commas.get(parameter.position()) : close;
+			int argument = this.tokens.significantAfter(start);
+			if (argument < 0 || this.tokens.significantAfter(argument) != end
+					|| this.tokens.get(argument).kind() != Kind.IDENTIFIER) {
+				return false;
+			}
+
+			String name = this.tokens.get(argument).text();
+			int line = lines[argument];
+			boolean handed = scoped(this.samplerParameters, name, line)
+					? scoped(proven, name, line)
+					: pinned.contains(name);
+			if (!handed) {
+				return false;
+			}
+
+			called = true;
+		}
+
+		return called;
+	}
+
+	/** Whether a function name preceded by this word is a definition rather than a call. */
+	private static boolean returnsAType(String word) {
+		return LegacyGlsl.TYPE_NAMES.contains(word);
+	}
+
+	/**
+	 * The samplers this program asks a chain for, under the names it declares them by: the targets
+	 * its {@code colortexNMipmapEnabled} directives name, whatever spelling the sampler took. Read
+	 * the way {@code TargetDirectives} reads them, on the live lines of this unit and the last
+	 * declaration winning.
+	 * <p>
+	 * The shadow map is NOT in here, whatever its own directives say, and that is deliberate: a
+	 * name in this set escapes the pin entirely, undirected reads included, which would hand the
+	 * map's lookups back the implicit level this pass exists to take away. What the map gets
+	 * instead is the narrower exemption {@link #keepsWrittenLevel} describes, and the two are not
+	 * interchangeable.
+	 */
+	private Set<String> chainedSamplers() {
+		Set<Integer> targets = new HashSet<>();
+		for (ConstDirectives.Directive directive : ConstDirectives.read(this.unit)) {
+			boolean on = directive.value().equals("true");
+			if (!directive.type().equals("bool") || !(on || directive.value().equals("false"))) {
+				continue;
+			}
+
+			Optional<TargetName.Suffixed> split = TargetName.split(directive.name());
+			if (split.isPresent() && split.get().suffix().equals(MIPMAP_SUFFIX)) {
+				if (on) {
+					targets.add(split.get().index());
+				} else {
+					targets.remove(split.get().index());
+				}
+			}
+		}
+
+		Set<String> chained = new HashSet<>();
+		for (String name : this.samplers.keySet()) {
+			OptionalInt index = TargetName.index(name);
+			if (index.isPresent() && targets.contains(index.getAsInt())) {
+				chained.add(name);
+			}
+		}
+
+		return chained;
+	}
+
+	/**
+	 * Whether this lookup already carries a level of its own, as opposed to one the hardware would
+	 * work out from the derivatives of its coordinate.
+	 * <p>
+	 * The two are not the same read at all, and this pass has only ever been about the second: the
+	 * defect it exists for is a level computed under divergent flow, and a literal or an expression
+	 * the pack wrote is computed by nobody.
+	 */
+	private static boolean writesItsOwnLevel(String lookup) {
+		return lookup.equals("textureLod") || lookup.equals("textureLodOffset");
+	}
+
+	/**
+	 * Whether a lookup that wrote its own level on this name keeps it.
+	 * <p>
+	 * The shadow map alone, and only where the pack asked for a chain on every image the name could
+	 * read. Pinning such a read was never about the driver: the pack handed a level and the pass
+	 * overwrote it with nought, which was the right answer only while the map carried one level.
+	 * With a chain under it, that rewrite is the engine deciding a pack's filter width for it, and
+	 * iterationT is the pack it decided for, asking for {@code log2(shadowMapResolution / 512)} and
+	 * being served the full size map.
+	 * <p>
+	 * Every image the name could read, and not the one it probably reads. {@code shadowtex0},
+	 * {@code shadowtex0HW} and {@code watershadow} are the first, {@code shadowtex1} and
+	 * {@code shadowtex1HW} the second: those five are fixed, whatever else the program declares.
+	 * The bare {@code shadow} is the one that moves, and it is the PROGRAM that moves it, being the
+	 * first image unless some stage also declares {@code watershadow} and the second when one does
+	 * ({@code samplers/IrisSamplers.java:145-152} on the 26.2 branch). This class sees one unit
+	 * where the binding folds the stages together, so the two can disagree about that one name: it
+	 * is admitted only where both images carry a chain, which is where the disagreement cannot
+	 * change the answer.
+	 * <p>
+	 * Undirected reads on those same names stay pinned, which is a divergence from Iris and the one
+	 * this pass already owed: there a mipmapped shadow sampler lets an ordinary {@code texture} call
+	 * pick its own level, and here it reads the base. Serving that would put the map back on the
+	 * exact read this driver renders wrong, so it waits for the day that defect is closed.
+	 */
+	private boolean keepsWrittenLevel(String name) {
+		if (SamplerPlan.classify(name) != SamplerPlan.Kind.SHADOW_DEPTH) {
+			return false;
+		}
+
+		if (name.equals("shadow")) {
+			return shadowChainZero && shadowChainOne;
+		}
+
+		return SamplerPlan.withoutTranslucents(name, false) ? shadowChainOne : shadowChainZero;
+	}
+
+	/**
+	 * Whether a name is one the engine binds an image of its own under in every family: a colour
+	 * target, a depth of the world or of the far terrain, the noise, or the shadow map's depth and
+	 * colour. It says the name is a candidate for pinning in a geometry program, and no more; a
+	 * colour target is taken back out by the caller's set of chained samplers, and one read of the
+	 * shadow map by {@link #keepsWrittenLevel}.
+	 */
+	private static boolean servedOutOfATarget(String name) {
+		return switch (SamplerPlan.classify(name)) {
+			case COLORTEX, DEPTH, NOISE, DISTANT_DEPTH, SHADOW_DEPTH, SHADOW_COLOUR -> true;
+			default -> false;
+		};
+	}
+
+	/**
+	 * Whether a sampler declared so has a level to pin. A rectangle, a buffer and a multisample
+	 * image have one level and no lookup that takes one, and a comparison sampler has one only in
+	 * the shapes {@link #LEVELLED_SHADOW_SHAPES} names.
+	 *
+	 * @param declaration the type alone, or the declaration {@link #liftUniforms} recorded, which
+	 *                    is the type followed by the name
+	 */
+	private static boolean levelled(String declaration) {
+		for (String word : declaration.split(" ", -1)) {
+			String shape = SamplerTypes.shapeOf(word);
+			if (shape != null) {
+				return !shape.contains("Rect") && !shape.contains("Buffer") && !shape.contains("MS")
+						&& (!shape.endsWith(SHADOW_SHAPE)
+								|| LEVELLED_SHADOW_SHAPES.contains(shape));
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * One lookup onto the base level, in whichever spelling it was written, or false for a call
+	 * with fewer arguments than its spelling takes, which the compiler will name for itself.
+	 *
+	 * @param levels where the literal goes when it is a new argument rather than a replaced one,
+	 *               applied once the scan is over so that no index moves under it
+	 */
+	private boolean pinLookup(int index, int open, int close, List<Closing> levels) {
+		List<Integer> commas = topLevelCommas(open, close);
+		String directive = this.tokens.get(index).directive();
+
+		switch (this.tokens.get(index).text()) {
+			case "texture", "textureGrad" -> {
+				if (commas.isEmpty()) {
+					return false;
+				}
+
+				// The bias of the one and the two derivatives of the other are what the level was
+				// computed from, and the level is a literal now.
+				this.tokens.replace(index, "textureLod");
+				dropArgumentsFrom(commas, 2, close);
+				levels.add(new Closing(close, ", " + BASE_LEVEL, directive));
+			}
+			case "textureOffset" -> {
+				if (commas.size() < 2) {
+					return false;
+				}
+
+				this.tokens.replace(index, "textureLodOffset");
+				dropArgumentsFrom(commas, 3, close);
+				levels.add(new Closing(commas.get(1), ", " + BASE_LEVEL, directive));
+			}
+			case "textureGradOffset" -> {
+				if (commas.size() != 4) {
+					return false;
+				}
+
+				// The two derivatives make way for the literal and the offset stays where it is.
+				this.tokens.replace(index, "textureLodOffset");
+				setArgument(commas, 2, close, BASE_LEVEL);
+				dropArgument(commas, 3, close);
+			}
+			default -> {
+				if (commas.size() < 2) {
+					return false;
+				}
+
+				setArgument(commas, 2, close, BASE_LEVEL);
+			}
+		}
+
+		return true;
+	}
+
+	/** The commas that separate a call's arguments, and none of the ones nested inside them. */
+	private List<Integer> topLevelCommas(int open, int close) {
+		List<Integer> commas = new ArrayList<>();
+		int depth = 0;
+
+		for (int scan = open + 1; scan < close; scan++) {
+			Token token = this.tokens.get(scan);
+			if (token.kind() != Kind.OPERATOR) {
+				continue;
+			}
+
+			if (token.operator("(") || token.operator("[") || token.operator("{")) {
+				depth++;
+			} else if (token.operator(")") || token.operator("]") || token.operator("}")) {
+				depth--;
+			} else if (depth == 0 && token.operator(",")) {
+				commas.add(scan);
+			}
+		}
+
+		return commas;
+	}
+
+	/** Blanks the argument at this position, counted from nought, and every one after it. */
+	private void dropArgumentsFrom(List<Integer> commas, int at, int close) {
+		if (commas.size() >= at) {
+			this.tokens.blankRange(commas.get(at - 1), close - 1);
+		}
+	}
+
+	/** Blanks the argument at this position alone, counted from nought, with the comma before it. */
+	private void dropArgument(List<Integer> commas, int at, int close) {
+		int end = commas.size() > at ? commas.get(at) - 1 : close - 1;
+		this.tokens.blankRange(commas.get(at - 1), end);
+	}
+
+	/** Puts a literal in place of the argument at this position, counted from nought. */
+	private void setArgument(List<Integer> commas, int at, int close, String text) {
+		int first = this.tokens.significantAfter(commas.get(at - 1));
+		int end = commas.size() > at ? commas.get(at) - 1 : close - 1;
+		this.tokens.blankRange(commas.get(at - 1) + 1, end);
+		this.tokens.inject(first, text);
+	}
+
+	/**
+	 * {@code gl_FragCoord.z} is the window depth the rasteriser produced, so it is in the target's
+	 * convention and asks the same question a depth lookup does, with the same answer.
+	 * <p>
+	 * The component is demanded rather than the vector wrapped. The corpus reads {@code .xy} three
+	 * hundred and forty six times, {@code .x} a hundred and forty eight and {@code .y} a hundred
+	 * and forty three, none of which is a depth, and wrapping the vector would quietly corrupt
+	 * every one of them.
+	 */
+	private void convertFragCoord(int index) {
+		int dot = this.tokens.significantAfter(index);
+		int swizzle = dot >= 0 && this.tokens.get(dot).operator(".")
+				? this.tokens.significantAfter(dot)
+				: -1;
+		if (swizzle < 0 || this.tokens.get(swizzle).kind() != Kind.IDENTIFIER) {
+			// Reached some other way, a subscript or a whole vector handed to a function. Nothing
+			// in the corpus does it, and a pack that starts has to be visible rather than wrong.
+			this.fragCoordUnhandled++;
+			return;
+		}
+
+		String field = this.tokens.get(swizzle).text();
+		if (field.equals("z")) {
+			this.tokens.inject(index, "(" + DEPTH_CONV + ".z * gl_FragCoord.z + " + DEPTH_CONV + ".w)");
+			this.fragCoordZ++;
+		} else if (field.equals("xyz")) {
+			// Two screen components that convert to nothing and one depth that does not, so the
+			// vector has to be rebuilt. Seven sites, all in gbuffers.
+			this.tokens.inject(index, "vec3(gl_FragCoord.xy, " + DEPTH_CONV + ".z * gl_FragCoord.z + "
+					+ DEPTH_CONV + ".w)");
+			this.fragCoordXyz++;
+		} else {
+			if (namesDepth(field)) {
+				this.fragCoordUnhandled++;
+			}
+
+			return;
+		}
+
+		this.tokens.blank(dot);
+		this.tokens.blank(swizzle);
+		takeDepthConv();
+	}
+
+	/** Whether a swizzle reaches the third component, under any of the three sets of names. */
+	private static boolean namesDepth(String field) {
+		return field.indexOf('z') >= 0 || field.indexOf('b') >= 0 || field.indexOf('p') >= 0;
+	}
+
+	/**
+	 * A write, so the inverse of what a read does. The pack produces a legacy window depth and the
+	 * hardware wants one in the target's convention, {@code d = (v - readB) / readA}; that inverse
+	 * is spelled with the same expression as the read because {@code readA * x + readB} is an
+	 * involution for both conventions, {@code readA} being one or minus one and {@code readB} nought
+	 * or one either way. It is the only reason no division appears here.
+	 * <p>
+	 * If a third convention ever arrives with {@code |readA| != 1}, this site is the one that has to
+	 * become {@code (v - of_DepthConv.w) / of_DepthConv.z}; the reads stay as they are.
+	 */
+	private void convertFragDepth(int index, List<Closing> closings) {
+		if (this.tokens.get(index).directive() != null) {
+			// The end of the statement is where the closing goes, and a macro body has no
+			// semicolon of its own: the search would run into the next statement and put the
+			// bracket in someone else's code.
+			this.fragDepthUnhandled++;
+			return;
+		}
+
+		int eq = this.tokens.significantAfter(index);
+		int after = this.tokens.significantAfter(eq);
+		boolean assignment = eq >= 0 && this.tokens.get(eq).operator("=")
+				&& (after < 0 || !this.tokens.get(after).operator("="));
+		int end = assignment ? this.tokens.statementEnd(eq) : -1;
+		if (end < 0) {
+			// Anything but a plain assignment ending in a semicolon. A compound one reads the
+			// value back before writing it and a fragment stage has no readable depth to start
+			// from, so there is nothing here that a rewrite at this site could mean. Counted
+			// rather than guessed at: the corpus has none of either.
+			this.fragDepthUnhandled++;
+			return;
+		}
+
+		// The pack's expression is parenthesised, which is not decoration: the right hand side may
+		// be a ternary, and multiplying into one without brackets changes what it means.
+		String directive = this.tokens.get(eq).directive();
+		this.tokens.inject(eq, "= (" + DEPTH_CONV + ".z * (");
+		closings.add(new Closing(end, ") + " + DEPTH_CONV + ".w)", directive));
+		takeDepthConv();
+		this.fragDepthWrites++;
+	}
+
+	/**
+	 * Asks for the conversion, which is only ever asked for by a rewrite that has just emitted a
+	 * use of it. A member declared and never read still occupies its place in the block of every
+	 * program of the pack, and the block is the layout.
+	 */
+	private void takeDepthConv() {
+		record(this.blockMembers, DEPTH_CONV, "vec4 " + DEPTH_CONV);
+		this.injectedNames.add(DEPTH_CONV);
+	}
+
+	private void takeTexShrink() {
+		record(this.blockMembers, TEX_SHRINK, "vec2 " + TEX_SHRINK);
+		this.injectedNames.add(TEX_SHRINK);
+	}
+
+	/**
+	 * The colour a sky pass is modulated by, asked for by the one prologue that folds a uniform into
+	 * {@code of_Color}.
+	 * <p>
+	 * Asked for HERE and not left to the collector, for the reason every injected member is: the
+	 * collector walks the body, and this name appears only in a line the header prints, so nothing
+	 * in the body would ever ask for it and the stage would name an identifier the block has not
+	 * got.
+	 */
+	private void takePassColour() {
+		record(this.blockMembers, PASS_COLOUR, "vec4 " + PASS_COLOUR);
+		this.injectedNames.add(PASS_COLOUR);
+	}
+
+	/**
+	 * {@code const} on a variable demands a compile-time constant under Vulkan, and OpenGL drivers
+	 * accepted a lot that is not one: {@code transpose} of a matrix literal, a constructor from a
+	 * uniform, {@code normalize} of a vector the pack treated as immutable. The keyword is the lie,
+	 * not the value, so it comes off and the declaration stays.
+	 * <p>
+	 * An array size still needs a real constant, so a declaration whose initialiser is only literals
+	 * and type constructors is left alone. Parameters keep {@code const}: that spelling means
+	 * immutable, not compile-time, and the language allows it.
+	 * <p>
+	 * A name the unit {@code #define}s is judged by what it stands for, and it has to be both ways:
+	 * this pass reads tokens, the macro is expanded later by the compiler, and what stands here is a
+	 * name where the compiler will see the body. Mellow builds its outline offsets out of
+	 * {@code OUTLINE_THICKNESS}, a constructor multiplied by it four times over, and hands the
+	 * array to {@code textureGatherOffsets}, which takes nothing but a constant expression: that
+	 * macro stands for a number, so the keyword stays, and read as non-constant the keyword came
+	 * off a declaration that was constant all along and one fullscreen pass of the pack would not
+	 * compile. Photon writes its fog colours through {@code from_srgb}, a macro over {@code pow}
+	 * and a matrix this very pass demotes: judged by the macro's name alone the keyword stayed, the
+	 * compiler refused what the name stood for, and a pack one of whose passes does not compile
+	 * draws nothing at all.
+	 */
+	private void demoteNonConstantInitialisers() {
+		int parens = 0;
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.directive() != null) {
+				continue;
+			}
+
+			if (token.operator("(")) {
+				parens++;
+				continue;
+			}
+
+			if (token.operator(")")) {
+				parens--;
+				continue;
+			}
+
+			if (parens != 0 || !token.identifier("const")) {
+				continue;
+			}
+
+			int end = this.tokens.statementEnd(index);
+			if (end >= 0 && nonConstantInitialiser(index, end)) {
+				this.tokens.blank(index);
+			}
+		}
+	}
+
+	/**
+	 * Whether this {@code const} declaration assigns something Vulkan will not take as a constant
+	 * expression: any identifier {@link #constantName} does not vouch for.
+	 */
+	private boolean nonConstantInitialiser(int keyword, int end) {
+		boolean seenEquals = false;
+		for (int scan = keyword; scan <= end; scan++) {
+			Token token = this.tokens.get(scan);
+			if (token.operator("=")) {
+				seenEquals = true;
+				continue;
+			}
+
+			if (!seenEquals || token.kind() != Kind.IDENTIFIER) {
+				continue;
+			}
+
+			if (!constantName(token.text(), new HashSet<>())) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Whether this name is taken as constant inside an initialiser: a type constructor, or a macro
+	 * of the pack whose replacement text names nothing but those. A macro is read through because
+	 * it is gone by the time the compiler judges the line, and a call or another global inside it
+	 * counts exactly as it would written out. That is the coarseness of the rule above and not the
+	 * compiler's: the compiler folds a builtin over literals and keeps the keyword, and what it
+	 * refuses is a global this very pass demoted, which a macro is one way of naming. Reverie
+	 * writes ten colours through a macro over {@code mix}, {@code pow} and {@code step}, and they
+	 * lose a keyword the compiler would have kept, at no cost to the image.
+	 */
+	private boolean constantName(String name, Set<String> path) {
+		if (LegacyGlsl.TYPE_NAMES.contains(name)) {
+			return true;
+		}
+
+		if (!this.packMacros.contains(name)) {
+			return false;
+		}
+
+		Boolean judged = this.macroConstant.get(name);
+		if (judged != null) {
+			return judged;
+		}
+
+		// A macro naming itself is not expanded again by the preprocessor either.
+		if (path.contains(name)) {
+			return true;
+		}
+
+		// A chain of names is bounded as PreprocessorExpression bounds its own: a pack is
+		// downloaded content, and the overflow is an error nothing above here catches. Past the
+		// bound the name counts as non-constant, which costs the keyword and nothing else.
+		if (path.size() >= MAX_MACRO_HOPS) {
+			return false;
+		}
+
+		path.add(name);
+		try {
+			boolean constant = true;
+			for (String inside : this.macroBodies.getOrDefault(name, Set.of())) {
+				if (!constantName(inside, path)) {
+					constant = false;
+					break;
+				}
+			}
+
+			this.macroConstant.put(name, constant);
+
+			return constant;
+		} finally {
+			path.remove(name);
+		}
+	}
+
+	/**
+	 * Precision qualifiers mean nothing on the desktop, but two declarations of one function that
+	 * disagree about them are still a mismatch, which is a failure the packs hit and cannot see.
+	 */
+	private void dropPrecision() {
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.IDENTIFIER || token.directive() != null) {
+				continue;
+			}
+
+			if (LegacyGlsl.PRECISION_QUALIFIERS.contains(token.text())) {
+				this.tokens.blank(index);
+				continue;
+			}
+
+			if (!token.identifier("precision")) {
+				continue;
+			}
+
+			int qualifier = this.tokens.significantAfter(index);
+			if (qualifier >= 0
+					&& LegacyGlsl.PRECISION_QUALIFIERS.contains(this.tokens.get(qualifier).text())) {
+				int end = this.tokens.statementEnd(index);
+				if (end >= 0) {
+					this.tokens.blankRange(index, end);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Counts writes from every branch, taken or not, which makes the number of outputs an upper
+	 * bound rather than the truth. That is deliberate and it was measured: restricting the count
+	 * to branches the expander took cost four units of Sildur's, where the only write to output
+	 * zero sits on a line the expander read as dead and the compiler read as live. Declaring an
+	 * output nothing writes costs a location; failing to declare one that is written costs the
+	 * program. Which attachment each output actually reaches is in {@code drawBuffers}, not here.
+	 */
+	private void rewriteFragmentOutputs() {
+		if (this.stage != ProgramStage.FRAGMENT) {
+			return;
+		}
+
+		boolean fragColor = false;
+
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.IDENTIFIER) {
+				continue;
+			}
+
+			if (token.identifier("gl_FragColor")) {
+				this.tokens.inject(index, "ofFragData0");
+				fragColor = true;
+				continue;
+			}
+
+			if (!token.identifier("gl_FragData")) {
+				continue;
+			}
+
+			int slot = literalIndexAfter(index);
+			if (slot < 0) {
+				// An index no one can read at translation time. Declaring an output for it would
+				// mean declaring the lot, and writing the ones a pack never touches is not free,
+				// so this is counted and left to fail loudly.
+				this.dynamicFragData++;
+				continue;
+			}
+
+			int open = this.tokens.significantAfter(index);
+			int number = this.tokens.significantAfter(open);
+			this.tokens.inject(index, "ofFragData" + slot);
+			this.tokens.blank(open);
+			this.tokens.blank(number);
+			this.tokens.blank(this.tokens.significantAfter(number));
+			this.maxFragmentOutput = Math.max(this.maxFragmentOutput, slot);
+			this.legacySlotZero |= slot == 0;
+		}
+
+		if (fragColor) {
+			this.maxFragmentOutput = Math.max(this.maxFragmentOutput, 0);
+			this.legacySlotZero = true;
+		}
+	}
+
+	/** The subscript of {@code gl_FragData[n]} when it is a literal in range, otherwise -1. */
+	private int literalIndexAfter(int index) {
+		int open = this.tokens.significantAfter(index);
+		if (open < 0 || !this.tokens.get(open).operator("[")) {
+			return -1;
+		}
+
+		int number = this.tokens.significantAfter(open);
+		if (number < 0 || this.tokens.get(number).kind() != Kind.NUMBER) {
+			return -1;
+		}
+
+		int close = this.tokens.significantAfter(number);
+		if (close < 0 || !this.tokens.get(close).operator("]")) {
+			return -1;
+		}
+
+		String text = this.tokens.get(number).text();
+		if (text.length() > 2 || !text.chars().allMatch(Character::isDigit)) {
+			return -1;
+		}
+
+		int slot = Integer.parseInt(text);
+
+		return slot < MAX_FRAGMENT_OUTPUTS ? slot : -1;
+	}
+
+	/** One fragment output the pack declared for itself, once its declaration has been moved. */
+	record Output(String name, String type) {
+	}
+
+	/**
+	 * Moves the outputs a pack declares for itself up into the header, next to the ones this
+	 * translation declares, so that the whole set is written in one place and in one order.
+	 * <p>
+	 * Half the corpus takes this road rather than {@code gl_FragData}: two hundred and forty three
+	 * fragment stages of the eight packs declare their own outputs, all of them with a location
+	 * they wrote themselves, and none of them mixing the two ways. Reverie's translucent stages are
+	 * where it costs something, since they name {@code Albedo}, {@code buf1}, {@code buf2} and
+	 * {@code Shadow} and write the fourth before the second.
+	 * <p>
+	 * Only a live line is moved, for the reason {@link #liftUniforms} gives about uniforms: a
+	 * declaration in a branch nobody takes would become unconditional on the way up. A declaration
+	 * this refuses simply stays where it stands, which is what happens today, so the refusal costs
+	 * the ordering and nothing else.
+	 */
+	private void liftFragmentOutputs() {
+		if (this.stage != ProgramStage.FRAGMENT) {
+			return;
+		}
+
+		int[] lines = this.tokens.lineNumbers();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (!token.identifier("out") || token.directive() != null) {
+				continue;
+			}
+
+			if (this.unit.isLive(lines[index]) && opensDeclaration(index)) {
+				liftOutput(index);
+			}
+		}
+
+		for (int location : this.packOutputs.keySet()) {
+			this.maxFragmentOutput = Math.max(this.maxFragmentOutput, location);
+		}
+	}
+
+	/**
+	 * Whether this {@code out} opens a declaration rather than qualifying a function parameter.
+	 * Told apart by what stands before it: a parameter follows the opening parenthesis or a comma,
+	 * a declaration follows the end of the last one or a layout qualifier.
+	 */
+	private boolean opensDeclaration(int index) {
+		int before = this.tokens.significantBefore(index);
+		if (before < 0) {
+			return true;
+		}
+
+		Token token = this.tokens.get(before);
+
+		return token.operator(";") || token.operator("}") || token.operator(")");
+	}
+
+	private void liftOutput(int keyword) {
+		int start = this.tokens.statementStart(keyword);
+		int end = this.tokens.statementEnd(keyword);
+		if (start < 0 || end < 0) {
+			return;
+		}
+
+		List<Integer> parts = this.tokens.significantRange(start, end);
+		int cursor = parts.indexOf(keyword);
+
+		// A type, one declarator and the semicolon, and nothing else. A pack that declares two
+		// outputs in one statement, or an array, or a type this cannot name, keeps its declaration
+		// where it wrote it rather than having it guessed at.
+		if (cursor < 0 || parts.size() != cursor + 4) {
+			return;
+		}
+
+		String type = this.tokens.get(parts.get(cursor + 1)).text();
+		Token name = this.tokens.get(parts.get(cursor + 2));
+		if (!LegacyGlsl.TYPE_NAMES.contains(type) || name.kind() != Kind.IDENTIFIER
+				|| !this.tokens.get(parts.get(cursor + 3)).operator(";")) {
+			return;
+		}
+
+		// A location the pack spelled out as a number. Anything else, a macro or nothing at all,
+		// leaves no way to say where the output belongs, and inventing one would be worse than the
+		// disorder this exists to fix.
+		//
+		// A slot a gl_FragData subscript or a gl_FragColor already claimed is not refused: that
+		// rewrite counts dead branches too, and a pack that writes gl_FragData under one program
+		// symbol and declares its own output under another has both in one file, with only the
+		// declaration live. The pack's name then takes the slot in the header and the synthesized
+		// one is never declared, which is what the compiler sees of the pack's own text where it
+		// and the expander agree on the live branch. Where they do not (rewriteFragmentOutputs
+		// says why they may), the renamed write names an output nobody declares, a refusal where
+		// the two declarations on one location were a refusal before.
+		int location = literalLocation(parts, cursor);
+		if (location < 0 || location >= MAX_FRAGMENT_OUTPUTS) {
+			return;
+		}
+
+		// Declared under its 32 bit type where the pack wrote a 16 bit one: the reason is with
+		// LegacyGlsl.widened, and the pack's own assignments still fit, a half converting to a
+		// float on its own.
+		Output output = new Output(name.text(), LegacyGlsl.widened(type));
+		if (this.packOutputs.putIfAbsent(location, output) == null) {
+			this.tokens.blankRange(start, end);
+		}
+	}
+
+	/** The {@code location = n} of a layout qualifier standing before this {@code out}, or -1. */
+	private int literalLocation(List<Integer> parts, int keyword) {
+		for (int at = 0; at + 2 < keyword; at++) {
+			if (!this.tokens.get(parts.get(at)).identifier("location")) {
+				continue;
+			}
+
+			Token number = this.tokens.get(parts.get(at + 2));
+			String text = number.text();
+			if (this.tokens.get(parts.get(at + 1)).operator("=") && number.kind() == Kind.NUMBER
+					&& text.length() <= 2 && text.chars().allMatch(Character::isDigit)) {
+				return Integer.parseInt(text);
+			}
+		}
+
+		return -1;
+	}
+
+	/**
+	 * Makes {@code main} name every output in ascending order before it does anything else, by
+	 * calling the function the header declares for it.
+	 * <p>
+	 * The call goes into {@code main} rather than the naming itself because the order that decides
+	 * is the order the compiler first meets the names in, and it walks the functions in the order
+	 * they were written: a helper standing before {@code main} and writing one output would take
+	 * the first rank whatever {@code main} does afterwards. The function is declared in the header
+	 * and so stands before everything the pack wrote.
+	 * <p>
+	 * The brace is replaced rather than a token inserted, since inserting moves every index after
+	 * it and this runs once the rest of the rewrite has settled.
+	 */
+	private void orderFragmentOutputs() {
+		if (this.stage != ProgramStage.FRAGMENT || this.maxFragmentOutput < 0) {
+			return;
+		}
+
+		// Where the body is wrapped, the wrapper makes the call and this must not also make it: the
+		// brace it would replace belongs to a function that is about to be renamed, and a second
+		// call would only name the outputs a second time.
+		if (wrapsFragment()) {
+			this.ordered = true;
+			return;
+		}
+
+		int brace = mainBrace();
+		if (brace >= 0) {
+			this.tokens.inject(brace, "{ " + ORDER_OUTPUTS + "();");
+			this.ordered = true;
+		}
+	}
+
+	/**
+	 * Works out whether this fragment stage can be given the alpha test its pass asks for, before
+	 * anything is moved.
+	 * <p>
+	 * A discard has to come at the END of {@code main}, after the pack has written its colour, which
+	 * is the opposite of the ascending call and so a second mechanism rather than the same one. It
+	 * is done by wrapping, for the reasons {@link #wrapMain} gives about closing braces, and the
+	 * wrapper then makes both calls.
+	 * <p>
+	 * <strong>The test is only written into a stage that writes draw buffer nought the way the
+	 * fixed function pipeline did</strong>, {@code gl_FragColor} or {@code gl_FragData[0]} at a
+	 * literal subscript. Iris asks the same before it injects anything, and it asks it in one
+	 * place: {@code pipeline/transform/transformer/CommonTransformer.java:280} on
+	 * {@code origin/26.2} wants the index nought of {@code gl_FragData} to have been rewritten,
+	 * {@code gl_FragColor} having been renamed onto it at {@code :239}. Its core profile
+	 * transformers never call that method at all, and the flag beside the condition is passed true
+	 * by the roads that must not inject whatever a stage writes, the composites and the compute
+	 * ones; the road a pack's geometry takes passes it false.
+	 * <p>
+	 * A pack that declares its own {@code layout(location = 0) out} is saying that slot holds
+	 * whatever it packed there, and the reference leaves it to test itself against
+	 * {@code alphaTestRef}, which it serves under that name and under {@code iris_currentAlphaTest}
+	 * both ({@code uniforms/IrisInternalUniforms.java:41,45}), renaming a pack's use of the first
+	 * only on its core profile roads.
+	 * <p>
+	 * <strong>Writing one in anyway is not a harmless extra.</strong> RenderPearl's cutout terrain
+	 * puts the block light level in the alpha of its draw buffer nought,
+	 * {@code colortex1 = f16vec4(linear(color.rgb), block_light)}, and an injected
+	 * {@code if (!(colortex1.a > 0.5)) { discard; }} then threw away every cutout fragment of the
+	 * world: no leaves, no grass, no held item, on a ground still carrying the canopy's shadow. The
+	 * alpha of a self declared slot nought is not an alpha, it is whatever the pack packed there.
+	 * <p>
+	 * <strong>The question is asked of the spelling and not of the live branches</strong>, which
+	 * differs from the reference and is deliberate: Iris preprocesses the file before its
+	 * transformer sees it, this translator leaves every {@code #if} standing so the game's compiler
+	 * re-evaluates the engine symbols, and the branch the expander read as dead is one the compiler
+	 * may read as live. {@link #rewriteFragmentOutputs} measured what asking for liveness costs on
+	 * exactly this token. What it leaves standing is a pack whose only legacy write to slot nought
+	 * sits on a dead branch beside a live declaration of its own, the shape {@link #liftOutput}
+	 * describes: that one would be given a test on its own output. No pack of the corpus writes it,
+	 * and withholding a discard from a program that really writes the builtin is the worse of the
+	 * two, a leaf drawn as a cube.
+	 * <p>
+	 * Two more things have to hold. Where the pack has ALSO declared slot nought for itself, that
+	 * declaration owns the name the test would read, so it has to be a {@code vec4} or there is no
+	 * alpha there to read; and {@code main} has to be findable, since a stage whose {@code main} is
+	 * not is a stage nothing can be appended to. A program that fails either keeps its picture and
+	 * loses its discard, which {@link TranslatedUnit.Notes#alphaEpilogue} reports rather than hides.
+	 */
+	private void planAlphaEpilogue() {
+		// No test for maxFragmentOutput here, unlike planCoverage: neither road can raise the flag
+		// without that count having been raised too, the gl_FragColor one at the end of its walk.
+		if (this.stage != ProgramStage.FRAGMENT || !this.alphaTest.tests() || !this.legacySlotZero) {
+			return;
+		}
+
+		Output first = this.packOutputs.get(0);
+		if (first != null && !first.type().equals("vec4")) {
+			return;
+		}
+
+		// Kept rather than asked for again in wrapMain: nothing moves the tokens between here and
+		// there today, and a second walk would quietly start depending on that staying true.
+		this.packMainName = mainName();
+		this.alphaEpilogue = this.packMainName >= 0;
+	}
+
+	/**
+	 * Works out whether this fragment stage can be given the coverage mask its pass asks for.
+	 * <p>
+	 * The mask is one more output, and where it lands is not where it is declared: the game asks the
+	 * SPIR-V reflection for the outputs and writes each one's rank over its own location, so the
+	 * mask has to be named after every output the pack declared, dead branches included. It is
+	 * refused where there is no room for one more, which is the eight colour targets a pipeline
+	 * carries, and where the stage declares no output at all, since then rank nought would be the
+	 * mask and the pack's colour would have nowhere to go.
+	 * <p>
+	 * A refusal costs the picture nothing by itself. The pass then draws exactly as it did before
+	 * the mask existed, and it is whoever reads the mask that has to notice it was never written.
+	 */
+	private void planCoverage() {
+		if (this.stage != ProgramStage.FRAGMENT || !this.coverage || this.maxFragmentOutput < 0
+				|| this.maxFragmentOutput + 1 >= MAX_FRAGMENT_OUTPUTS) {
+			return;
+		}
+
+		// The assignment goes at the end of main, after the pack has written its colour and after
+		// the discard, so the body is wrapped for the same reason the alpha test wraps it. The two
+		// share the wrapper and the name, and whichever asked first has already found it.
+		if (this.packMainName < 0) {
+			this.packMainName = mainName();
+		}
+
+		this.covers = this.packMainName >= 0;
+	}
+
+	/** Whether the fragment stage's own {@code main} is wrapped, by the alpha test or by the mask. */
+	private boolean wrapsFragment() {
+		return this.alphaEpilogue || this.covers;
+	}
+
+	/**
+	 * Converts the clip depth the vertex stage writes, once, after everything the pack did to it.
+	 * <p>
+	 * The pack leaves {@code gl_Position.z} in the OpenGL volume, near at minus w and far at plus w.
+	 * With {@code clipA} and {@code clipB} at minus a half and a half that becomes
+	 * {@code 0.5 * (w - z)}, which is the reversed Z the game rasterises in; at a half and a half it
+	 * becomes {@code 0.5 * (z + w)}, which is the forward zero to one a target of ours carries. In
+	 * both, w is untouched, so x, y and the perspective divide do not move and the Vulkan clip test
+	 * {@code 0 <= z <= w} is the OpenGL test {@code -w <= z <= w} exactly: the clipping is preserved
+	 * and not only the value.
+	 * <p>
+	 * It is an epilogue and not a rewrite of each write because the corpus writes {@code gl_Position}
+	 * four hundred and ninety times, a hundred and fifty nine of them through a partial swizzle, and
+	 * twenty eight of those go back and touch {@code .z} or {@code .w} afterwards: BSL scales
+	 * {@code gl_Position.z} in {@code shadow.glsl:265}, Bliss subtracts from it in
+	 * {@code all_translucent.vsh:153}. Those touch ups are in legacy space and have to be converted
+	 * after the fact, once, whereas rewriting each write would compose the conversion once per write.
+	 * <p>
+	 * It is a wrapper around {@code main} and not an injection before its closing brace because
+	 * {@link TokenStream#matchingBracket} cannot close a brace and, more to the point, counts
+	 * operators without looking at whether their line is live: {@link #liftUniforms} refuses to
+	 * count brace depth for that very reason, a pack opening a brace in one branch of an
+	 * {@code #if} and closing it in another. A misplaced closing brace would put the epilogue in
+	 * the middle of the code. Wrapping also survives an early {@code return} from {@code main},
+	 * which no vertex stage in the corpus does, and the header is already where code of ours is
+	 * written.
+	 * <p>
+	 * The depth conversion is for vertex stages only. A geometry stage writes {@code gl_Position}
+	 * once per {@code EmitVertex}, so an epilogue would land in the wrong place, and a program
+	 * carrying both has the conversion done before the geometry stage reads the position back.
+	 * The corpus writes one geometry stage, iterationT's, and it passes
+	 * {@code gl_in[i].gl_Position} through untouched, so the converted depth reaches the rasteriser
+	 * as this engine wants it. A stage that did arithmetic on the depth it reads back would be
+	 * working in the reversed volume rather than the OpenGL one the pack was written against.
+	 * <p>
+	 * A fragment stage is wrapped for two reasons, the alpha test and the coverage mask, decided in
+	 * {@link #planAlphaEpilogue} and {@link #planCoverage}. The same wrapping argument holds and the
+	 * same header carries it.
+	 */
+	private void wrapMain() {
+		if (this.stage == ProgramStage.FRAGMENT) {
+			if (wrapsFragment()) {
+				this.tokens.replace(this.packMainName, PACK_MAIN);
+				this.mainWrapped = true;
+			}
+
+			return;
+		}
+
+		if (this.stage != ProgramStage.VERTEX) {
+			return;
+		}
+
+		// Before the early return below, because this is not about wrapping. The sky prologue spells
+		// of_Color out of this uniform whatever the bound format carries, either alone or times the
+		// element, and it prints that line whatever else the stage does, so the block has to carry
+		// the name whatever else the stage does. Taken for the sky and for no other family: it is a
+		// member of the block of the sky programs only.
+		if (this.inputs == VertexInputs.SKY) {
+			takePassColour();
+		}
+
+		// A terrain stage is wrapped whatever it writes, and not only when it names gl_Position: the
+		// prologue is what fills the four names the mesh answers, and it is also what keeps all four
+		// attributes alive. An input the shader declares and never reads may be dropped from the
+		// SPIR-V, and rebind only counts the ones that survived, so a dropped attribute shifts the
+		// location of every one after it.
+		boolean terrain = this.inputs.terrain();
+		boolean distant = this.inputs == VertexInputs.DISTANT;
+		boolean depth = namesClipPosition();
+		boolean overlay = this.inputs.overlay();
+		boolean lines = this.inputs == VertexInputs.LINES;
+		if (!terrain && !distant && !depth && !overlay && !lines) {
+			return;
+		}
+
+		int name = mainName();
+		if (name < 0) {
+			return;
+		}
+
+		this.tokens.replace(name, PACK_MAIN);
+		this.terrainPrologue = terrain;
+		this.distantPrologue = distant;
+		this.entityWrapped = overlay;
+		this.linesWrapped = lines;
+		if (lines) {
+			// The widening reads the screen size off the two uniforms a pack may read and often
+			// does not declare in this program; naming them here is what has the block supply them.
+			this.injectedNames.add("viewWidth");
+			this.injectedNames.add("viewHeight");
+		}
+
+		if (terrain) {
+			takeTexShrink();
+		}
+
+		if (depth) {
+			takeDepthConv();
+			this.depthEpilogue = true;
+		}
+
+		this.mainWrapped = true;
+	}
+
+	/**
+	 * Wraps {@code main} when a matrix was split and nothing else had wrapped it, so the columns
+	 * have a place to be copied from and the reconstructed matrix has a place to be assigned.
+	 * <p>
+	 * {@link #mainName} is not enough here. {@link #orderFragmentOutputs} has already run, and on a
+	 * fragment that is not wrapped for alpha or coverage it replaces the opening brace with a
+	 * {@code RAW} token. {@code mainName} then no longer sees that brace and returns -1, the
+	 * header still emits a wrapper because the matrices were split, and the body keeps its own
+	 * {@code main}: two bodies, which is the compile error a fragment with matrix varyings hits.
+	 * The injected brace is still a body of {@code main}, so it is accepted here.
+	 */
+	private void wrapMainForSplits() {
+		if (this.mainWrapped || !this.splits.any()) {
+			return;
+		}
+
+		int name = mainName();
+		if (name < 0) {
+			name = mainNameAfterOutputOrder();
+		}
+
+		if (name < 0) {
+			return;
+		}
+
+		this.tokens.replace(name, PACK_MAIN);
+		this.mainWrapped = true;
+	}
+
+	/**
+	 * The {@code main} whose opening brace {@link #orderFragmentOutputs} already replaced, or -1.
+	 * Same walk as {@link #mainName}, except a {@code RAW} token that still opens with a brace
+	 * counts as the body.
+	 */
+	private int mainNameAfterOutputOrder() {
+		int[] lines = this.tokens.lineNumbers();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (!token.identifier("main") || token.directive() != null
+					|| !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			int close = this.tokens.matchingBracket(this.tokens.callOpener(index));
+			int brace = this.tokens.significantAfter(close);
+			if (brace >= 0) {
+				Token after = this.tokens.get(brace);
+				if (after.kind() == Kind.RAW && after.text().startsWith("{")) {
+					return index;
+				}
+			}
+		}
+
+		return -1;
+	}
+
+	/**
+	 * Wraps the body's own main so that the owed varyings can be assigned before it runs, where
+	 * nothing had wrapped it already.
+	 * <p>
+	 * After {@link #prepare} rather than inside it, and that is forced: which varyings are owed is a
+	 * property of the PROGRAM, decided once both stages have been read, and a stage prepared on its
+	 * own cannot know. The token indices are stable by then, which {@link #regions} relies on for
+	 * the same reason.
+	 * <p>
+	 * Before the pack's own main and not after, as Iris prepends it at
+	 * {@code CompatibilityTransformer.java:494}. It matters where a pack writes the name itself on
+	 * some path: the pack's own value has to win, so ours is what stands there before it runs.
+	 */
+	private void wrapMainForOwedOutputs() {
+		if (this.mainWrapped) {
+			return;
+		}
+
+		int name = mainName();
+		if (name < 0) {
+			// No main to wrap and so no place to assign from. The declarations still go out, which is
+			// what the pairing reads; the values are then whatever the stage leaves, as they were.
+			return;
+		}
+
+		this.tokens.replace(name, PACK_MAIN);
+		this.mainWrapped = true;
+	}
+
+	/**
+	 * Takes the vertex inputs the chunk mesh has not got out of the body, keeping the type the pack
+	 * declared them under so that the header can hand back a global of the same shape.
+	 * <p>
+	 * Runs before {@link #rewriteIdentifiers}, which is where {@code attribute} becomes {@code in}
+	 * and the two stop being distinguishable. Leaving one standing is not a soft failure: the game
+	 * refuses outright, {@code IntermediaryShaderModule.rebind} raising on an input the vertex format
+	 * has no element for, which is at least loud. What it must not do is guess: an {@code in} is also
+	 * how a function names a parameter, so the keyword has to open the statement, and where it is
+	 * {@code in} rather than {@code attribute} the name has to be one this engine knows is an
+	 * attribute.
+	 */
+	private void synthesizeAttributes() {
+		if (this.stage != ProgramStage.VERTEX || !this.inputs.synthesizes()) {
+			return;
+		}
+
+		int[] lines = this.tokens.lineNumbers();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.directive() != null || !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			if (token.identifier("attribute")) {
+				synthesizeOne(index, false);
+			} else if (token.identifier("in")) {
+				synthesizeOne(index, true);
+			}
+		}
+	}
+
+	/** @param known whether the declared name has to be one this engine already calls an attribute */
+	private void synthesizeOne(int keyword, boolean known) {
+		FileScope declared = fileScopeDeclaration(keyword);
+		if (declared == null
+				|| (known && declared.names().stream().noneMatch(VertexPrologue.SYNTHESIZED::contains))) {
+			return;
+		}
+
+		// The declaration goes whatever happens; what it leaves behind does not. Where the mesh
+		// carries the overlay, the header already declares the overlay colour and the three
+		// identifiers as varyings, so a global of the same name is that name declared twice and the
+		// stage is refused for a redefinition. E-LITE writes attribute int blockEntityId in a
+		// shared vertex body and lost its entities, its hand and its blocks in three places, twenty
+		// four stages, to exactly that. Leaving the name out here is what hands its reads to the
+		// varying, which carries the value the mesh really has rather than the zero a synthesised
+		// global would hold. Iris arrives at the same place from the other side, deleting the
+		// declaration and putting iris_entityInfo in the place of every read
+		// (pipeline/transform/transformer/EntityPatcher.java:129-152).
+		declared.names().forEach(name -> {
+			if (!headerDeclares(name)) {
+				this.synthesized.putIfAbsent(name, declared.type());
+			}
+		});
+		this.tokens.blankRange(declared.start(), declared.end());
+	}
+
+	/** Whether the header names this itself on this mesh, so that a global of it would redeclare it. */
+	private boolean headerDeclares(String name) {
+		return this.inputs.overlay() && (ENTITY_COLOR.equals(name) || ENTITY_IDS.contains(name));
+	}
+
+	/**
+	 * Reads the varyings this stage declares at file scope, both ways round.
+	 * <p>
+	 * The two are not symmetric and neither is what the game does with them.
+	 * {@code IntermediaryShaderModule.rebind} walks the vertex stage's outputs and looks each one up
+	 * in the fragment stage by name: an input the fragment declares that nothing before it writes is
+	 * refused outright, at :205-207, and the whole module goes with it. That is a refusal, not a
+	 * silence, and it costs three packs of the corpus a pass apiece.
+	 * <p>
+	 * A vertex stage is not asked for its inputs. Its file scope {@code in} is an attribute, which
+	 * the vertex format answers and {@link #synthesizeAttributes} has already dealt with.
+	 */
+	private void collectVaryings() {
+		if (this.stage == ProgramStage.COMPUTE) {
+			return;
+		}
+
+		int[] lines = this.tokens.lineNumbers();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.directive() != null || !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			String storage = storageWord(token, this.macroAliases);
+			if ("out".equals(storage)) {
+				FileScope declared = fileScopeDeclaration(index);
+				if (declared != null) {
+					this.declaredOutputs.addAll(declared.names());
+					this.declaredOutputScopes.add(declared);
+				}
+			} else if ("in".equals(storage) && this.stage != ProgramStage.VERTEX) {
+				FileScope declared = fileScopeDeclaration(index);
+				if (declared != null) {
+					this.declaredInputs.add(declared);
+				}
+			}
+		}
+	}
+
+	/**
+	 * Takes back out every input this stage declares that no stage before it writes and that its own
+	 * body never reads.
+	 * <p>
+	 * <strong>Both halves of the condition earn their place, and the first is what makes this
+	 * safe.</strong> Dropping an input the vertex stage does write would be a silent corruption
+	 * rather than a fix: {@code rebind} only counts the fragment inputs it found, at :151-163, so
+	 * everything declared after the missing one lands a location too low with nothing said by
+	 * anyone. And dropping one the body does read would turn a refusal into an undeclared
+	 * identifier, which is the same pass lost with a worse message. So what is taken out is exactly
+	 * what the game was going to refuse the module for, and never anything else.
+	 * <p>
+	 * A pack does not write these by hand. Mellow's {@code /global/gbuffers.fsh} declares eleven
+	 * varyings and every fragment stage of the pack includes it, so its {@code deferred1}, drawn
+	 * over a quad, asks for the six a geometry pass would have written; Bliss loses
+	 * {@code gbuffers_water} to one name, and its water is then the game's own.
+	 *
+	 * @param provided every name a stage before this one declares as an output
+	 */
+	private void dropUnprovidedInputs(Set<String> provided) {
+		// First, and above the return below rather than under it: a stage whose plain inputs are all
+		// provided still has splits to answer for, and Sildur's gbuffers_textured is exactly that
+		// stage. Under the return it ran on the stages that did not need it and on none that did.
+		dropUnprovidedSplits(provided);
+
+		List<FileScope> unprovided = this.declaredInputs.stream()
+				.filter(declared -> declared.names().stream().noneMatch(provided::contains))
+				.toList();
+		if (unprovided.isEmpty()) {
+			return;
+		}
+
+		Set<String> candidates = new HashSet<>();
+		unprovided.forEach(declared -> candidates.addAll(declared.names()));
+		Set<String> read = readNames(candidates);
+
+		boolean dropped = false;
+		for (FileScope declared : unprovided) {
+			if (declared.names().stream().noneMatch(read::contains)) {
+				this.tokens.blankRange(declared.start(), declared.end());
+				this.droppedInputs.addAll(declared.names());
+				dropped = true;
+				continue;
+			}
+
+			// Read by the body, so it stays, and the stage before it has to hand it over instead.
+			// Every name of the declaration and not only the ones read: they share one statement,
+			// and a name left out of it is one the module is still refused for.
+			for (String name : declared.names()) {
+				// A DIVERGENCE, and an array is the whole of it. Iris patches one:
+				// CompatibilityTransformer.java:467-497 bails only on a type with no numeric
+				// specifier (:473-480), and its declarationTemplate at :68-70 is "out __type
+				// __name;", which carries no array specifier at all. What makes that impossible
+				// here is that the two sides would then disagree on the type, the fragment stage
+				// holding "in float x[4]" against a vertex stage holding "out float x", and this
+				// backend compiles each stage to its own module rather than linking them, so the
+				// disagreement lands as a compile error naming neither stage. What it costs the
+				// image is nothing: the pass is lost either way, here through the refusal it
+				// already had and there through a module that does not build. The one array
+				// varying the corpus declares, Photon's sky harmonics, is split into its elements
+				// before this runs, and those elements are not offered here either: an input array
+				// the vertex stage never wrote would stay declared, which no pack of the corpus
+				// does. The declarator carrying brackets is what tells one, the type name alone
+				// never doing so.
+				if (declared.declarators().getOrDefault(name, "").equals(declared.type() + " " + name)) {
+					this.unprovidedInputs.put(name, declared.qualifier().isEmpty()
+							? declared.type()
+							: declared.qualifier() + " " + declared.type());
+				}
+			}
+		}
+
+		if (dropped) {
+			this.used = usedNames();
+			this.declaredAfter = declaredUnderAType();
+		}
+	}
+
+	/**
+	 * The same for a varying this stage reads through a split, which the walk above cannot see.
+	 * <p>
+	 * A split takes the pack's declaration out of the body, so it is in none of the lists that walk
+	 * offers, and a matrix the stage before never wrote would stay declared through its columns
+	 * with nobody able to take it back out. Sildur's {@code gbuffers_textured} is that shape: the
+	 * fragment stage declares {@code varying mat3 tbnMatrix} outside any condition and reads it
+	 * only under {@code #if nMap >= 1}, which is off by default, while the vertex stage declares
+	 * AND writes it inside that same condition. Three columns nothing writes, and the game refuses
+	 * the pipeline by their names, which cost the pack its solid, cutout, particle and hand passes.
+	 * <p>
+	 * The condition is the walk's own and it earns its place the same way: the columns have to be
+	 * unwritten by the stage before, and the pack's own name has to be read nowhere in the body. A
+	 * split whose name the body still reads stays, and the stage keeps the refusal it has, because
+	 * taking it out would turn that into an undeclared identifier.
+	 */
+	private void dropUnprovidedSplits(Set<String> provided) {
+		for (String name : this.splits.splitInputs()) {
+			if (this.splits.interfaceNamesOf(name).stream().anyMatch(provided::contains)
+					|| !readNames(Set.of(name)).isEmpty()) {
+				continue;
+			}
+
+			if (this.splits.forgetInput(name)) {
+				this.droppedInputs.add(name);
+			}
+		}
+	}
+
+	/**
+	 * Stops this stage handing on every varying the stage after it does not declare, by taking the
+	 * {@code out} off the declaration and leaving a plain global of the same name and type behind.
+	 * <p>
+	 * <strong>The other way round from {@link #dropUnprovidedInputs}, and it is the way that says
+	 * nothing at all.</strong> {@code rebind:151-163} numbers the fragment stage over the vertex
+	 * stage's output list and advances its counter only on the names the fragment declares, while
+	 * {@code createFromSpirv:114-116} had numbered that same list {@code 0..n-1} with nothing
+	 * skipped. One name the fragment does not declare therefore drops every name after it in the
+	 * list by a location, with no exception raised and no line logged, and the fragment reads its
+	 * neighbour's value. Measured over the corpus before this: 39 pairs handing on a varying the
+	 * fragment never declares, and 16 of them landing at least one location on the neighbour.
+	 * <p>
+	 * <strong>Demoted rather than deleted, because the body writes them.</strong> Deleting the
+	 * declaration would leave the assignments naming nothing, which is the pass lost. A global of
+	 * the same name and type keeps every assignment compiling and is simply not part of the
+	 * interface any more, which is the whole of what was wanted. The interpolation qualifier goes
+	 * with the {@code out}: {@code flat} on a plain global is a syntax error, and it means nothing
+	 * once there is nobody to interpolate for.
+	 * <p>
+	 * <strong>What Iris does here is nothing, and that is not an oversight on its part.</strong> It
+	 * links two stages the way OpenGL does, where an output nobody reads is legal and costs nothing;
+	 * there is no line of {@code CompatibilityTransformer} to follow because the language it targets
+	 * never asked the question. What forces the hand here is
+	 * {@code IntermediaryShaderModule.rebind:151-163}, which pairs by counting rather than by name.
+	 * The picture is unchanged either way: what is taken out of the interface is, by the condition
+	 * itself, a value no later stage could read.
+	 * <p>
+	 * <strong>A declaration is taken whole or left alone.</strong> {@code out vec3 a, b;} with the
+	 * fragment declaring {@code b} alone stays as it is, since demoting it would take {@code b} out
+	 * from under a fragment that reads it and that is the failure this exists to prevent. No pack
+	 * of the corpus writes one, the measurement below being zero, and the shape is worth naming
+	 * rather than reading as covered.
+	 * <p>
+	 * <strong>Only what the PACK declares is offered here, on both sides.</strong> The two varyings
+	 * the engine names itself are emitted into both headers off one union and are never in either
+	 * list, so neither can be withheld from under a stage that declares it. The shape that would
+	 * be a hazard is a pack writing {@code out vec4 entityColor} in its vertex stage against a
+	 * fragment that only gets the name from the header; it cannot arise, because a vertex stage
+	 * that reaches that union already receives the header's declaration of the same name and is
+	 * refused for the redefinition before this is ever asked.
+	 *
+	 * @param declared every name the stage after this one still declares as an input
+	 */
+	private void withholdUndeclaredOutputs(Set<String> declared) {
+		for (FileScope scope : this.declaredOutputScopes) {
+			if (scope.names().stream().anyMatch(declared::contains)) {
+				continue;
+			}
+
+			// From the start of the statement up to the type, which is the first token that is
+			// neither the keyword nor a qualifier. Either order has to be taken: GLSL accepts both,
+			// Mellow opens with flat, and fileScopeDeclaration already gathers them both ways.
+			for (int index : this.tokens.significantRange(scope.start(), scope.end())) {
+				String text = this.tokens.get(index).text();
+				if (!text.equals("out") && !LegacyGlsl.INTERPOLATION_QUALIFIERS.contains(text)) {
+					break;
+				}
+
+				this.tokens.blank(index);
+			}
+
+			this.declaredOutputs.removeAll(scope.names());
+		}
+	}
+
+	/**
+	 * Which of these names the body really reads, counting a function that declares one of them for
+	 * itself as meaning its own.
+	 * <p>
+	 * Counting mentions is not enough and Mellow is why. Its {@code deferred1} includes a header
+	 * declaring eleven varyings and its own full screen vertex stage writes five of them; of the six
+	 * left over, three go out here. {@code Tangent} is mentioned once in the whole stage, as a
+	 * parameter of the pack's own {@code tbn_decode(vec3 Normal, vec4 Tangent)}, and {@code Normal}
+	 * is mentioned in five functions, each of which declares a {@code Normal} of its own, four as a
+	 * parameter and one as a local. Counting mentions would keep both, and the game would then
+	 * refuse the whole module over two varyings nothing reads.
+	 * <p>
+	 * <strong>Scope is taken at the function and not at the block, which is coarser than the
+	 * language.</strong> A name declared inside an {@code if} and read again after the closing brace
+	 * is called shadowed here and is not. Nothing in the corpus does it, and the cost if something
+	 * did is bounded by the caller: the only declarations offered here are ones no earlier stage
+	 * writes, so the worst this can do is turn a module the game refuses into a stage that does not
+	 * compile.
+	 */
+	private Set<String> readNames(Set<String> candidates) {
+		boolean[] declaration = new boolean[this.tokens.size()];
+		for (FileScope declared : this.declaredInputs) {
+			for (int index = declared.start(); index <= declared.end(); index++) {
+				declaration[index] = true;
+			}
+		}
+
+		int[] region = this.regions;
+		int[] lines = this.tokens.lineNumbers();
+		Map<String, Set<Integer>> shadowed = new HashMap<>();
+		Set<String> read = new HashSet<>();
+
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			// A branch nobody takes neither reads the name nor shadows it, since the compiler never
+			// sees either line. Asked of both, so that the two halves keep agreeing.
+			if (token.kind() != Kind.IDENTIFIER || declaration[index]
+					|| !this.unit.isLive(lines[index]) || !candidates.contains(token.text())) {
+				continue;
+			}
+
+			int before = this.tokens.significantBefore(index);
+			boolean declares = before >= 0
+					&& LegacyGlsl.TYPE_NAMES.contains(this.tokens.get(before).text());
+			if (declares && region[index] >= 0) {
+				// From here to the end of the function, and not before it: a mention above the
+				// declaration is still the varying's, which is what the language says.
+				shadowed.computeIfAbsent(token.text(), ignored -> new HashSet<>()).add(region[index]);
+			} else if (!declares && !shadowed.getOrDefault(token.text(), Set.of()).contains(region[index])) {
+				read.add(token.text());
+			}
+		}
+
+		return read;
+	}
+
+	/**
+	 * Which top level block each token belongs to, counting the signature that opens it, or -1 for a
+	 * token at file scope. A local declaration only means its own name inside one of these.
+	 * <p>
+	 * Counts the pack's braces and only those, so it has to be asked while they are all that is
+	 * there. {@link #rewrite} asks it once, at the last moment where that holds.
+	 */
+	private int[] regions() {
+		int[] region = new int[this.tokens.size()];
+		Arrays.fill(region, -1);
+
+		int depth = 0;
+		int current = -1;
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.directive() == null && token.operator("{")) {
+				if (depth == 0) {
+					current++;
+					// Back over the signature, so that a parameter counts as declared inside the
+					// body it names things for rather than at file scope beside it.
+					int from = this.tokens.statementStart(index);
+					for (int back = from < 0 ? index : from; back <= index; back++) {
+						region[back] = current;
+					}
+				}
+
+				depth++;
+			} else if (token.directive() == null && token.operator("}")) {
+				depth--;
+			}
+
+			if (depth > 0) {
+				region[index] = current;
+			}
+		}
+
+		return region;
+	}
+
+	/**
+	 * One declaration at file scope, and the tokens that would go with it if it were taken out.
+	 *
+	 * @param qualifier   the interpolation qualifiers of the declaration, from either side of the
+	 *                    storage keyword, empty where it has none. Kept because a varying handed to
+	 *                    the other stage has to be declared there under the same ones, and
+	 *                    {@code flat} is the one that matters: an integer varying is flat or it is
+	 *                    nothing
+	 * @param declarators each name with the text that declares it, array brackets included, which is
+	 *                    what lets a declaration be written again rather than described
+	 */
+	record FileScope(List<String> names, String type, String qualifier,
+			Map<String, String> declarators, int start, int end) {
+
+		FileScope {
+			names = List.copyOf(names);
+			declarators = Map.copyOf(declarators);
+		}
+	}
+
+	/**
+	 * The declaration a storage keyword opens at file scope, or null where the keyword opens
+	 * something else.
+	 * <p>
+	 * It must not guess: {@code in} and {@code out} are also how a function names a parameter, so
+	 * the keyword has to open the statement, and everything before it has to be an interpolation
+	 * qualifier. A parameter list puts the return type and the function's name ahead of it, and a
+	 * caller blanking from there would erase the function.
+	 * <p>
+	 * That rules out one form a pack could legally write, {@code layout(location = N) out}: what
+	 * stands before the keyword is no interpolation qualifier, so this answers null and the varying
+	 * is neither offered to {@link #dropUnprovidedInputs} nor counted as provided. Harmless where
+	 * both stages spell it that way, since neither side is seen. The shape to watch for is a vertex
+	 * stage writing it against a fragment stage that declares the same name plainly and never reads
+	 * it, which would be taken out from under a location the vertex stage still fills. No pack of
+	 * the corpus writes the form: over the stages the harness emits there is not one
+	 * {@code layout} qualified {@code in} among the 905 fragment stages, and not one
+	 * {@code layout} qualified {@code out} among the 903 vertex stages. What this rules out is a
+	 * pack, and never a stage of ours: the fragment outputs the header writes carry the qualifier
+	 * and are never read back through here.
+	 */
+	private FileScope fileScopeDeclaration(int keyword) {
+		return fileScopeDeclaration(keyword, LegacyGlsl.TYPE_NAMES);
+	}
+
+	/**
+	 * The same, for a declaration whose type is among those named rather than among the
+	 * language's own: the struct types a unit defines, which the split of struct varyings reads
+	 * and nothing else asks for.
+	 */
+	private FileScope fileScopeDeclaration(int keyword, Set<String> types) {
+		int end = this.tokens.statementEnd(keyword);
+		int start = end < 0 ? -1 : this.tokens.statementStart(keyword);
+		if (start < 0) {
+			return null;
+		}
+
+		List<Integer> parts = this.tokens.significantRange(start, end);
+		int cursor = parts.indexOf(keyword);
+		if (cursor < 0) {
+			return null;
+		}
+
+		// Gathered on both sides of the keyword, because GLSL takes the qualifier either way round
+		// and packs write both: Mellow opens with flat, and a pack writing "in flat" is as legal.
+		List<String> qualifiers = new ArrayList<>();
+		for (int before = 0; before < cursor; before++) {
+			String text = this.tokens.get(parts.get(before)).text();
+			if (!LegacyGlsl.INTERPOLATION_QUALIFIERS.contains(text)) {
+				return null;
+			}
+
+			qualifiers.add(text);
+		}
+
+		cursor++;
+		while (cursor < parts.size() && (isQualifier(this.tokens.get(parts.get(cursor)))
+				|| LegacyGlsl.INTERPOLATION_QUALIFIERS
+						.contains(this.tokens.get(parts.get(cursor)).text()))) {
+			String text = this.tokens.get(parts.get(cursor)).text();
+			if (LegacyGlsl.INTERPOLATION_QUALIFIERS.contains(text)) {
+				qualifiers.add(text);
+			}
+
+			cursor++;
+		}
+
+		if (cursor >= parts.size() || this.tokens.get(parts.get(cursor)).kind() != Kind.IDENTIFIER) {
+			return null;
+		}
+
+		String type = this.tokens.get(parts.get(cursor)).text();
+		if (!types.contains(type)) {
+			return null;
+		}
+
+		Map<String, String> found = new LinkedHashMap<>();
+		if (!readDeclarators(parts, cursor + 1, type, "", "", found)) {
+			return null;
+		}
+
+		return new FileScope(List.copyOf(found.keySet()), type, String.join(" ", qualifiers), found,
+				start, end);
+	}
+
+	private boolean namesClipPosition() {
+		for (Token token : this.tokens) {
+			if (token.identifier("gl_Position")) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * The brace opening the body of {@code main}, or -1 when the unit serves no such function.
+	 */
+	private int mainBrace() {
+		int name = mainName();
+
+		return name < 0
+				? -1
+				: this.tokens.significantAfter(
+						this.tokens.matchingBracket(this.tokens.callOpener(name)));
+	}
+
+	/**
+	 * The name of the {@code main} this unit really serves, or -1 when it serves none.
+	 * <p>
+	 * A dead one is stepped over, for the reason {@link #liftFragmentOutputs} gives about
+	 * declarations: a pack that writes one {@code main} per branch of an {@code #if} would
+	 * otherwise have the prologue put in whichever came first in the file, and the branch the
+	 * compiler actually sees would name its outputs in whatever order the pack wrote them in.
+	 */
+	private int mainName() {
+		int[] lines = this.tokens.lineNumbers();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (!token.identifier("main") || token.directive() != null
+					|| !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			int close = this.tokens.matchingBracket(this.tokens.callOpener(index));
+			int brace = this.tokens.significantAfter(close);
+			if (brace >= 0 && this.tokens.get(brace).operator("{")) {
+				return index;
+			}
+		}
+
+		return -1;
+	}
+
+	/**
+	 * Moves every plain uniform into one block, because Vulkan takes no other kind. Samplers stay
+	 * opaque and loose, but their declarations leave the body the same way: the header writes them
+	 * in the order the program handed over, sampled names first. What that order buys, and what it
+	 * no longer decides, is on {@code ProgramTranslator.sampledFirst}.
+	 * <p>
+	 * Brace depth is not consulted. A uniform is only legal at file scope, {@code uniform} is a
+	 * reserved word so it can be nothing else, and a pack that opens a brace in one branch of an
+	 * {@code #if} and closes it in another would put any depth count out by one for the rest of
+	 * the file.
+	 */
+	private void liftUniforms() {
+		int[] lines = this.tokens.lineNumbers();
+		Map<String, String> aliases = new HashMap<>();
+
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() == Kind.HASH && this.unit.isLive(lines[index])) {
+				int name = this.tokens.macroNameAfter(index);
+				if (name >= 0 && "define".equals(token.directive())) {
+					String alias = aliasOf(name).orElse("");
+					if (alias.isEmpty()) {
+						aliases.remove(this.tokens.get(name).text());
+					} else {
+						aliases.put(this.tokens.get(name).text(), alias);
+					}
+				} else if (name >= 0 && "undef".equals(token.directive())) {
+					aliases.remove(this.tokens.get(name).text());
+				}
+			}
+			if (!token.identifier("uniform") || token.directive() != null) {
+				continue;
+			}
+
+			// A declaration in a branch nobody takes stays where it is. Moving it to the header
+			// would make it unconditional, and packs do declare a name as a uniform in one branch
+			// and as an ordinary global in the other. Complementary's dhProjection six are the
+			// other side of that rule: they are ordinary pack uniforms under DISTANT_HORIZONS,
+			// Iris registers them as such (CommonUniforms.java:184-186, MatrixUniforms.java:41-45)
+			// and OpenGL accepts the loose form. They enter OfGlobals only when that branch is
+			// live. If the expander never saw the symbol and the header still defines it, they
+			// stay in the body and Vulkan refuses the unit; PackChoice.load installs the table
+			// before SettingSet.resolve so the two readers agree.
+			if (this.unit.isLive(lines[index])) {
+				liftOne(index, aliases);
+			}
+		}
+
+		// Where the mesh carries the overlay this name is not a uniform at all, so the declaration
+		// the loop above has just taken out of the body leaves nothing behind. Iris deletes the same
+		// declaration outright (EntityPatcher.java:39) and answers every read from a varying its
+		// vertex stage writes; leaving the name in the block would answer them all with one number
+		// instead, which is the mob that never flashes.
+		//
+		// By the name and not by the shape, where Iris matches the whole declaration. The corpus
+		// writes one shape and only one, eighteen declarations of uniform vec4 entityColor over the
+		// eight packs, so the two answer the same today; a pack that wrote another type would keep
+		// its uniform under Iris and lose the pass to a redefinition, and lose the type here.
+		//
+		// The three identifiers leave by the same door and for the same reason, one draw batching
+		// several submissions: a chest and the mob beside it share it, so a number in the block is
+		// one number for both. Iris deletes those three declarations in the same breath
+		// (EntityPatcher.java:130-132).
+		if (this.inputs.overlay()) {
+			this.blockMembers.remove(ENTITY_COLOR);
+			ENTITY_IDS.forEach(this.blockMembers::remove);
+		}
+	}
+
+	private void liftOne(int keyword, Map<String, String> aliases) {
+		int end = this.tokens.statementEnd(keyword);
+		if (end < 0) {
+			// Either a uniform block, which is already legal, or a declaration with no semicolon,
+			// which is a pack problem and not ours to paper over.
+			return;
+		}
+
+		int start = this.tokens.statementStart(keyword);
+		if (start < 0) {
+			return;
+		}
+
+		List<Integer> parts = this.tokens.significantRange(start, end);
+		int keywordAt = parts.indexOf(keyword);
+		if (keywordAt < 0) {
+			return;
+		}
+
+		// Both sides of the keyword, because the corpus uses both. BSL and Complementary's voxel
+		// volume write writeonly uniform image3D, the qualifier in front, and Bliss and
+		// Complementary's player atlas write uniform readonly and uniform writeonly, the
+		// qualifier behind. Reading only what follows the keyword lost the first form.
+		List<String> memory = new ArrayList<>();
+		for (int part = 0; part < keywordAt; part++) {
+			rememberMemoryQualifier(memory, this.tokens.get(parts.get(part)));
+		}
+
+		int cursor = keywordAt + 1;
+		while (cursor < parts.size() && isQualifier(this.tokens.get(parts.get(cursor)))) {
+			rememberMemoryQualifier(memory, this.tokens.get(parts.get(cursor)));
+			cursor++;
+		}
+
+		if (cursor >= parts.size() || this.tokens.get(parts.get(cursor)).kind() != Kind.IDENTIFIER) {
+			return;
+		}
+
+		String type = this.tokens.get(parts.get(cursor)).text();
+
+		// An opaque uniform is recorded the same way, then taken out of the body: the header
+		// writes every sampler in the order the program settled, which is what MoltenVK numbers.
+		boolean opaque = LegacyGlsl.isOpaqueType(type);
+
+		// Recorded under the spelling the token carries, which is the road decision made real:
+		// collectComparisonSamplers has already taken the comparison out of every declaration it
+		// sent to the arithmetic, and one still spelling it is one the binding owes a comparison
+		// sampler, so the header has to keep saying so. Taking it out here again is what once
+		// declared a kept comparison ordinary, and every lookup on it stopped compiling.
+		//
+		// Recorded for an opaque uniform alone, which is the only declaration these can be
+		// written on and the only one that reads them back out of the header.
+		//
+		// The format goes the same way and for the same reason, and it is asked of a storage image
+		// alone: no other opaque type can be declared with one, and the header writes a format back
+		// in front of an image declaration and nowhere else, so read off a sampler it would sit
+		// there unread.
+		String format = opaque && LegacyGlsl.isImageType(type) ? imageFormat(parts, keywordAt) : "";
+		if (!readDeclarators(parts, cursor + 1, type, opaque ? String.join(" ", memory) : "", format,
+				opaque ? this.samplers : this.blockMembers, aliases)) {
+			return;
+		}
+
+		this.tokens.blankRange(start, end);
+	}
+
+	/**
+	 * A custom image can be written as an integer word and sampled as a normalised colour in a
+	 * different program. Keep those declarations distinct in the binding table; the encoded name
+	 * selects a compatible Vulkan view of the same memory, including on a cached translation.
+	 */
+	private void nameCustomImageViews() {
+		Map<String, String> renames = new LinkedHashMap<>();
+		Map<String, String> renamed = new LinkedHashMap<>();
+		this.samplers.forEach((name, declaration) -> {
+			String emitted = name;
+			var image = CustomImages.image(name);
+			if (image.isPresent()) {
+				String type = declaration.substring(0, declaration.indexOf(' '));
+				var base = image.get().internalFormat().used();
+				var requested = CustomImageView.requested(base, type, this.imageFormats.get(name));
+				if (requested.isPresent() && requested.get() != base) {
+					if (!CustomImageView.compatible(base, requested.get())) {
+						throw new IllegalArgumentException("Incompatible image view for " + name
+								+ ": " + base + " as " + requested.get());
+					}
+					emitted = new CustomImageView(name, requested.get()).name();
+					renames.put(name, emitted);
+					String qualifiers = this.memoryQualifiers.remove(name);
+					if (qualifiers != null) this.memoryQualifiers.put(emitted, qualifiers);
+					String format = this.imageFormats.remove(name);
+					if (format != null) this.imageFormats.put(emitted, format);
+					declaration = type + " " + emitted
+							+ declaration.substring(type.length() + 1 + name.length());
+				}
+			}
+			renamed.put(emitted, declaration);
+		});
+		if (renames.isEmpty()) return;
+		this.samplers.clear();
+		this.samplers.putAll(renamed);
+		for (int at = 0; at < this.tokens.size(); at++) {
+			Token token = this.tokens.get(at);
+			String replacement = renames.get(token.text());
+			if (replacement != null && token.kind() == Kind.IDENTIFIER && !token.macroName()
+					&& (token.directive() == null || "define".equals(token.directive()))) {
+				this.tokens.replace(at, replacement);
+			}
+		}
+		this.macroAliases.replaceAll((_, value) -> renames.getOrDefault(value, value));
+	}
+
+	/**
+	 * The image format the pack wrote in front of {@code uniform}, or nothing where it wrote none.
+	 * <p>
+	 * By the vocabulary and not by the position, so that a {@code layout} carrying more than one
+	 * qualifier reads the same as one carrying a format alone: {@code binding} and {@code set} and
+	 * the numbers beside them are not format words, and neither is a name a {@code #define} stands
+	 * for, so a pack naming its format through a macro the expander did not resolve is read as
+	 * having written none rather than as having written that name.
+	 */
+	private String imageFormat(List<Integer> parts, int keywordAt) {
+		for (int part = 0; part < keywordAt; part++) {
+			Token token = this.tokens.get(parts.get(part));
+			if (token.kind() == Kind.IDENTIFIER && CustomImages.isLayoutFormat(token.text())) {
+				return token.text();
+			}
+		}
+
+		return "";
+	}
+
+	/**
+	 * Finds every sampler the pack declared as a comparison sampler, remembers the name so that
+	 * {@link #rewriteShadowCompare} knows its lookups, and settles which of the two roads each
+	 * takes: the declaration keeps its spelling and the binding carries a comparison sampler, or it
+	 * is declared ordinary and {@link #SHADOW_COMPARE} makes the comparison in arithmetic.
+	 * <p>
+	 * A pass of its own, and early, because of when the others run: the uniforms are lifted after
+	 * the depth conversion, and the conversion is the one place that has to know. It walks the
+	 * declaration itself rather than reusing the lifting, since all it needs is the type token and
+	 * the names it introduces, and it must not disturb what the lifting then reads.
+	 * <p>
+	 * The two forms a comparison sampler is written in are told apart by the parenthesis, and they
+	 * have to be: a declaration lists names until the semicolon, a parameter names one thing and
+	 * ends at the comma. Read as a declaration, {@code shadowsmoothfilter(in sampler2DShadow tex,
+	 * in vec3 uv, ...)} claims every identifier down to the first statement of the body.
+	 * <p>
+	 * A declaration in a branch nobody takes says nothing about the name, the way it says nothing to
+	 * {@link #liftUniforms}. Both Complementary packs declare {@code shadowtex0} a plain
+	 * {@code sampler2D} in their {@code composite1} and a {@code sampler2DShadow} in the branch that
+	 * is not composite1; taking the dead one would make every lookup on that name a comparison, in a
+	 * program whose texture is not one. The bracket count still walks every token, live or not,
+	 * because it is the shape of the text and not a statement about the program.
+	 * <p>
+	 * The road is decided per declaration, by the name and by nothing a stage chooses, so the same
+	 * name answers the same way in every stage that spells it the same. A file-scope declaration
+	 * keeps its spelling when every name it introduces is one of the shadow map's own and the pack
+	 * has not taken the name over as a custom image, because those are the names the binding can
+	 * really put a comparison sampler under; anything else compared is rewritten ordinary and
+	 * handed the arithmetic, as every name once was. What this cannot close is a pack spelling one
+	 * name two ways across the stages of one program: the sampler is the pipeline's, so the plain
+	 * spelling would read through the comparison, undefined exactly as it is under Iris, and the
+	 * binding says so by name when it meets one.
+	 * <p>
+	 * A parameter follows the unit: it keeps its spelling where the unit keeps a comparison at file
+	 * scope, since that is what its callers pass, and goes back to ordinary with everything else,
+	 * which is what the callers hold then. A unit mixing both roads at file scope leaves a helper
+	 * with one type and a caller with the other, which fails to compile, loudly; no pack of the
+	 * corpus does. A compute unit is all-arithmetic whatever it declares, its descriptors being
+	 * pushed on a road the render-pass substitution never sees, and so is every unit of a launch
+	 * whose soft-compare switch is armed.
+	 */
+	private void collectComparisonSamplers() {
+		int[] lines = this.tokens.lineNumbers();
+		int depth = 0;
+		int parameters = -1;
+		boolean arithmetic = softCompare() || this.stage == ProgramStage.COMPUTE;
+		List<Integer> parameterTypes = new ArrayList<>();
+		List<Scoped> parameterNames = new ArrayList<>();
+
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.directive() == null && token.operator("(")) {
+				if (depth == 0) {
+					parameters = index;
+				}
+
+				depth++;
+			} else if (token.directive() == null && token.operator(")")) {
+				depth--;
+			}
+
+			if (token.kind() != Kind.IDENTIFIER || token.directive() != null
+					|| !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			String plain = withoutComparison(token.text());
+			if (plain.equals(token.text()) || !LegacyGlsl.isOpaqueType(token.text())) {
+				continue;
+			}
+
+			// Every identifier this declaration introduces, and how far what it introduces them
+			// into reaches. Array bounds and commas are not identifiers, so they are stepped over.
+			int last = depth > 0 ? this.tokens.functionEnd(parameters) : this.tokens.size() - 1;
+			List<Scoped> introduced = new ArrayList<>();
+			boolean bindable = !arithmetic;
+			for (int scan = this.tokens.significantAfter(index); scan >= 0;
+					scan = this.tokens.significantAfter(scan)) {
+				Token next = this.tokens.get(scan);
+				if (next.operator(";") || (depth > 0 && (next.operator(",") || next.operator(")")))) {
+					break;
+				}
+
+				if (next.kind() == Kind.IDENTIFIER) {
+					introduced.add(new Scoped(next.text(), lines[index], lines[last]));
+					if (depth == 0 && (SamplerPlan.classify(next.text())
+							!= SamplerPlan.Kind.SHADOW_DEPTH
+							|| CustomImages.named(next.text()))) {
+						bindable = false;
+					}
+				}
+			}
+
+			// A parameter waits for the file-scope verdict, since what it must match is whatever
+			// its callers will be holding by then.
+			if (depth > 0) {
+				parameterTypes.add(index);
+				parameterNames.addAll(introduced);
+			} else if (bindable) {
+				this.hardwareComparisonSamplers.addAll(introduced);
+			} else {
+				this.tokens.replace(index, plain);
+				this.comparisonSamplers.addAll(introduced);
+				this.retypedSamplers.addAll(introduced);
+			}
+		}
+
+		if (!this.hardwareComparisonSamplers.isEmpty()) {
+			this.hardwareComparisonSamplers.addAll(parameterNames);
+
+			return;
+		}
+
+		for (int index : parameterTypes) {
+			this.tokens.replace(index, withoutComparison(this.tokens.get(index).text()));
+		}
+
+		this.comparisonSamplers.addAll(parameterNames);
+	}
+
+	/**
+	 * Finds every sampler a function takes as a parameter, and over which lines that name means it.
+	 * <p>
+	 * Nothing is rewritten and nothing depends on it being complete: it exists so that a lookup made
+	 * through such a name is counted as one no rule on names could have classified, rather than
+	 * passed over in silence. The old rewrite by name returned on exactly these and moved no
+	 * counter, so the one thing it could not do was also the one thing nothing measured.
+	 */
+	private void collectSamplerParameters() {
+		int[] lines = this.tokens.lineNumbers();
+		int depth = 0;
+		int parameters = -1;
+		int position = 0;
+
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.directive() == null && token.operator("(")) {
+				if (depth == 0) {
+					parameters = index;
+					position = 0;
+				}
+
+				depth++;
+			} else if (token.directive() == null && token.operator(")")) {
+				depth--;
+			} else if (token.directive() == null && depth == 1 && token.operator(",")) {
+				position++;
+			}
+
+			// Inside a parenthesis and nowhere else, which is what tells a parameter from a
+			// declaration: a declaration lists names until the semicolon and would claim the whole
+			// body of whatever follows it.
+			if (depth <= 0 || parameters < 0 || token.directive() != null
+					|| token.kind() != Kind.IDENTIFIER || !LegacyGlsl.isOpaqueType(token.text())) {
+				continue;
+			}
+
+			int name = this.tokens.significantAfter(index);
+			if (name >= 0 && this.tokens.get(name).kind() == Kind.IDENTIFIER) {
+				Scoped parameter = new Scoped(this.tokens.get(name).text(), lines[index],
+						lines[this.tokens.functionEnd(parameters)]);
+				this.samplerParameters.add(parameter);
+				if (!levelled(token.text())) {
+					this.unlevelledParameters.add(parameter);
+				}
+
+				int function = this.tokens.significantBefore(parameters);
+				if (function >= 0 && this.tokens.get(function).kind() == Kind.IDENTIFIER) {
+					this.typedParameters.add(new SamplerParameter(this.tokens.get(function).text(),
+							position, parameter));
+				}
+			}
+		}
+	}
+
+	/**
+	 * Moves {@code centerDepthSmooth} off its declaration and onto a lookup in one texel.
+	 * <p>
+	 * The value is the depth at the middle of the screen, smoothed by the pack's own half life, and
+	 * it is what a depth of field focuses on. It is accumulated on the card, in the texel the
+	 * engine's {@code CenterDepth} pass draws, and never comes back to this side at all, so it
+	 * cannot be a member of the uniform block: the declaration has to become a sampler and every use
+	 * of the name a lookup. That is exactly what Iris does, in
+	 * {@code CompositeDepthTransformer}, and the packs are written against the result rather than
+	 * against a float.
+	 * <p>
+	 * <strong>Only a full screen family, which is where Iris makes it available and nowhere
+	 * else.</strong> Its transformer runs under {@code Patch.COMPOSITE} alone, so a
+	 * {@code gbuffers} program that declares the name keeps a float nothing writes and reads a
+	 * nought. Mellow is the one pack of the corpus that reaches that case, declaring it in an include
+	 * its whole tree takes, and serving it there would be a value where the packs were written for a
+	 * zero.
+	 * <p>
+	 * The family and not the vertex format, for the same reason Iris chooses on the patch: what
+	 * decides this is which stage of the frame a program is drawn in, and a file translated with no
+	 * pass named is the entry point of nothing and is left as it stands. A compute stage is out for
+	 * the same reason: {@code TransformPatcher} sends {@code Patch.COMPUTE} to
+	 * {@code CommonTransformer} alone and past this transformer entirely.
+	 * <p>
+	 * Neither of those two families reaches this on the pack road, and both lines are written for
+	 * the one reader that does meet them: {@code PackProgram} reads a vertex, a geometry and a
+	 * fragment stage and no other, so a compute unit is never translated at all, and
+	 * {@code TargetPlan} puts a shadow composite aside before the list of running programs is
+	 * built. What is left is the harness, which translates a unit on its own with no plan around it.
+	 * <p>
+	 * The third refusal is a pack that {@code #define}s the name itself: the lookup would be
+	 * expanded by its own macro and the declaration is not the pack's meaning of the word. It is
+	 * taken from the macros the unit collects rather than from the live lines, so a definition in a
+	 * branch that is not taken stops the move as well - wider than it needs to be, and no pack of
+	 * the corpus writes it either way.
+	 * <p>
+	 * <strong>A shadow composite is out too, and there the reason is ours.</strong> Iris injects the
+	 * sampler there like anywhere else and never binds it: {@code ShadowCompositeRenderer} does not
+	 * name {@code CenterDepthSampler} once, so what the declaration reads is texture unit nought and
+	 * no pack can build on it. This engine runs no shadow composite at all, which
+	 * {@code TargetPlan} says by name where it drops them, so there is nothing here to bind either.
+	 * Leaving the family alone gives it the nought a gbuffers program gets, which costs the image
+	 * nothing: not one program of the family is drawn.
+	 * <p>
+	 * The member comes out of its declaration rather than the declaration out of the file, which is
+	 * what lets a name declared beside others be moved: {@code uniform float a, centerDepthSmooth;}
+	 * keeps its {@code a}. Where the name sits in the list makes no difference, the type being
+	 * looked for at the head of the list rather than in front of the name alone; Iris detaches the
+	 * {@code DeclarationMember} wherever it sits too, and injects its sampler before the
+	 * declarations. Here the sampler is registered like any other opaque uniform and the header
+	 * writes it, since the lifting has already been given a statement that no longer names it.
+	 * <p>
+	 * A declaration of the name under anything but {@code uniform float} is left exactly where it
+	 * is, and it neither moves this unit nor stops it. That is Iris's shape: its matcher takes
+	 * {@code uniform float name;} and nothing else, so a unit where the name is only a local, a
+	 * parameter or a global of the pack's own is not rewritten on either side, while a unit that
+	 * declares the uniform as well is rewritten around the other declaration. Every read goes to
+	 * the lookup there, the local's own reads included, which is what
+	 * {@code CompositeDepthTransformer.java:50} does over the whole tree. Both Complementary packs
+	 * write the shape, the uniform in one branch of an {@code #if} and an ordinary {@code float} of
+	 * the same name in the other; at their own defaults neither branch is live, so what they meet
+	 * is the empty unit above.
+	 */
+	private void moveCenterDepth() {
+		if (this.stage == ProgramStage.COMPUTE || !movesCenterDepth()
+				|| this.packMacros.contains(CENTER_DEPTH)) {
+			return;
+		}
+
+		int[] lines = this.tokens.lineNumbers();
+		List<Integer> members = new ArrayList<>();
+		List<Integer> reads = new ArrayList<>();
+
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.IDENTIFIER || !token.text().equals(CENTER_DEPTH)
+					|| token.directive() != null || !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			int type = declarationType(index);
+			if (type < 0) {
+				reads.add(index);
+			} else if (uniformFloat(type)) {
+				members.add(index);
+			}
+		}
+
+		// A unit that reads the name without declaring it as a uniform is left alone, which is the
+		// same answer Iris gives: what is not declared is not made available.
+		if (members.isEmpty()) {
+			return;
+		}
+
+		// The header declares the sampler, because the statement the name was taken out of may
+		// still declare other names and cannot carry a second declaration.
+		String texel = SamplerPlan.centerDepth();
+		members.forEach(this::detachMember);
+
+		this.samplers.put(texel, SAMPLER_2D + " " + texel);
+		reads.forEach(read -> this.tokens.inject(read, LOOKUP + "(" + texel + ", vec2(0.5)).r"));
+	}
+
+	/**
+	 * Whether the pass this file is the entry point of is one this engine draws over a quad, which is
+	 * where Iris makes the value available, less the shadow composites it never binds and this engine
+	 * never runs.
+	 */
+	private boolean movesCenterDepth() {
+		return fullScreenPass();
+	}
+
+	/**
+	 * Whether the pass this file is the entry point of is drawn over a quad by this engine: named,
+	 * not a geometry family, and not a shadow composite, which this engine never runs.
+	 */
+	private boolean fullScreenPass() {
+		String family = ProgramNames.familyOf(this.program);
+
+		return !this.program.isEmpty() && !ProgramNames.geometry(family)
+				&& !ProgramNames.shadowComposite(family);
+	}
+
+	/**
+	 * The type token of the declaration this name is a declarator of, or -1 when the name is read
+	 * rather than declared.
+	 * <p>
+	 * A built-in type in front of the name is what makes it a declaration, and it has to be the
+	 * type set rather than any identifier: this lexer has no keyword, so
+	 * {@code return centerDepthSmooth;} puts an identifier there too. The type is not always in
+	 * front of the name, though, and the walk back over the declarators before it is what finds it
+	 * where it is not: without that walk {@code uniform float a, centerDepthSmooth;} reads as a use
+	 * of the name, no member is found, and the whole unit is left standing with a member nothing
+	 * answers.
+	 * <p>
+	 * The walk gives up on anything that is not a bare declarator, and that is what keeps a read
+	 * out of the members: the comma of {@code f(a, centerDepthSmooth)} is reached the same way and
+	 * stops on the bracket in front of {@code a}.
+	 */
+	private int declarationType(int name) {
+		int cursor = name;
+		while (cursor > 0) {
+			int before = this.tokens.significantBefore(cursor);
+			if (before < 0) {
+				return -1;
+			}
+
+			Token token = this.tokens.get(before);
+			if (LegacyGlsl.TYPE_NAMES.contains(token.text())) {
+				return before;
+			}
+
+			if (!token.operator(",")) {
+				return -1;
+			}
+
+			// The declarator this comma binds to the list. Anything else there, an initialiser or a
+			// closing bracket, is an expression and not a list this pass knows how to read.
+			int previous = this.tokens.significantBefore(before);
+			if (previous < 0 || this.tokens.get(previous).kind() != Kind.IDENTIFIER) {
+				return -1;
+			}
+
+			cursor = previous;
+		}
+
+		return -1;
+	}
+
+	/**
+	 * Whether the declaration this type token opens is a {@code uniform float}, which is the one
+	 * shape whose member can be moved onto a sampler.
+	 */
+	private boolean uniformFloat(int type) {
+		if (!this.tokens.get(type).text().equals(CENTER_DEPTH_TYPE)) {
+			return false;
+		}
+
+		int cursor = this.tokens.significantBefore(type);
+		while (cursor >= 0 && isQualifier(this.tokens.get(cursor))) {
+			cursor = this.tokens.significantBefore(cursor);
+		}
+
+		return cursor >= 0 && this.tokens.get(cursor).identifier("uniform");
+	}
+
+	/**
+	 * Takes one declarator out of the statement that introduces it, leaving whatever else the
+	 * statement declares standing.
+	 * <p>
+	 * The comma that binds the name is what goes with it, and it is the one before unless the name
+	 * opens the list. Where there is no comma either side the name is the only declarator, and then
+	 * the statement itself goes: a {@code uniform float ;} left behind is not a declaration of
+	 * nothing, it is a syntax error.
+	 */
+	private void detachMember(int name) {
+		int before = this.tokens.significantBefore(name);
+		if (before >= 0 && this.tokens.get(before).operator(",")) {
+			this.tokens.blank(before);
+			this.tokens.blank(name);
+
+			return;
+		}
+
+		int after = this.tokens.significantAfter(name);
+		if (after >= 0 && this.tokens.get(after).operator(",")) {
+			this.tokens.blank(name);
+			this.tokens.blank(after);
+
+			return;
+		}
+
+		int start = this.tokens.statementStart(name);
+		int end = this.tokens.statementEnd(name);
+		if (start < 0 || end < 0) {
+			// A declaration with no semicolon, which is a pack problem and not ours to paper over.
+			// Left whole rather than half emptied, the way the lifting leaves it.
+			return;
+		}
+
+		this.tokens.blankRange(start, end);
+	}
+
+	/**
+	 * Records every storage block the unit declares, so a {@code bufferObject} can be bound to it.
+	 * <p>
+	 * Named rather than rewritten because the game never looks for one.
+	 * {@code IntermediaryShaderModule.createFromSpirv} lists the module's uniform buffers and its
+	 * sampled images and nothing else, so a storage block is appended afterwards and remapped with
+	 * the rest. Complementary Ultra writes {@code blockDataBuffer} at binding 0 for world-space
+	 * reflections; without that name the shadow program is refused and voxel lighting never writes.
+	 * <p>
+	 * Read on the shape and not on the word alone: {@code buffer} followed by a name and an opening
+	 * brace is an interface block and can be nothing else, so no brace depth has to be counted, which
+	 * this class cannot count anyway. A block in a branch the expander did not take is left out for
+	 * the reason a uniform in one is: the compiler will not see it either.
+	 */
+	private void collectStorageBlocks() {
+		int[] lines = this.tokens.lineNumbers();
+
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (!token.identifier("buffer") || token.directive() != null
+					|| !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			int name = this.tokens.significantAfter(index);
+			if (name < 0 || this.tokens.get(name).kind() != Kind.IDENTIFIER) {
+				continue;
+			}
+
+			int brace = this.tokens.significantAfter(name);
+			if (brace < 0 || !this.tokens.get(brace).operator("{")) {
+				continue;
+			}
+
+			int binding = layoutBinding(index);
+			note(this.tokens.get(name).text(), binding);
+			int close = this.tokens.matchingBracket(brace);
+			int instance = close < 0 ? -1 : this.tokens.significantAfter(close);
+			if (instance >= 0 && this.tokens.get(instance).kind() == Kind.IDENTIFIER) {
+				note(this.tokens.get(instance).text(), binding);
+			}
+		}
+	}
+
+	/**
+	 * Both spellings of one block, the block name and the instance name, share its binding, and the
+	 * first spelling filed keeps it.
+	 * <p>
+	 * Which of two would win is a question no pack that compiles can ask: two live declarations of
+	 * one block name at file scope are a redeclaration, so the only name that can reach here twice
+	 * is one block's instance name standing as another block's name, and neither of the two bindings
+	 * is then the right one. Iris never has the choice to make at all, binding a buffer by the index
+	 * in its layout qualifier and never by the name.
+	 */
+	private void note(String name, int binding) {
+		if (this.storageBlocks.stream().noneMatch(block -> block.name().equals(name))) {
+			this.storageBlocks.add(new TranslatedUnit.StorageBlock(name, binding));
+		}
+	}
+
+	/**
+	 * The {@code binding = N} in the layout qualifier that precedes this {@code buffer} token, or
+	 * {@code -1} when the pack wrote none. Complementary always writes one; a nameless
+	 * {@code bufferObject.N} is matched against it.
+	 */
+	private int layoutBinding(int bufferIndex) {
+		int start = 0;
+		for (int scan = bufferIndex - 1; scan >= 0; scan--) {
+			if (this.tokens.get(scan).operator(";")) {
+				start = scan + 1;
+				break;
+			}
+		}
+
+		for (int scan = start; scan < bufferIndex; scan++) {
+			if (!this.tokens.get(scan).identifier("binding")) {
+				continue;
+			}
+
+			int equals = this.tokens.significantAfter(scan);
+			if (equals < 0 || !this.tokens.get(equals).operator("=")) {
+				continue;
+			}
+
+			int number = this.tokens.significantAfter(equals);
+			if (number < 0 || this.tokens.get(number).kind() != Kind.NUMBER) {
+				continue;
+			}
+
+			try {
+				return Integer.parseInt(this.tokens.get(number).text());
+			} catch (NumberFormatException ignored) {
+				return -1;
+			}
+		}
+
+		return -1;
+	}
+
+	/**
+	 * Whether this name is a comparison sampler where it stands. A parameter only is inside its own
+	 * function, and Bliss's {@code lib/texFiltering.glsl} is why the question is asked that way: it
+	 * names both its plain sampler and its comparison sampler {@code tex}, in two functions one
+	 * after the other, and a rewrite of the first would not compile.
+	 */
+	private boolean comparisonAt(String name, int line) {
+		return scoped(this.comparisonSamplers, name, line);
+	}
+
+	/** The same question for the comparison samplers that kept their spelling. */
+	private boolean hardwareComparisonAt(String name, int line) {
+		return scoped(this.hardwareComparisonSamplers, name, line);
+	}
+
+	/** Whether one of these names means what the list says it does on this line. */
+	private static boolean scoped(Collection<Scoped> names, String name, int line) {
+		for (Scoped scoped : names) {
+			if (scoped.name().equals(name) && line >= scoped.from() && line <= scoped.to()) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * The same sampler type with the comparison taken out of its spelling, or the type as it stands.
+	 * {@code sampler2DShadow} becomes {@code sampler2D} and {@code sampler2DArrayShadow} becomes
+	 * {@code sampler2DArray}; a name that is not a sampler comes back untouched.
+	 */
+	private static String withoutComparison(String type) {
+		String shape = SamplerTypes.shapeOf(type);
+		if (shape == null || !shape.endsWith(SHADOW_SHAPE)) {
+			return type;
+		}
+
+		return type.substring(0, type.length() - SHADOW_SHAPE.length());
+	}
+
+	/**
+	 * Records each declarator of one declaration. False if none could be read.
+	 *
+	 * @param memory the memory qualifiers written in front of the type, kept beside the name
+	 *               rather than in the declaration so that the type stays the first word of it.
+	 *               Empty for everything but an opaque uniform, which is the only declaration
+	 *               these can be written on.
+	 * @param format the image format the pack wrote, kept beside the name for the same reason.
+	 *               Empty for everything but a storage image, and for one the pack left bare.
+	 */
+	private boolean readDeclarators(List<Integer> parts, int from, String type, String memory,
+			String format, Map<String, String> target) {
+		return readDeclarators(parts, from, type, memory, format, target, Map.of());
+	}
+
+	private boolean readDeclarators(List<Integer> parts, int from, String type, String memory,
+			String format, Map<String, String> target, Map<String, String> aliases) {
+		int cursor = from;
+		boolean any = false;
+
+		while (cursor < parts.size()) {
+			Token token = this.tokens.get(parts.get(cursor));
+			if (token.operator(";")) {
+				break;
+			}
+
+			if (token.kind() != Kind.IDENTIFIER) {
+				return false;
+			}
+
+			String name = liftedName(token.text(), aliases);
+			if (!memory.isEmpty()) {
+				this.memoryQualifiers.put(name, memory);
+			}
+
+			if (!format.isEmpty()) {
+				this.imageFormats.put(name, format);
+			}
+
+			StringBuilder declaration = new StringBuilder(type).append(' ').append(name);
+			cursor++;
+
+			while (cursor < parts.size() && this.tokens.get(parts.get(cursor)).operator("[")) {
+				int close = this.tokens.matchingBracket(parts.get(cursor));
+				if (close < 0) {
+					return false;
+				}
+
+				while (cursor < parts.size() && parts.get(cursor) <= close) {
+					declaration.append(this.tokens.get(parts.get(cursor)).text());
+					cursor++;
+				}
+			}
+
+			// OptiFine tolerates an initialiser on a uniform and GLSL does not, so it is dropped.
+			if (cursor < parts.size() && this.tokens.get(parts.get(cursor)).operator("=")) {
+				while (cursor < parts.size()) {
+					Token skipped = this.tokens.get(parts.get(cursor));
+					if (skipped.operator(",") || skipped.operator(";")) {
+						break;
+					}
+
+					cursor++;
+				}
+			}
+
+			record(target, name, declaration.toString());
+			any = true;
+
+			if (cursor < parts.size() && this.tokens.get(parts.get(cursor)).operator(",")) {
+				cursor++;
+			}
+		}
+
+		return any;
+	}
+
+	/** A lifted declaration stands before the pack's defines, so it needs the name they spell out. */
+	private static String liftedName(String name, Map<String, String> aliases) {
+		String original = name;
+		Set<String> seen = new HashSet<>();
+		while (aliases.containsKey(name)) {
+			if (!seen.add(name)) {
+				return original;
+			}
+			name = aliases.get(name);
+		}
+		return name;
+	}
+
+	private void record(Map<String, String> target, String name, String declaration) {
+		String existing = target.putIfAbsent(name, declaration);
+		if (existing != null && !existing.equals(declaration)) {
+			this.conflicts.add(name);
+		}
+	}
+
+
+	/**
+	 * The answers the header is written from, taken once every pass has run. Nothing here is
+	 * written back, which is why {@link Emitter} is handed these rather than this object.
+	 */
+	private Emitter emitter(Map<String, String> memory, Map<String, String> formats) {
+		return new Emitter(this.stage, this.inputs, this.bound, this.alphaTest, this.extensions,
+				this.engineDefines,
+				memory, formats, this.used, this.declaredNames,
+				this.synthesized,
+				this.volumes.read(), this.packOutputs, this.maxFragmentOutput, this.owedOutputs,
+				this.splits, this.gameTextureMatrix,
+				this.gameModelView, this.softRewrites, this.trigCalls, this.hashCalls,
+				this.packBuiltinCalls, this.mainWrapped, this.depthEpilogue, this.terrainPrologue,
+				this.distantPrologue, this.entityWrapped, this.linesWrapped, this.alphaEpilogue, this.covers,
+				wrapsFragment(), this.ordered, this.namesFragDepth, this.makesOverlayColour,
+				this.coreProfile);
+	}
+
+	/**
+	 * Names declared under a built-in type once the uniforms have been lifted out of the text. The
+	 * outputs moved into the header count too: the body no longer shows them, and a shared block
+	 * that carried the same name would end up declaring it twice.
+	 */
+	private Set<String> declaredUnderAType() {
+		Set<String> names = new HashSet<>();
+		this.packOutputs.values().forEach(output -> names.add(output.name()));
+
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (token.kind() != Kind.IDENTIFIER || token.directive() != null) {
+				continue;
+			}
+
+			int before = this.tokens.significantBefore(index);
+			if (before >= 0 && LegacyGlsl.TYPE_NAMES.contains(this.tokens.get(before).text())) {
+				names.add(token.text());
+			}
+		}
+
+		return names;
+	}
+
+	/**
+	 * Sampler names this stage reads outside their uniform declaration. An include can declare
+	 * twenty textures of which the body samples one: those unused names still occupy identifier
+	 * tokens at the declaration, and counting every identifier would treat them as used.
+	 */
+	private Set<String> sampledNames() {
+		boolean[] declared = new boolean[this.tokens.size()];
+		int[] lines = this.tokens.lineNumbers();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			Token token = this.tokens.get(index);
+			if (!token.identifier("uniform") || token.directive() != null
+					|| !this.unit.isLive(lines[index])) {
+				continue;
+			}
+
+			FileScope scope = fileScopeDeclaration(index);
+			if (scope == null) {
+				continue;
+			}
+
+			for (int at = scope.start(); at <= scope.end() && at < declared.length; at++) {
+				declared[at] = true;
+			}
+		}
+
+		Set<String> sampled = new LinkedHashSet<>();
+		for (int index = 0; index < this.tokens.size(); index++) {
+			if (declared[index]) {
+				continue;
+			}
+
+			Token token = this.tokens.get(index);
+			if (token.kind() == Kind.IDENTIFIER) {
+				String name = liftedName(token.text(), this.macroAliases);
+				if (this.samplers.containsKey(name)) {
+					sampled.add(name);
+				}
+			}
+		}
+
+		return sampled;
+	}
+
+	/**
+	 * Every name the translated body mentions. Taken from the tokens rather than the text, so a
+	 * name that only appears inside a comment does not have a uniform declared for it.
+	 */
+	private Set<String> usedNames() {
+		Set<String> names = new HashSet<>(this.injectedNames);
+		for (Token token : this.tokens) {
+			if (token.kind() == Kind.IDENTIFIER) {
+				names.add(token.text());
+			}
+		}
+
+		return names;
+	}
+
+	private TranslatedUnit.Notes notes() {
+		return new TranslatedUnit.Notes(this.maxFragmentOutput + 1, this.dynamicFragData,
+				this.conflicts.size(), this.shadowCalls, this.unwrappedShadowCalls,
+				this.strippedExtensions, this.depthEpilogue ? 1 : 0, this.alphaEpilogue ? 1 : 0,
+				this.covers ? 1 : 0, this.depthLookups,
+				this.parameterLookups, this.pinnedLookups, this.unpinnedParameterLookups,
+				this.fragCoordZ, this.fragCoordXyz,
+				this.fragCoordUnhandled, this.fragDepthWrites, this.fragDepthUnhandled,
+				List.copyOf(this.conflicts), comparedSamplers(), hardwareComparedSamplers(),
+				retypedSamplers(), List.copyOf(this.storageBlocks),
+				this.volumes.lookups(), this.volumes.leftAlone(), this.trigCalls, this.gameTextureMatrix,
+				this.gameModelView);
+	}
+
+	/**
+	 * The comparison samplers this stage is handed from outside, both roads together, which are the
+	 * only ones anything binds: one taken as a parameter is a name inside a function and never a
+	 * descriptor.
+	 */
+	private List<String> comparedSamplers() {
+		return descriptors(Stream.concat(this.comparisonSamplers.stream(),
+				this.hardwareComparisonSamplers.stream()));
+	}
+
+	/** The bound ones of the road that kept its spelling, which the binding owes a comparison. */
+	private List<String> hardwareComparedSamplers() {
+		return descriptors(this.hardwareComparisonSamplers.stream());
+	}
+
+	/** The bound ones this unit declares under a type the pack did not write. */
+	private List<String> retypedSamplers() {
+		return descriptors(this.retypedSamplers.stream());
+	}
+
+	private List<String> descriptors(Stream<Scoped> scoped) {
+		return scoped
+				.map(Scoped::name)
+				.distinct()
+				.filter(this.samplers::containsKey)
+				.toList();
+	}
+
+
+	/** Adds a memory qualifier to what a declaration carries, in the order the pack wrote it. */
+	private static void rememberMemoryQualifier(List<String> memory, Token token) {
+		String text = token.text();
+		if (token.kind() == Kind.IDENTIFIER && LegacyGlsl.MEMORY_QUALIFIERS.contains(text)
+				&& !memory.contains(text)) {
+			memory.add(text);
+		}
+	}
+
+	static boolean isQualifier(Token token) {
+		return token.kind() == Kind.IDENTIFIER
+				&& (LegacyGlsl.MEMORY_QUALIFIERS.contains(token.text())
+						|| LegacyGlsl.PRECISION_QUALIFIERS.contains(token.text()));
+	}
+}

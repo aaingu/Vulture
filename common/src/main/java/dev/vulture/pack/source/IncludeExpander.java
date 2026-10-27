@@ -1,0 +1,835 @@
+package dev.vulture.pack.source;
+
+import dev.vulture.glsl.CompilerMacros;
+import dev.vulture.glsl.LoadClock;
+import dev.vulture.pack.model.ProgramStage;
+import dev.vulture.pack.option.OptionRewriter;
+import dev.vulture.pack.option.SettingSet;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Flattens one entry file into a single unit: includes spliced in, settings applied where they
+ * are declared, dead branches left in place for the compiler to drop.
+ * <p>
+ * Which includes are followed depends on the settings, because the directive can sit inside a
+ * conditional. That makes the include graph a function of the settings rather than a property
+ * of the pack, and it is why a unit has to be rebuilt when a setting changes rather than
+ * patched.
+ * <p>
+ * A condition is decided on the names the compiler will have defined when it reads the line: the
+ * macros it writes ahead of the stage ({@link CompilerMacros}), the engine's own symbols, and the
+ * pack's defines as they are met. Leave the first out and an include under a test of a compiler
+ * macro is dropped where the compiler goes on to take the branch, and the code under it then names
+ * something nothing declared.
+ * <p>
+ * A line that starts inside a block comment is read as neither a condition nor a define, the
+ * compiler stripping comments before it reads a directive. NVIDIA's FXAA header, which SEUS PTGI
+ * HRR ships, gives {@code #define FXAA_HLSL_5 1} among the examples of its licence comment: read as
+ * a define, it made the Direct3D branches live, the translator then settled the macros of the GLSL
+ * branch away as redefinitions, and the three composite programs that include the header did not
+ * build. For the same reason every format directive a pack writes between a condition and its end
+ * inside one comment is live, as under Iris, which preprocesses with comments kept and reads its
+ * directives out of them. The player's settings are still applied to such a line, the directive
+ * readers taking their constants out of comments, and an include there is still followed, as Iris
+ * follows it: it resolves includes on the raw lines before its preprocessor runs. Two shapes the
+ * compiler takes are still not read: a directive after the pair that closes a comment on the same
+ * line, and the {@code #endif} this reader adds at the end of a file that closes no comment it
+ * opened, which lands inside that comment.
+ * <p>
+ * An include in a branch that is off becomes a comment rather than staying as it was. Keeping
+ * it would leave a directive GLSL has no notion of sitting in the text, which is a gamble on
+ * how the compiler treats directives inside a block it is discarding.
+ * <p>
+ * The other lines that do not survive as written are the conditionals a pack wrote loosely, which
+ * the compiler would refuse where the reference never shows it a conditional at all. They are
+ * rewritten into a directive GLSL will take, or commented out where there is nothing for them to
+ * close: see {@link #defined} and {@link #unopened}.
+ * <p>
+ * A pack's {@code #error} becomes a comment too, in a branch taken or not. jcpp hands it to the
+ * reference's listener, which logs it and lets the program build ({@code GlslCollectingListener}
+ * extends {@code DefaultPreprocessorListener}). Photon guards several programs that way, and its
+ * properties carry no line turning {@code prepare} off with cloud shadows, so that program was
+ * refused here and the whole pack with it. The ones this reader writes itself, a missing or
+ * cyclic include, are not the pack's and stay errors.
+ */
+public final class IncludeExpander {
+
+	/** Deep enough for anything real: the worst of the corpus reaches five. */
+	private static final int MAX_DEPTH = 32;
+
+	/**
+	 * A depth limit alone does not bound the work. Includes form a graph, not a tree, and a
+	 * file that includes the next one twice doubles at every level: eighteen small files with no
+	 * cycle at all produce half a million lines and take forty seconds, and thirty-two levels
+	 * would run for hours before running out of memory. Neither of those is catchable where this
+	 * is called from, so the total is bounded too.
+	 */
+	private static final int MAX_FILES = 20_000;
+
+	private static final int MAX_LINES = 400_000;
+
+	/**
+	 * Lines are not the cost that matters downstream. Four hundred thousand of them held one
+	 * pack's worth of tokens in a gigabyte and a half, which is an {@code OutOfMemoryError} rather
+	 * than an exception anyone can catch. The worst unit of the corpus is four hundred kilobytes,
+	 * so this leaves an order of magnitude and still bounds the translator that reads it.
+	 */
+	private static final int MAX_CHARACTERS = 4_000_000;
+
+	private static final Pattern INCLUDE = Pattern.compile("^\\s*#\\s*include\\s+[<\"](.+?)[>\"].*$");
+	private static final Pattern IF_DEFINED = Pattern.compile("^(\\s*)#\\s*(ifdef|ifndef)\\b(.*)$");
+
+	/** What has to follow {@code #ifdef} for the directive to be one the compiler will read. */
+	static final Pattern DEFINED_NAME = Pattern.compile("^\\s+([A-Za-z_]\\w*)(.*)$");
+
+	private static final Pattern IF = Pattern.compile("^(\\s*)#\\s*if\\b(.*)$");
+	private static final Pattern ELIF = Pattern.compile("^(\\s*)#\\s*elif\\b(.*)$");
+	private static final Pattern ELSE = Pattern.compile("^\\s*#\\s*else\\b.*$");
+	private static final Pattern ENDIF = Pattern.compile("^\\s*#\\s*endif\\b.*$");
+	private static final Pattern DEFINE = Pattern.compile("^\\s*#\\s*define\\s+([A-Za-z_]\\w*)\\s*(.*)$");
+	private static final Pattern UNDEF = Pattern.compile("^\\s*#\\s*undef\\s+([A-Za-z_]\\w*).*$");
+	private static final Pattern VERSION = Pattern.compile("^\\s*#\\s*version\\s+(.*)$");
+	private static final Pattern ERROR = Pattern.compile("^\\s*#\\s*error\\b.*$");
+
+	/** The two comment shapes a directive's tail is stripped of, compiled once for every line. */
+	private static final Pattern LINE_COMMENT = Pattern.compile("//.*");
+	private static final Pattern BLOCK_COMMENT = Pattern.compile("/\\*.*?\\*/");
+
+	private final ShaderPackSource source;
+	private final SettingSet settings;
+	private final boolean partOfALoad;
+
+	/**
+	 * The directives this pack writes loosely, each said once, in the order they were met. Held
+	 * on the expander and not on a unit: a loose directive lives in a shared body, so it is met
+	 * again in every program that includes it, and one line per program would bury it.
+	 */
+	private final Set<String> loose = new LinkedHashSet<>();
+
+	public IncludeExpander(ShaderPackSource source, SettingSet settings) {
+		this(source, settings, true);
+	}
+
+	private IncludeExpander(ShaderPackSource source, SettingSet settings, boolean partOfALoad) {
+		this.source = source;
+		this.settings = settings;
+		this.partOfALoad = partOfALoad;
+	}
+
+	/**
+	 * For the pack report's walk, whose flattening is neither clocked as a load's nor kept by the
+	 * opening.
+	 * <p>
+	 * That walk expands every entry point the pack ships, once each, and it is made on the first
+	 * load of a given pack and on none of the reloads of it. Counted into the clock, it would leave
+	 * the figure several times larger on one load than on the next with nothing on the line saying
+	 * which of the two had just been read, where what the line is for is what a load pays every
+	 * time.
+	 * <p>
+	 * Kept by the opening, it would find nothing there ever, no entry point being asked for twice,
+	 * and would hold every unit it built alive to the end of a reading whose whole point is to
+	 * throw them away, three hundred and thirty-nine of them for the widest pack of the corpus.
+	 */
+	public static IncludeExpander forTheReport(ShaderPackSource source, SettingSet settings) {
+		return new IncludeExpander(source, settings, false);
+	}
+
+	/**
+	 * One entry file flattened, and flattened once per opening of the pack and per settings it is
+	 * read under.
+	 * <p>
+	 * <strong>The memo is what makes a load pay for a unit once.</strong> A load walks one place of
+	 * the pack over and over: once for its directives, once for the chain, once for the chunk
+	 * programs, and once more for every compute program it ships. Each of those walks every fragment
+	 * entry of the place, and expanding one of Photon's costs tens of milliseconds, so the same unit
+	 * built a dozen times was the bulk of what a load with both compiled stores warm still waited on.
+	 * <p>
+	 * The pack report's walk neither reads the memo nor fills it, and {@link #forTheReport} says
+	 * why.
+	 * <p>
+	 * A unit that throws is not remembered, so whoever asks next reads the file again and meets the
+	 * same failure rather than a silence.
+	 * <p>
+	 * The device's answer on its extensions, which decides some of the compiler's macros, is not in
+	 * the memo's key: the device gives it once, at its creation, before any pack is read.
+	 */
+	public ExpandedUnit expand(Path entry) throws IOException {
+		String relative = this.source.rel(entry);
+		if (this.partOfALoad) {
+			Optional<ExpandedUnit> known = this.source.expandedUnit(this.settings, relative);
+			if (known.isPresent()) {
+				LoadClock.expansionServed();
+
+				return known.get();
+			}
+		}
+
+		long began = System.nanoTime();
+		State state = new State(startingDefines(relative), this.loose);
+
+		expandFile(entry, 0, state);
+
+		ExpandedUnit unit = new ExpandedUnit(relative, List.copyOf(state.output), state.version,
+				state.toStats(), state.live, state.defines);
+		if (this.partOfALoad) {
+			LoadClock.expansion(System.nanoTime() - began);
+			this.source.rememberUnit(this.settings, relative, unit);
+		}
+
+		return unit;
+	}
+
+	/**
+	 * What the compiler has defined before the first line of this entry, then the engine's symbols.
+	 * <p>
+	 * The stage is the one the entry's extension names, which is the stage the file is compiled as,
+	 * so no caller has to say it: the fragment entries a place is read for its directives start
+	 * with the table its fragment stage is compiled with. A file whose extension names no stage is
+	 * compiled as none and starts with the engine's symbols alone.
+	 */
+	private Map<String, String> startingDefines(String relative) {
+		Map<String, String> defines = new LinkedHashMap<>();
+		ProgramStage.ofFile(relative)
+				.ifPresent(stage -> defines.putAll(CompilerMacros.definedIn(stage)));
+		defines.putAll(this.settings.unitDefines());
+
+		return defines;
+	}
+
+	/** What this reader read for the pack across every unit expanded so far, ready for the log. */
+	public List<String> looseDirectives() {
+		return List.copyOf(this.loose);
+	}
+
+	private void expandFile(Path file, int depth, State state) throws IOException {
+		String relative = this.source.rel(file);
+		state.maxDepth = Math.max(state.maxDepth, depth);
+
+		if (depth > MAX_DEPTH) {
+			state.tooDeep++;
+			state.emit("#error include nesting too deep at " + relative, true);
+			return;
+		}
+
+		if (++state.filesExpanded > MAX_FILES || state.overBudget()) {
+			state.giveUp(relative);
+			return;
+		}
+
+		// A file already on the current path is a cycle. The measuring prototype had no such
+		// check and leaned on the depth limit instead, which meant a malformed pack was expanded
+		// thirty-two times over before anything said so.
+		if (!state.onPath.add(relative)) {
+			state.cycles++;
+			state.emit("#error include cycle at " + relative, true);
+			return;
+		}
+
+		if (!state.everSeen.add(relative)) {
+			state.duplicates++;
+		}
+
+		ConditionStack conditions = new ConditionStack();
+
+		for (Logical logical : logicalLines(file)) {
+			// Checked here and not only on the way in. One file is enough on its own: a pack that
+			// ships a single shader of a million lines never expands anything, so a budget read
+			// once per file would never be read at all.
+			if (state.overBudget()) {
+				state.giveUp(relative);
+				break;
+			}
+
+			String line = logical.text();
+			if (state.inBlockComment && !INCLUDE.matcher(line).matches()) {
+				String settled = conditions.active()
+						? OptionRewriter.apply(line, this.settings.chosen(), this.settings.scale())
+						: line;
+				if (settled.equals(line)) {
+					state.emit(logical.physical(), conditions.active());
+				} else {
+					state.emit(settled, true);
+				}
+
+				continue;
+			}
+
+			String directive = handleCondition(logical, relative, conditions, state);
+			if (directive != null) {
+				if (directive.equals(line)) {
+					state.emit(logical.physical(), true);
+				} else {
+					state.emit(directive, true);
+				}
+
+				continue;
+			}
+
+			if (ERROR.matcher(line).matches()) {
+				report(conditions, state, relative, logical,
+						"the reference only logs it, so it is not written out");
+				// A block comment the message opens still has to open, or its body would be code.
+				state.emit(BlockComments.openAfter(line, false)
+						? "/* error not written out */ /*"
+						: "// error not written out: " + line.trim(), conditions.active());
+				continue;
+			}
+
+			Matcher include = INCLUDE.matcher(line);
+			if (include.matches()) {
+				state.seen++;
+				if (conditions.active()) {
+					follow(file, include.group(1), depth, state);
+				} else {
+					state.skipped++;
+					state.emit("// include not taken: " + include.group(1), false);
+				}
+
+				continue;
+			}
+
+			if (!conditions.active()) {
+				// Kept as it was, so that what the compiler discards is what is written here.
+				state.emit(logical.physical(), false);
+				continue;
+			}
+
+			Matcher version = VERSION.matcher(line);
+			if (version.matches()) {
+				// A unit has exactly one version directive and it is the entry file's. Later
+				// ones come from includes and would be an error where they land.
+				if (state.version == null) {
+					state.version = LINE_COMMENT.matcher(version.group(1)).replaceAll("").trim();
+					state.emit(logical.physical(), true);
+				}
+
+				continue;
+			}
+
+			String tracked = track(line, state);
+			if (tracked.equals(line)) {
+				state.emit(logical.physical(), true);
+			} else {
+				state.emit(tracked, true);
+			}
+		}
+
+		// A rewritten conditional the file never closes would leave a directive this reader put in
+		// the text with nothing to close it, so it is closed where the file ends.
+		//
+		// Only those are closed: a group the PACK left open is handed to the compiler exactly as the
+		// pack wrote it.
+		for (int open = conditions.unclosedRewritten(); open > 0; open--) {
+			state.emit("#endif", true);
+			state.openInOutput--;
+		}
+
+		state.onPath.remove(relative);
+	}
+
+	/**
+	 * One line as the compiler reads it, where in the file it starts, and the lines it was written
+	 * over.
+	 * <p>
+	 * A backslash before a line break joins the next line onto this one before the compiler reads
+	 * a single directive, so the directives are matched and the conditions decided on the joined
+	 * text. Read line by line as written, a condition continued over three lines is decided on its
+	 * first: Photon undefines its waving switches under one written that way, the fragment on the
+	 * first line could not be decided and so stood for true, the switches came off the table, and
+	 * the include they guard was skipped while the compiler, seeing the whole condition, kept the
+	 * code that calls into it.
+	 * <p>
+	 * What is EMITTED stays the lines as written, because the compiler joins them again and joins
+	 * once: Bliss ends a comment with three backslashes and a blank line under it, the compiler
+	 * takes the last backslash with the blank line and the comment ends there, and a joined line
+	 * written out would end with the two backslashes left, which the compiler would then take
+	 * with the line of code below. Sixteen units lost a declaration that way. The lines written out
+	 * joined are the ones this reader had to rewrite, a {@code #define} a setting changed, a
+	 * conditional the pack wrote loosely and an {@code #error} turned into a comment, and no pack
+	 * of the corpus continues any of those.
+	 */
+	private record Logical(String text, int number, List<String> physical) {
+	}
+
+	/** The file's lines as the compiler joins them, kept on the opening with the raw lines. */
+	private record LogicalLinesOf(Path file) {
+	}
+
+	/**
+	 * Once per file of an opening rather than once per inclusion of it: a header a unit pulls in
+	 * twenty times was wrapped twenty times over lines the opening already kept. The report's
+	 * walk keeps nothing on its opening, as its other memo does not either.
+	 */
+	private List<Logical> logicalLines(Path file) throws IOException {
+		if (!this.partOfALoad) {
+			return logicalLines(this.source.readLines(file));
+		}
+
+		return this.source.derived(new LogicalLinesOf(file),
+				() -> logicalLines(this.source.readLines(file)));
+	}
+
+	private static List<Logical> logicalLines(List<String> lines) {
+		List<Logical> logical = new ArrayList<>(lines.size());
+		StringBuilder joined = new StringBuilder();
+		List<String> physical = new ArrayList<>();
+		int number = 1;
+		for (String line : lines) {
+			physical.add(line);
+			if (line.endsWith("\\")) {
+				joined.append(line, 0, line.length() - 1);
+				continue;
+			}
+
+			joined.append(line);
+			logical.add(new Logical(joined.toString(), number, List.copyOf(physical)));
+			number += physical.size();
+			joined.setLength(0);
+			physical.clear();
+		}
+
+		if (!physical.isEmpty()) {
+			logical.add(new Logical(joined.toString(), number, List.copyOf(physical)));
+		}
+
+		return logical;
+	}
+
+	/**
+	 * Accounts for a conditional directive and says what to write in its place.
+	 *
+	 * @return null when the line is not a conditional directive, and otherwise the text to write,
+	 *         which is the line itself unless the pack wrote the directive loosely
+	 */
+	private String handleCondition(Logical logical, String relative, ConditionStack conditions,
+			State state) {
+		String line = logical.text();
+
+		Matcher ifDefined = IF_DEFINED.matcher(line);
+		if (ifDefined.matches()) {
+			state.conditionals++;
+			state.openInOutput++;
+
+			return defined(logical, relative, ifDefined, conditions, state);
+		}
+
+		Matcher iff = IF.matcher(line);
+		if (iff.matches()) {
+			state.conditionals++;
+			state.openInOutput++;
+			if (!beyondComments(iff.group(2)).isEmpty()) {
+				String written = rewritten(iff.group(2), state);
+				if (written != null) {
+					conditions.rewrittenIfDirective(written.equals("1"));
+
+					return iff.group(1) + "#if " + written;
+				}
+
+				conditions.ifDirective(() -> decide(iff.group(2), state));
+				return line;
+			}
+
+			report(conditions, state, relative, logical,
+					"no expression follows it, so the group it opens is not taken");
+			conditions.rewrittenIfDirective(false);
+
+			return iff.group(1) + "#if 0";
+		}
+
+		Matcher elif = ELIF.matcher(line);
+		if (elif.matches()) {
+			state.conditionals++;
+			if (state.openInOutput == 0) {
+				return unopened(conditions, state, relative, logical);
+			}
+
+			if (!beyondComments(elif.group(2)).isEmpty()) {
+				String written = rewritten(elif.group(2), state);
+				if (written != null) {
+					conditions.rewrittenElifDirective(written.equals("1"));
+
+					return elif.group(1) + "#elif " + written;
+				}
+
+				conditions.elifDirective(() -> decide(elif.group(2), state));
+				return line;
+			}
+
+			report(conditions, state, relative, logical,
+					"no expression follows it, so the branch it opens is not taken");
+			conditions.elifDirective(() -> false);
+
+			return elif.group(1) + "#elif 0";
+		}
+
+		if (ELSE.matcher(line).matches()) {
+			if (state.openInOutput == 0) {
+				return unopened(conditions, state, relative, logical);
+			}
+
+			conditions.elseDirective();
+
+			return line;
+		}
+
+		if (ENDIF.matcher(line).matches()) {
+			if (state.openInOutput == 0) {
+				return unopened(conditions, state, relative, logical);
+			}
+
+			state.openInOutput--;
+			conditions.endifDirective();
+
+			return line;
+		}
+
+		return null;
+	}
+
+	/**
+	 * A directive that continues or closes a group where the text written out has none open. jcpp
+	 * reports it and carries on with the text it had; the compiler here would be handed the
+	 * directive and refuse the program for it, so it becomes a comment. Photon writes one, and it
+	 * is what costs its three {@code composite3} programs.
+	 * <p>
+	 * The count that decides this is of what has been WRITTEN, never the depth of the file being
+	 * read: a group opened in an include is closed by whichever file writes its {@code #endif}. A
+	 * count too low would comment out an {@code #endif} a group needed, and it is too low on the
+	 * shapes this reader does not see: a directive that follows a comment on the same line, and an
+	 * {@code #endif} added at the end of a file inside a comment that file never closed.
+	 */
+	private static String unopened(ConditionStack conditions, State state, String relative,
+			Logical logical) {
+		report(conditions, state, relative, logical,
+				"nothing is open for it to close, so it is not written out");
+
+		return "// no conditional is open here: " + logical.text().trim();
+	}
+
+	/**
+	 * Says what was read of a directive the pack wrote loosely.
+	 * <p>
+	 * Not said from a branch that is off: the reference's preprocessor does not read the inside of
+	 * one, so there is nothing it decided differently there to report.
+	 */
+	private static void report(ConditionStack conditions, State state, String relative,
+			Logical logical, String decided) {
+		if (conditions.active()) {
+			state.loose(relative, logical, decided);
+		}
+	}
+
+	/**
+	 * Reads one {@code #ifdef} or {@code #ifndef}, and rewrites it when what the pack wrote is not
+	 * a directive the compiler will take.
+	 * <p>
+	 * Two shapes are written loosely and the reference lets both through, because it hands the
+	 * compiler the text its preprocessor produced rather than the text the pack wrote, so no
+	 * conditional directive survives as far as a compiler at all: {@code JcppProcessor.java:55-64}
+	 * of the reference walks the tokens jcpp yields and {@code ShaderPack.java:317} makes that the
+	 * program source. Here the directives are left in the text for the compiler to read, which is
+	 * what turns a shape jcpp merely complains about into a program that will not build.
+	 * <p>
+	 * A name followed by anything else: jcpp reads the first token, decides on it, and reports each
+	 * further token as an unexpected one, so the extra tokens are dropped and the decision is
+	 * unchanged. Anything else than a name after the keyword, a number, a bracket, or the end of
+	 * the line: jcpp reports what it read instead of a name and leaves the group it opened taken,
+	 * so it becomes a group that is always taken. Both are reported to the listener rather than
+	 * thrown, and the reference's listener only prints, so neither refuses the pack there.
+	 * <p>
+	 * One thing jcpp does that is not reproduced: when the keyword is followed by nothing at all,
+	 * recovering eats the line under it, the newline having already been read as the name that was
+	 * missing. That is a slip of its recovery rather than a decision, it does not happen when a
+	 * token other than a name is there to be read, and reproducing it would silently drop a line of
+	 * a pack's code.
+	 */
+	private String defined(Logical logical, String relative, Matcher ifDefined,
+			ConditionStack conditions, State state) {
+		String indent = ifDefined.group(1);
+		String keyword = ifDefined.group(2);
+		Matcher name = DEFINED_NAME.matcher(ifDefined.group(3));
+
+		if (!name.matches()) {
+			report(conditions, state, relative, logical,
+					"nothing that can name a setting follows it, so the group it opens is taken");
+			conditions.rewrittenIfDirective(true);
+
+			return indent + "#if 1";
+		}
+
+		boolean defined = state.defines.containsKey(name.group(1));
+		conditions.ifDirective(keyword.equals("ifdef") == defined);
+
+		if (beyondComments(name.group(2)).isEmpty()) {
+			return logical.text();
+		}
+
+		report(conditions, state, relative, logical, "only " + name.group(1) + " is read");
+
+		return indent + "#" + keyword + " " + name.group(1);
+	}
+
+	/** What the compiler still has to read once the comments are taken out of a directive's tail. */
+	private static String beyondComments(String tail) {
+		String code = BLOCK_COMMENT.matcher(tail).replaceAll(" ");
+		int line = code.indexOf("//");
+		int unterminated = code.indexOf("/*");
+		if (line >= 0) {
+			code = code.substring(0, line);
+		}
+
+		if (unterminated >= 0 && (line < 0 || unterminated < line)) {
+			code = code.substring(0, unterminated);
+		}
+
+		return code.trim();
+	}
+
+	/**
+	 * An expression that cannot be decided is treated as true. Pulling in code that turns out to
+	 * be unnecessary costs a compiler error at worst, and it names the line; dropping code that
+	 * was needed removes a function, and the error then points somewhere unrelated.
+	 */
+	private boolean decide(String expression, State state) {
+		Optional<Boolean> value = PreprocessorExpression.evaluate(expression, state.defines);
+		if (value.isEmpty()) {
+			state.undecidable++;
+			return true;
+		}
+
+		return value.get();
+	}
+
+	/**
+	 * The verdict written out as the condition itself, on the one kind of condition the compiler
+	 * will not read, or null on every other, which keeps its own text.
+	 * <p>
+	 * The preprocessor of the language works in whole numbers and refuses a line carrying anything
+	 * else; a GL driver reduces it and answers, so packs ship them. Clarity writes
+	 * {@code #if MOTION_BLUR > 0.0} with that setting at 0.5 and Pegasus writes
+	 * {@code #if SKY_LIGHT_FALLOFF == 1} with the macro at 1.0, and the second is what its terrain,
+	 * water, entity and particle passes were refused for.
+	 * <p>
+	 * <strong>What goes out is this expander's own answer, and that is only safe because the
+	 * evaluator computes it the way a driver does.</strong> It reads a fractional value as the
+	 * number it is rather than truncating, so {@code 0.5 > 0.0} is true here as it is there. The
+	 * shape written before that was true was the same rewrite over an evaluator that truncated, and
+	 * it read Clarity's motion blur as switched off: the picture would have lost the effect with
+	 * nothing said. The two halves only work together.
+	 * <p>
+	 * An expression neither this nor a driver can settle is written as taken, which is what
+	 * {@link #decide} answers everywhere else and for the reason given there.
+	 */
+	private String rewritten(String expression, State state) {
+		PreprocessorExpression.Verdict verdict =
+				PreprocessorExpression.decide(expression, state.defines);
+		if (!verdict.fractional()) {
+			return null;
+		}
+
+		// Not counted as undecidable, unlike decide's own road, and the difference is the point:
+		// that counter says how many conditions this reader handed to the compiler without an
+		// answer, and these it answers. An `#elif` is also asked here before the stack has said
+		// whether the branch can still matter, so counting would drift by every branch an earlier
+		// one had already won.
+		return verdict.taken().orElse(true) ? "1" : "0";
+	}
+
+	private void follow(Path from, String spec, int depth, State state) throws IOException {
+		Optional<Path> target = spec.startsWith("/")
+				? this.source.resolveInsideShaders(spec)
+				: this.source.resolveRelativeTo(from, spec);
+
+		if (target.isEmpty()) {
+			state.missing++;
+			// Left in the text on purpose: the compiler then names the file that is absent,
+			// rather than the load quietly producing a unit with a hole in it.
+			state.emit("#error include not found: " + spec, true);
+			return;
+		}
+
+		state.followed++;
+		expandFile(target.get(), depth + 1, state);
+	}
+
+	/**
+	 * Applies the chosen settings to a declaration and keeps the define table in step with the
+	 * text actually written, so that a later conditional sees what the compiler will see.
+	 */
+	private String track(String line, State state) {
+		Matcher undef = UNDEF.matcher(line);
+		if (undef.matches()) {
+			state.defines.remove(undef.group(1));
+			return line;
+		}
+
+		Matcher original = DEFINE.matcher(line);
+		String rewritten = OptionRewriter.apply(line, this.settings.chosen(), this.settings.scale());
+		Matcher applied = DEFINE.matcher(rewritten);
+
+		if (applied.matches()) {
+			state.defines.put(applied.group(1),
+					LINE_COMMENT.matcher(applied.group(2)).replaceAll("").trim());
+		} else if (original.matches()) {
+			// The line declared something and no longer does: a switch that was turned off.
+			state.defines.remove(original.group(1));
+		}
+
+		return rewritten;
+	}
+
+	/**
+	 * One flattened unit, ready for a translator and then for the compiler.
+	 *
+	 * @param live which lines came from a branch that was taken. Dead branches are kept in the
+	 *             text, because the compiler has to see the same code the expander did, but a
+	 *             translator that moves a declaration has to know: lifting a uniform out of a
+	 *             branch nobody takes makes it unconditional, and packs do declare the same name
+	 *             as a uniform in one branch and as an ordinary global in the other. Conditional
+	 *             lines themselves count as taken; they are directives, never declarations.
+	 * @param defines what the names of the unit stand for once the whole of it has been read: the
+	 *             macros the compiler defines for the entry's stage, the engine's own symbols, then
+	 *             every {@code #define} the taken branches declare with the player's settings
+	 *             already applied to it, and none of the ones an
+	 *             {@code #undef} took back. The text keeps the names as the pack wrote them,
+	 *             because the compiler substitutes them itself; a reader that has to know a value
+	 *             BEFORE anything is compiled, as the dispatch size of a compute program is, has
+	 *             nowhere else to read it. It is the table as the last line of the unit leaves it,
+	 *             so a name the pack declares twice reads as its second declaration wherever it is
+	 *             used, which is the one shape a preprocessor would answer differently
+	 */
+	public record ExpandedUnit(String entry, List<String> lines, String version,
+			ExpansionStats stats, BitSet live, Map<String, String> defines) {
+
+		/**
+		 * Copied in and copied out, a {@link BitSet} being mutable. In on its own was enough while
+		 * a unit was built for one reader and dropped; now that an opening hands the same unit back
+		 * to every walk of a load that asks for it, a reader that set a bit would set it for all
+		 * the others too, and the key a translation is found on disk by is taken over this set,
+		 * so a stray bit moves which cached program a unit lands on.
+		 * <p>
+		 * The define table is copied for the same reason: what is handed in is the mutable table the
+		 * expander kept in step with the text line by line.
+		 */
+		public ExpandedUnit {
+			live = (BitSet) live.clone();
+			defines = Map.copyOf(defines);
+		}
+
+		@Override
+		public BitSet live() {
+			return (BitSet) this.live.clone();
+		}
+
+		public String text() {
+			return String.join("\n", this.lines);
+		}
+
+		public boolean isLive(int line) {
+			return this.live.get(line);
+		}
+	}
+
+	private static final class State {
+
+		private final Map<String, String> defines;
+		private final Set<String> loose;
+		private final List<String> output = new ArrayList<>();
+		private final BitSet live = new BitSet();
+		private final Set<String> onPath = new HashSet<>();
+		private final Set<String> everSeen = new HashSet<>();
+
+		private String version;
+		private long characters;
+		private int filesExpanded;
+		private int exhausted;
+		private int seen;
+		private int followed;
+		private int skipped;
+		private int missing;
+		private int duplicates;
+		private int cycles;
+		private int maxDepth;
+		private int tooDeep;
+		private int conditionals;
+		private int undecidable;
+
+		/**
+		 * How many conditional groups the text written out so far leaves open, which is not the
+		 * depth of any one file: a group opened in an include is closed by whatever file writes the
+		 * {@code #endif}, and the compiler reads the unit as one text.
+		 */
+		private int openInOutput;
+
+		/**
+		 * Whether the text written out so far leaves a block comment open, which belongs to the
+		 * unit rather than to one file for the same reason a group does.
+		 */
+		private boolean inBlockComment;
+
+		private State(Map<String, String> defines, Set<String> loose) {
+			this.defines = new LinkedHashMap<>(defines);
+			this.loose = loose;
+		}
+
+		private void loose(String relative, Logical logical, String decided) {
+			this.loose.add(relative + ":" + logical.number() + " writes " + logical.text().trim()
+					+ ", and " + decided);
+		}
+
+		private void emit(String line, boolean taken) {
+			add(line, taken);
+			this.inBlockComment = BlockComments.openAfter(line, this.inBlockComment);
+		}
+
+		/**
+		 * Lines a backslash joins, whose comments are read over the joined text: a line comment
+		 * continued that way hides the line under it too.
+		 */
+		private void emit(List<String> lines, boolean taken) {
+			StringBuilder joined = new StringBuilder();
+			for (String line : lines) {
+				add(line, taken);
+				joined.append(line.endsWith("\\") ? line.substring(0, line.length() - 1) : line);
+			}
+
+			this.inBlockComment = BlockComments.openAfter(joined.toString(), this.inBlockComment);
+		}
+
+		private void add(String line, boolean taken) {
+			this.live.set(this.output.size(), taken);
+			this.output.add(line);
+			this.characters += line.length() + 1;
+		}
+
+		private boolean overBudget() {
+			return this.output.size() > MAX_LINES || this.characters > MAX_CHARACTERS;
+		}
+
+		/** Said once and then quietly, otherwise the message itself becomes the runaway. */
+		private void giveUp(String relative) {
+			if (this.exhausted++ == 0) {
+				emit("#error include budget exhausted at " + relative, true);
+			}
+		}
+
+		private ExpansionStats toStats() {
+			return new ExpansionStats(this.seen, this.followed, this.skipped, this.missing,
+					this.duplicates, this.cycles, this.maxDepth, this.tooDeep, this.conditionals,
+					this.undecidable, this.exhausted);
+		}
+	}
+}

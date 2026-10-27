@@ -1,0 +1,208 @@
+package dev.vulture.render;
+
+import dev.vulture.pack.option.EngineDefines;
+import dev.vulture.uniform.BiomeCategory;
+import dev.vulture.uniform.WorldState;
+import dev.vulture.Vulture;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+/**
+ * Writes the block of the program {@code dump=} names out as {@code name = value} text.
+ * <p>
+ * It is the instrument every milestone since the fifth has been closed with, and it exists because a
+ * uniform can be non zero, plausible and wrong: reading the number is the only cheap way to tell,
+ * and it costs nothing on screen and no command typed in the game. The values it prints come from
+ * the same walk that fills the uniform buffer, a {@link dev.vulture.uniform.TextSink} standing in
+ * for the byte sink, so what is read here is what a shader was handed and not a second look at the
+ * catalogue that could disagree with it.
+ * <p>
+ * Once a second and not once a frame, because the file is meant to be read by a human or tailed by a
+ * script, and because two passes of one frame are handed the same numbers anyway. It is written
+ * whole each time rather than appended, so what is in it is always this second and never a history
+ * to scroll through; a curve is taken by reading it repeatedly, which is what the halflife checks do.
+ */
+final class PackDump {
+
+	/** The program named by the line, lowercased, matched on the tail of a path. Empty is off. */
+	private static volatile String wanted = "";
+	private static volatile Path file;
+	private static long lastNanos;
+
+	/**
+	 * Whether the line has already been told that nothing running answers to it. Once a load.
+	 * <p>
+	 * Volatile like the two above and for the same reason, which is a reason about where the writes
+	 * come from and not about what the field means: {@link #configure} is reached from the client
+	 * setup event, which the loader dispatches on a pool of its own, while {@link #take} only ever
+	 * runs on the render thread. Whether the join between the two already publishes it is an argument
+	 * this keyword ends.
+	 */
+	private static volatile boolean said;
+
+	private PackDump() {
+	}
+
+	/** Set at every load, from the line {@code options.txt} holds and the game's own directory. */
+	static void configure(String program, Path into) {
+		wanted = program;
+		file = into;
+		said = false;
+	}
+
+	/**
+	 * Takes this frame's dump, if a second has gone by and the line names something that is running.
+	 * <p>
+	 * <strong>Three of the engine's values are not the named pass's, and cannot be</strong>, which is
+	 * six lines of the file: the pass model view feeds four of them, the modulating colour one and
+	 * the render stage one. All three are set by whoever is about to write a block, and this is taken
+	 * as the frame opens, before any pass has written one. The matrix and the colour therefore read
+	 * back as the camera's and as white, which is what the frame boundary leaves; the render stage
+	 * reads back as whatever the last block of the frame before set, and that is NOT the chain's
+	 * {@code NONE}, whatever the order of a frame suggests: the shadow stage draws at the end of a
+	 * frame for the next one, after the chain has run, so a dump of the sky's disc comes out at
+	 * stage 17, measured in game. So the eight pieces of the sky dump alike on exactly what tells them
+	 * apart, and so do the three chunk passes and every piece of the entities. Everything else is the
+	 * named program's own.
+	 *
+	 * @param passes   the chain's own passes, empty for the frame or two before they are built
+	 * @param terrain  the terrain's programs, empty until it is read
+	 * @param families the six other families in the chain's own order, each answering its programs
+	 *                 and each empty until it is read. <strong>The order is the order a line
+	 *                 resolves in</strong>,
+	 *                 and the terrain goes first on purpose: it is answered from a different
+	 *                 catalogue, its {@code of_ModelViewMatrix} being the world's where a composite's
+	 *                 is the identity, which is exactly the pair a reading has to tell apart. Every
+	 *                 family is named by ELEMENT rather than by file, because in every one of them
+	 *                 several elements share a file: the eight pieces of the sky come out of two
+	 *                 files, four apiece, the two halves of the entities sometimes out of one, and
+	 *                 the clouds answer their two settings, {@code fancy} and {@code flat}, out of one
+	 */
+	static void take(String place, int load, List<PackPass> passes, WorldState world,
+			Collection<? extends DumpedProgram> terrain, List<? extends FamilyDraw> families) {
+		if (wanted.isEmpty() || file == null) {
+			return;
+		}
+
+		long now = System.nanoTime();
+		if (lastNanos != 0L && now - lastNanos < 1_000_000_000L) {
+			return;
+		}
+
+		lastNanos = now;
+		List<String> running = new ArrayList<>();
+		String path = null;
+		String decoded = null;
+
+		// Named by element and not only by path: several elements of a family are usually the same
+		// file, and a line that said gbuffers_terrain twice would not say which of the two was read.
+		// The label is matched as well as the path, so dump=cutout names the pass and
+		// dump=gbuffers_terrain still names the file, taking the first pass drawn with it.
+		List<Collection<? extends DumpedProgram>> drawn = new ArrayList<>(1 + families.size());
+		drawn.add(terrain);
+		for (FamilyDraw family : families) {
+			drawn.add(family.programs());
+		}
+
+		for (Collection<? extends DumpedProgram> family : drawn) {
+			for (DumpedProgram program : family) {
+				running.add(program.label());
+				if (decoded == null && (names(program.path()) || names(program.label()))) {
+					path = program.label();
+					decoded = program.decoded(world);
+				}
+			}
+		}
+
+		for (PackPass pass : passes) {
+			running.add(pass.path());
+			if (decoded == null && names(pass.path())) {
+				path = pass.path();
+				decoded = pass.decoded(world);
+			}
+		}
+
+		if (decoded == null) {
+			// Nothing is built yet, which is the first frame or two rather than a wrong name. The
+			// line has to survive that or a dump asked for in the file would be turned off before
+			// the thing it names exists.
+			if (running.isEmpty() || said) {
+				return;
+			}
+
+			// Said once and the line left armed, rather than turning the dump off outright: that
+			// would be right only while everything a place draws with is read on its first frame.
+			// Three families are read at the moment the world first draws one, so naming a piece of
+			// the sky or an entity would be refused before the thing existed and stay refused for
+			// the rest of the session. What is listed is therefore what has been read SO
+			// FAR and the line says as much, since another family reading later still answers.
+			said = true;
+			Vulture.logger().warn("{}={} names nothing read so far, so nothing is dumped yet. Read so "
+					+ "far: {}", EngineOptions.DUMP_KEY, wanted, running);
+
+			return;
+		}
+
+		write("# " + place + ", " + path + ", load " + load + "\n" + situation(world) + decoded);
+	}
+
+	private static boolean names(String path) {
+		return path.toLowerCase(Locale.ROOT).endsWith(wanted);
+	}
+
+	/**
+	 * Failing to write is said once and then dropped. A dump that cannot be taken is a lost
+	 * measurement, and turning it into a crash would make a debugging aid the reason the game stopped.
+	 */
+	private static void write(String text) {
+		try {
+			Files.createDirectories(file.getParent());
+			Files.writeString(file, text, StandardCharsets.UTF_8);
+		} catch (IOException e) {
+			Vulture.logger().warn("Could not write the decoded dump to {}: {}", file, e.toString());
+			wanted = "";
+		}
+	}
+
+	/**
+	 * Where the camera stood when these values were taken, and what the biome table says about it.
+	 * <p>
+	 * Written into the same file as the values and read from the same frame, because a reading is
+	 * only worth something if what it describes is known at the same instant. A pack's biome uniforms
+	 * are smoothed over a second, so a player who walked between the screenshot and the file is enough
+	 * to make a table that works look broken, or the other way round, which has already happened once.
+	 * <p>
+	 * The define is printed beside the number the uniform carries because those two are the pair that
+	 * has to agree. {@link BiomeClassifier} hands out both from one table so that they cannot drift;
+	 * this line is what proves it rather than assuming it.
+	 */
+	private static String situation(WorldState world) {
+		int id = world.biomeId();
+		// Backwards, on purpose. Asking the define table which name carries the number the uniform
+		// just reported is the whole check: the two are built from one walk of the registry and are
+		// meant to agree, and a number no define carries is that promise broken, said out loud here
+		// rather than found later as a pack lighting the wrong biome.
+		String name = EngineDefines.machine().biomes().entrySet().stream()
+				.filter(entry -> entry.getValue() == id)
+				.map(Map.Entry::getKey)
+				.findFirst()
+				.orElse("!! no BIOME_ define carries this number");
+
+		BiomeCategory[] categories = BiomeCategory.values();
+		int category = world.biomeCategory();
+
+		return "# biome " + id + " is BIOME_" + name + ", category " + category + " "
+				+ (category >= 0 && category < categories.length ? categories[category] : "?") + "\n"
+				+ "# camera " + Math.round(world.cameraPosition().x()) + ", "
+				+ Math.round(world.cameraPosition().y()) + ", "
+				+ Math.round(world.cameraPosition().z()) + "\n";
+	}
+}

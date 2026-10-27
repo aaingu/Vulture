@@ -1,0 +1,248 @@
+package dev.vulture.uniform;
+
+import dev.vulture.uniform.values.CameraValues;
+import dev.vulture.uniform.values.CelestialValues;
+import dev.vulture.uniform.values.DhValues;
+import dev.vulture.uniform.values.DrawValues;
+import dev.vulture.uniform.values.GeometryValues;
+import dev.vulture.uniform.values.MatrixValues;
+import dev.vulture.uniform.values.PlayerValues;
+import dev.vulture.uniform.values.ShadowGeometryValues;
+import dev.vulture.uniform.values.ShadowMatrixValues;
+import dev.vulture.uniform.values.TimeValues;
+import dev.vulture.uniform.values.WeatherValues;
+import dev.vulture.uniform.values.WorldValues;
+
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * The name to source table. Built once, statically, split across the values package.
+ * <p>
+ * A name that is not in the table is not an error and is not guessed at: the block writes zeroes
+ * for it and says the name out loud once. That is the difference between a gap you can read in a
+ * log and a wrong image nobody can explain.
+ * <p>
+ * The engine table is a partition, so registering a name twice is a mistake rather than an
+ * intention and {@link #builder()} refuses it. A pack's own uniforms are a different matter: they
+ * are layered on top with {@link #builder(UniformCatalog)}, where shadowing an engine name is
+ * exactly what the layering is for.
+ */
+public final class UniformCatalog {
+
+	private static volatile UniformCatalog engine;
+	private static volatile UniformCatalog geometry;
+	private static volatile UniformCatalog shadowGeometry;
+
+	private final Map<String, Entry> entries;
+
+	private UniformCatalog(Map<String, Entry> entries) {
+		this.entries = entries;
+	}
+
+	private record Entry(UniformShape natural, UniformSource source) {
+	}
+
+	/**
+	 * Cached. Calls the register method of every class in the values package, in a fixed order.
+	 * <p>
+	 * The order is fixed because it is the order a duplicate would be reported in, not because
+	 * anything downstream depends on it: a block is walked in the order the translation fixed, and
+	 * this table is only ever looked up by name.
+	 */
+	public static UniformCatalog engine() {
+		UniformCatalog built = engine;
+		if (built != null) {
+			return built;
+		}
+
+		synchronized (UniformCatalog.class) {
+			if (engine == null) {
+				Builder builder = builder();
+				DrawValues.register(builder);
+				CameraValues.register(builder);
+				MatrixValues.register(builder);
+				ShadowMatrixValues.register(builder);
+				DhValues.register(builder);
+				CelestialValues.register(builder);
+				TimeValues.register(builder);
+				WeatherValues.register(builder);
+				WorldValues.register(builder);
+				PlayerValues.register(builder);
+				coreMatrices(builder);
+				engine = builder.build();
+			}
+
+			return engine;
+		}
+	}
+
+	/**
+	 * The engine table with the seven fixed function names answered for a pass drawn over the world.
+	 * <p>
+	 * A layer and not a table of its own: {@link #builder(UniformCatalog)} refuses a duplicate only
+	 * among the names it registers itself, so shadowing an engine name is what layering is for and
+	 * registering the same name twice here would still be caught.
+	 */
+	public static UniformCatalog geometry() {
+		UniformCatalog built = geometry;
+		if (built != null) {
+			return built;
+		}
+
+		synchronized (UniformCatalog.class) {
+			if (geometry == null) {
+				Builder builder = builder(engine());
+				GeometryValues.register(builder);
+				coreMatrices(builder);
+				geometry = builder.build();
+			}
+
+			return geometry;
+		}
+	}
+
+	/**
+	 * The same again for a pass drawn from the light, where the six that depend on the point of view
+	 * answer the shadow pair. Layered over {@link #geometry()} rather than over the engine table, so
+	 * that the two stay one list: a name added to one and forgotten in the other would leave a shadow
+	 * program reading the camera.
+	 * <p>
+	 * The seventh, the texture matrices, is deliberately NOT among them and inherits from the layer
+	 * below. A light map coordinate is the same number whichever end of the world it is drawn from,
+	 * and Iris translates a shadow program through the very transformers it translates a camera one
+	 * with, so the substitution it makes for {@code gl_TextureMatrix[1]} is the same on both.
+	 */
+	public static UniformCatalog shadowGeometry() {
+		UniformCatalog built = shadowGeometry;
+		if (built != null) {
+			return built;
+		}
+
+		synchronized (UniformCatalog.class) {
+			if (shadowGeometry == null) {
+				Builder builder = builder(geometry());
+				ShadowGeometryValues.register(builder);
+				coreMatrices(builder);
+				shadowGeometry = builder.build();
+			}
+
+			return shadowGeometry;
+		}
+	}
+
+	/**
+	 * The three names OptiFine's core profile mode gives the fixed function state, answered from
+	 * whatever that layer has just put behind the {@code gl_} spelling.
+	 * <p>
+	 * Called last in each of the three tables rather than written into the three values classes,
+	 * because that is what keeps the two spellings the same value. It is what Iris does too, one
+	 * family at a time and over two transformers picked by the profile the unit declares; the
+	 * paths and their lines are set out in {@link dev.vulture.glsl.LegacyGlsl#CORE_MATRICES}, and
+	 * the packs are written against them.
+	 * <p>
+	 * The third is the texture matrix, and it is unit NOUGHT rather than the array: the core
+	 * spelling names one matrix where the fixed function spelling names eight, so the alias answers
+	 * the element a bare member asks for. Iris substitutes it on the same three paths as the pair,
+	 * {@code mat4(1.0)} over a quad and over a chunk
+	 * ({@code CompositeCoreTransformer.java:27}, {@code SodiumCoreTransformer.java:47}), and the
+	 * draw's own matrix on the families the game hands over as a render type
+	 * ({@code VanillaCoreTransformer.java:85}).
+	 * <p>
+	 * <strong>That last path is a divergence, and it is the one already carried by
+	 * {@link dev.vulture.glsl.LegacyGlsl#GAME_TEXTURE_MATRIX} rather than a new one.</strong> A
+	 * literal {@code gl_TextureMatrix[0]} is redirected in the translation on the passes that bind
+	 * the game's transforms; the core spelling arrives here instead, as a member the pack declared,
+	 * and this table has one answer per family. So a core profile program drawn from one of the six
+	 * render types that set a texture transform would read the identity here where Iris reads the
+	 * draw's matrix. Nothing of the corpus reads that difference: the one pack that names it is
+	 * Clarity, in {@code shaders/prog/generic.vsh:14}, included only by its {@code gbuffers_skybasic}
+	 * and {@code gbuffers_skytextured}, and neither of those is drawn from a render type that sets
+	 * one.
+	 */
+	private static void coreMatrices(Builder builder) {
+		builder.alias("modelViewMatrix", "of_ModelViewMatrix");
+		builder.alias("projectionMatrix", "of_ProjectionMatrix");
+		builder.alias("textureMatrix", "of_TextureMatrix");
+	}
+
+	public static Builder builder() {
+		return new Builder(Map.of());
+	}
+
+	/** Starts from an existing catalogue, so a pack's own uniforms can be layered on the engine. */
+	public static Builder builder(UniformCatalog base) {
+		return new Builder(base.entries);
+	}
+
+	/** null when the name is not in the table. */
+	public UniformSource source(String name) {
+		Entry entry = this.entries.get(name);
+
+		return entry == null ? null : entry.source();
+	}
+
+	public UniformShape natural(String name) {
+		Entry entry = this.entries.get(name);
+
+		return entry == null ? null : entry.natural();
+	}
+
+	public Set<String> names() {
+		return Collections.unmodifiableSet(this.entries.keySet());
+	}
+
+	public static final class Builder {
+
+		private final Map<String, Entry> entries;
+
+		/** Names this builder registered itself, which is what a duplicate is measured against. */
+		private final Set<String> added = new HashSet<>();
+
+		private Builder(Map<String, Entry> base) {
+			this.entries = new LinkedHashMap<>(base);
+		}
+
+		/**
+		 * Adds one name the catalogue can answer, and where its value comes from.
+		 *
+		 * @param natural the shape the engine holds the value in, which is not necessarily the one
+		 *                a program declares it under. The declaration decides what is written; this
+		 *                only says what there is to write.
+		 */
+		public Builder add(String name, UniformShape natural, UniformSource source) {
+			if (!this.added.add(name)) {
+				throw new IllegalStateException(name + " is registered twice in the same catalogue");
+			}
+
+			this.entries.put(name, new Entry(natural, source));
+
+			return this;
+		}
+
+		/**
+		 * Registers a second spelling of a name already in this builder, reading whatever that name
+		 * holds at this point.
+		 * <p>
+		 * Taken here and not written out again on purpose: the value of the second spelling is the
+		 * value of the first, and a layer that changes one and forgets the other is exactly the
+		 * failure this avoids.
+		 */
+		public Builder alias(String name, String existing) {
+			Entry entry = this.entries.get(existing);
+			if (entry == null) {
+				throw new IllegalStateException(
+						"Cannot make " + name + " a second name for " + existing + ", which is not registered");
+			}
+
+			return add(name, entry.natural(), entry.source());
+		}
+
+		public UniformCatalog build() {
+			return new UniformCatalog(Collections.unmodifiableMap(new LinkedHashMap<>(this.entries)));
+		}
+	}
+}

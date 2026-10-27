@@ -1,0 +1,75 @@
+plugins {
+	id "net.neoforged.moddev" version "${moddev_version}"
+}
+
+base {
+	archivesName = "vulture-fabric"
+}
+
+neoForge {
+	// The same bare game the common module compiles against, and for the same reason: nothing in
+	// this module is built by NeoForge, this plugin is only how the project gets Minecraft on a
+	// compile classpath.
+	//
+	// No Loom, and that is a fact about Minecraft 26 rather than a preference. Loom exists to remap
+	// a mod between the names a developer writes and the names the game runs under, and from 26.2 on
+	// there are no others: Sodium's own Fabric jar carries no refmap at all and declares its access
+	// widener in the "official" namespace, which is what a jar looks like when nothing needs
+	// remapping. A jar compiled against the bare game is already in the namespace Fabric Loader
+	// loads it in.
+	neoFormVersion = project.neoform_version
+}
+
+repositories {
+	maven {
+		name = "FabricMC"
+		url = "https://maven.fabricmc.net/"
+	}
+}
+
+dependencies {
+	compileOnly project(":common")
+
+	// All three ship with the loader and none is bundled. Fabric Loader 0.19.3 carries
+	// mixinextras-fabric 0.5.4 inside its own jar, which is why nothing here has to be jarred in.
+	compileOnly "net.fabricmc:fabric-loader:${project.fabric_loader_version}"
+	compileOnly "net.fabricmc:sponge-mixin:${project.mixin_version}"
+	compileOnly "io.github.llamalad7:mixinextras-common:${project.mixinextras_version}"
+
+	// The two Fabric API modules the key that opens the settings screen is registered and asked
+	// through, and the only Fabric API this mod uses at all. Named one by one rather than through the
+	// whole of Fabric API, because what the metadata has to declare is these two: a key mapping has
+	// to be appended to an array the options own, and it has to be asked once a tick, and the bare
+	// game offers neither.
+	compileOnly "net.fabricmc.fabric-api:fabric-key-mapping-api-v1:${project.fabric_key_mapping_version}"
+	compileOnly "net.fabricmc.fabric-api:fabric-lifecycle-events-v1:${project.fabric_lifecycle_version}"
+}
+
+tasks.named("processResources", ProcessResources).configure {
+	def metadata = [
+		mod_id: project.mod_id,
+		mod_version: rootProject.effectiveVersion,
+		minecraft_version: project.minecraft_version,
+		minecraft_next: project.minecraft_next,
+		fabric_loader_min_version: project.fabric_loader_min_version
+	]
+
+	inputs.properties(metadata)
+
+	filesMatching("fabric.mod.json") {
+		expand(metadata)
+	}
+}
+
+tasks.named("jar", Jar).configure {
+	archiveVersion = "${rootProject.effectiveVersion}+mc${project.minecraft_version}"
+	from project(":common").sourceSets.main.output
+
+	// The licence has to reach whoever receives the program, and what they receive is this jar.
+	// A licence field in the metadata is a declaration, not a copy.
+	from(rootDir) {
+		include "LICENSE"
+		include "GPL-3.0.txt"
+		include "NOTICE"
+	}
+}

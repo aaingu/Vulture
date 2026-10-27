@@ -1,0 +1,2711 @@
+package dev.vulture.render;
+
+import dev.vulture.glsl.LegacyGlsl;
+import dev.vulture.glsl.PackProgram;
+import dev.vulture.glsl.TranslatedUnit;
+import dev.vulture.pack.model.AlphaTest;
+import dev.vulture.pack.model.BlendMode;
+import dev.vulture.pack.model.ProgramStage;
+import dev.vulture.pack.model.RenderStage;
+import dev.vulture.pack.model.TargetName;
+import dev.vulture.pack.model.TextureStage;
+import dev.vulture.pack.program.TerrainPass;
+import dev.vulture.pack.target.ChainPlan;
+import dev.vulture.pack.target.DrawBuffers;
+import dev.vulture.pack.target.SamplerPlan;
+import dev.vulture.render.pbr.PbrAtlases;
+import dev.vulture.render.pbr.PbrMap;
+import dev.vulture.render.pbr.PbrTextures;
+import dev.vulture.render.storage.StorageBuffers;
+import dev.vulture.render.storage.StorageImages;
+import dev.vulture.render.timing.PassTimings;
+import dev.vulture.uniform.ClipSpace;
+import dev.vulture.uniform.TextSink;
+import dev.vulture.uniform.WorldState;
+import dev.vulture.Vulture;
+
+import com.mojang.blaze3d.GpuDeviceLossException;
+import com.mojang.blaze3d.GpuFormat;
+import com.mojang.blaze3d.PrimitiveTopology;
+import com.mojang.blaze3d.platform.CompareOp;
+import com.mojang.blaze3d.buffers.GpuBuffer;
+import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.blaze3d.buffers.Std140Builder;
+import com.mojang.blaze3d.pipeline.BindGroupLayout;
+import com.mojang.blaze3d.pipeline.BlendFunction;
+import com.mojang.blaze3d.pipeline.ColorTargetState;
+import com.mojang.blaze3d.pipeline.CompiledRenderPipeline;
+import com.mojang.blaze3d.pipeline.DepthStencilState;
+import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.blaze3d.shaders.ShaderSource;
+import com.mojang.blaze3d.shaders.ShaderType;
+import com.mojang.blaze3d.shaders.UniformType;
+import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.blaze3d.systems.RenderPass;
+import com.mojang.blaze3d.systems.RenderPassDescriptor;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.textures.FilterMode;
+import com.mojang.blaze3d.textures.GpuSampler;
+import com.mojang.blaze3d.textures.GpuTextureView;
+import com.mojang.blaze3d.vertex.VertexFormat;
+import com.mojang.blaze3d.vertex.VertexFormatElement;
+import com.mojang.blaze3d.vulkan.VulkanRenderPipeline;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.BindGroupLayouts;
+import net.minecraft.client.renderer.MappableRingBuffer;
+import net.minecraft.resources.Identifier;
+
+import org.joml.Matrix4fc;
+import org.joml.Vector4fc;
+import org.jspecify.annotations.Nullable;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+/**
+ * One program the pack draws a pass of the world's own geometry with, in place of the shader the
+ * game would have used.
+ * <p>
+ * The work is the same whatever geometry it is drawn over, and that is why this class is not
+ * {@link TerrainProgram}: the uniform block, the samplers and their fallbacks, the colour
+ * attachments and the one blend the pack asked for do not know a chunk from a sky quad. What does
+ * differ is gathered in {@link Pass}, which the family fills in: {@code TerrainProgram} answers it
+ * out of {@link TerrainPass} for Sodium's three chunk passes.
+ * <p>
+ * Nothing of the mesh is changed: the attributes it carries are decoded and the names it does not
+ * carry are given constants. Which of them the mesh really answers is the family's to say, in
+ * {@link Pass#answered}, and it is worth saying: a name the log calls a constant when the mesh does
+ * carry it sends a reader looking for a defect that is not there.
+ * <p>
+ * The block is called {@code OfGlobals} like every other program of this engine, and it has to stay
+ * that way: Sodium binds its own {@code u_Globals} into the same pass, unconditionally, and the two
+ * would be one name. The bindings Sodium emits for names this pipeline does not declare are
+ * harmless, because the descriptor flush walks the layout of the pipeline that is bound and not the
+ * list of what was offered; the converse is not, and everything declared here has to be bound or the
+ * draw throws.
+ */
+final class GeometryProgram {
+
+	/** The block name the translator writes into every program. Never {@code u_Globals}. */
+	private static final String UNIFORM_BLOCK = "OfGlobals";
+
+	/**
+	 * Everything one family of geometry answers differently, so that the rest of this class can be
+	 * written once.
+	 *
+	 * @param family       what the log calls this geometry, {@code chunk} for a chunk pass. One word,
+	 *                     and it lands in the middle of a sentence
+	 * @param name         the pass inside that family, lowercased, {@code solid} or {@code shadow}.
+	 *                     It tells two passes served by one file apart, both in the log and in the
+	 *                     identifier the device caches a shader module under, so it may not be empty
+	 * @param namespace    the namespace the pipeline is named in. <strong>Not a cosmetic where the
+	 *                     geometry is Sodium's</strong>, and {@link TerrainProgram} says why in full:
+	 *                     the push constant range exists only for a namespace containing
+	 *                     {@code sodium}, and without it the world draws itself on top of the camera
+	 * @param answered     the vertex names this mesh really carries, which are the ones NOT to
+	 *                     report as constants
+	 * @param shadow       whether this pass is drawn from the light rather than from the camera. It
+	 *                     decides the depth window, the culling, the descriptor and what a
+	 *                     {@code shadowtex} lookup may be answered with
+	 * @param blend        what the pass blends with when the pack says nothing, which is the game's
+	 *                     own answer for that pass and not a taste: the sun and the moon are drawn
+	 *                     over the sky and the chunk pass that is translucent is drawn over the
+	 *                     world. Empty for a pass that writes outright
+	 * @param covers       whether this pass writes the mask the scene seed is cut with, which every
+	 *                     pass drawn before the seed and into the pack's own targets has to
+	 * @param claimed      whether this family draws opaque pieces of its OWN over the pixels its
+	 *                     blending pieces span, which is the sky and nothing else: its disc writes
+	 *                     outright and marks what it covers, and {@link HorizonCone}, drawn inside
+	 *                     the disc's own pass and sharing its mask, carries that mark down over the
+	 *                     lower hemisphere. So the stars, the sunrise, the sun and the moon blend
+	 *                     onto a target the seed leaves alone although none of them marks a pixel of
+	 *                     its own. Asked only of a blending pass drawn before the seed, and it is
+	 *                     what separates the sky from the hand, which has no such sibling at all.
+	 *                     <p>
+	 *                     <strong>It records how a family is PUT TOGETHER and is not a per frame
+	 *                     guarantee</strong>, and the difference is not a quibble: what marks those
+	 *                     pixels is answered per program and per frame, and this is answered once at
+	 *                     the load. Two ways the marking can be absent leave the blending pieces
+	 *                     claiming all the same, and they do not cost the same. The cone is drawn
+	 *                     only for {@link TerrainDraw.Mask#WRITTEN}
+	 *                     ({@code render/HorizonCone.java:152}) and only while the pack serves a sky
+	 *                     at all, and then what the seed repaints is what stands in the band the
+	 *                     cone would have closed: the lower half of the stars, the sunrise fan, a
+	 *                     rising or setting sun or moon. Or the disc's own mask is turned down,
+	 *                     which is {@code covers} below, and then nothing of the sky marks anything
+	 *                     and the seed repaints the whole of it. The blend alone grants those pixels
+	 *                     either way, so this is a defect the field records rather than one it
+	 *                     introduces, and what the field buys is that it is written down somewhere
+	 * @param afterDeferred whether the pass is drawn after the deferred stage, which is what decides
+	 *                     that a depth sampler can be answered with the opaque world's image
+	 * @param topology     how the mesh is assembled, which is the game's answer and not a choice:
+	 *                     the pass this is bound into was opened for the pipeline the game built,
+	 *                     and a difference of topology would be a difference nobody declared
+	 * @param cull         whether a back face is thrown away, which is the game's answer too and
+	 *                     differs inside one family: the entity pipelines split almost evenly on it,
+	 *                     and a cape drawn with the wrong one is either a cape with no inside or a
+	 *                     cape drawn twice. The shadow map is the one place the answer is this
+	 *                     engine's, and {@link TerrainProgram} says why it is no
+	 * @param depth        the depth test and write, or null for none at all. Null is not an
+	 *                     oversight and the sky is why: the game's own sky pipeline declares no
+	 *                     depth state, so the disc neither tests nor writes, and a pack's program
+	 *                     given the ordinary state would write the sky into the depth and have the
+	 *                     world tested against it
+	 * @param stage        what a pack is told it is drawing, which it reads as {@code renderStage}
+	 *                     and branches on with {@code MC_RENDER_STAGE_*}. Both Complementary read it,
+	 *                     so a pass that answered {@code NONE} would take them down the branch meant
+	 *                     for a full screen quad
+	 * @param bindings     a bind group of the game's own that this stage reads besides ours, or null
+	 *                     for the families that read nothing but their mesh. Only the clouds have
+	 *                     one, and there it is the whole geometry: the pass fills {@code CloudInfo}
+	 *                     and {@code CloudFaces} by name against whatever pipeline is bound, so a
+	 *                     pipeline that did not declare them would be handed neither
+	 * @param perDraw      the name of a second uniform block of ours, one the FAMILY fills between
+	 *                     draws inside one pass, or null for every family whose block is written
+	 *                     once. Only the far terrain has one, and it has one because its geometry
+	 *                     arrives in pieces that do not share a value: each section of Distant
+	 *                     Horizons carries block coordinates of its own corner, so the corner has to
+	 *                     be bound per section, and a value bound per draw cannot live in
+	 *                     {@code OfGlobals}, which is written once and read by every draw of the
+	 *                     pass. Declared here and bound by the family: what this record decides is
+	 *                     that the layout carries the name, without which the draw is refused
+	 * @param distantVolume whether this pass is drawn in Distant Horizons' own volume rather than in
+	 *                     the game's. True for the far terrain and false for everything else. The
+	 *                     three {@code dhProjection} names answer that volume for every pass alike
+	 *                     now, as Iris serves them; what this still decides is that the pass owns its
+	 *                     first draw buffer outright, the constructor saying why the seed cannot be
+	 *                     its road
+	 */
+	record Pass(String family, String name, String namespace, Set<String> answered, boolean shadow,
+			Optional<BlendFunction> blend, boolean covers, boolean claimed, boolean afterDeferred,
+			PrimitiveTopology topology, boolean cull, DepthStencilState depth, RenderStage stage,
+			BindGroupLayout bindings, String perDraw, boolean distantVolume) {
+
+		/** Whether the pass blends at all, which is the same question as having something to blend with. */
+		boolean blended() {
+			return this.blend.isPresent();
+		}
+	}
+
+	/**
+	 * What a pack calls the block atlas. {@code texture} arrives as {@code ofTexture} because the
+	 * word is reserved in modern GLSL and the translator renames it; all eight packs of the corpus
+	 * use that spelling and no other.
+	 */
+	private static final Set<String> ATLAS = Set.of("gtexture", "tex", "texture", "ofTexture");
+
+	private static final String LIGHTMAP = "lightmap";
+
+	/**
+	 * The game's overlay image, which only a vertex stage drawn from the entity mesh ever asks for:
+	 * the translation puts the name there itself, and no pack writes it.
+	 */
+	private static final String OVERLAY = LegacyGlsl.OVERLAY_SAMPLER;
+
+	/**
+	 * The pass the answers that do NOT follow the draw's image are currently standing in, and the
+	 * program that put them there.
+	 * <p>
+	 * A bind writes a name into a map the pass keeps until it closes, allocating the pair it stores,
+	 * so a name whose answer cannot move inside a pass only has to be written once. Two things can
+	 * undo that writing, and both are held here rather than on the program: {@link #resolve} moving
+	 * the answers, which drops the pair below, and another program binding ITS names over them,
+	 * which one pass sees often since {@link GeometryHold} carries several families through one and
+	 * the entity family alone hands its pass twenty pieces.
+	 * <p>
+	 * Nothing outside this class writes one of these names into a geometry pass, and that is a fact
+	 * about today's naming rather than a guarantee. A composite, a copy or a clear ends the hold
+	 * before it records anything, but {@link GeometryHold#leftover} deliberately does not: it
+	 * adopts the game's remaining immediate draws and Distant Horizons' generic object renderer
+	 * into a hold that is already open. What keeps them apart is only that none of their names
+	 * collides: the game binds {@code Sampler0} and its siblings, Sodium {@code u_BlockTex} and
+	 * {@code u_LightTex}, Distant Horizons {@code uLightMap} alone, and a pack's names are the
+	 * lower case ones a pack writes. The translation never compares a name a pack declared
+	 * against any of those, so nothing enforces it.
+	 * <p>
+	 * <strong>Settling raises what a collision would cost.</strong> A foreign write over one of
+	 * these names used to be undone by the next bind of the same program; it now stands for the
+	 * rest of the pass.
+	 */
+	private static RenderPass settledIn;
+
+	private static GeometryProgram settled;
+
+	/** Where one colour attachment of a world pass takes its image from. */
+	private enum Bound {
+
+		/** The target the chunk renderer was going to draw into, which carries its own format. */
+		GAME,
+
+		/** A colour target of the pack, named by the attachment and on the half it names. */
+		PACK,
+
+		/**
+		 * No image at all, and the slot is there to be skipped.
+		 * <p>
+		 * The game writes each fragment output's RANK over the location it declared, so a stage
+		 * declaring more outputs than the pack gave it draw buffers still spends those ranks. They
+		 * are stood for here rather than closed up, or the mask below would land on the rank an
+		 * output of the pack's already holds and read whatever that output happens to carry.
+		 */
+		UNUSED,
+
+		/** The mask carrying the depth this pass left, which is ours and not in the pack's buffers. */
+		COVERAGE
+	}
+
+	/**
+	 * One colour attachment, in the order the pipeline's states and the descriptor's views are both
+	 * walked. {@code target} is the pack's answer and is null for anything else.
+	 */
+	private record Slot(Bound bound, ChainPlan.Attachment target, GpuFormat format) {
+	}
+
+	/**
+	 * One sampler this program declares, with everything about it that is settled at the load and the
+	 * pair the pass open resolved for it.
+	 * <p>
+	 * Walked in order rather than looked up by name, and that is the whole point of it: what a name
+	 * is answered with, worked out again for every name at every draw, is a search through
+	 * {@link PbrMap} by string, a second one through the plan's map, a cascade of equals and a
+	 * switch, each time. Only two of the questions can move between two draws of one
+	 * pass, and both are the same question: which image this draw brought.
+	 */
+	private static final class Sampled {
+
+		/** The name the layout carries, which is what the bind spells. */
+		private final String name;
+
+		/** Which material map this name asks for, or null for every other name. */
+		private final PbrMap material;
+
+		/** Whether this name is the albedo of whatever this pass is drawing. */
+		private final boolean albedo;
+
+		/** The plan's answer for the name, which never moves once the pack is read. */
+		private final SamplerPlan.Binding binding;
+
+		/**
+		 * What the pack supplies under the name, or null for every kind but a pack texture and
+		 * for a name the pack took over with nothing behind it. Settled here for the reason the
+		 * class carries: resolving it walked the pack's texture directives by name at every pass
+		 * open, three times over for one name.
+		 */
+		private final ColorTargets.PackSource source;
+
+		/**
+		 * Whether this map is read through the albedo's own sampler, which is every one of them but
+		 * the specular under labPBR. Settled at the pass open: the format is the resource pack's, and
+		 * a resource reload stands outside every render pass.
+		 */
+		private boolean interpolates;
+
+		/** What answers this name where the draw brought no image, which for most names is all of it. */
+		private GpuTextureView view;
+
+		/** The sampler state that goes with it, on the same rule. */
+		private GpuSampler state;
+
+		/**
+		 * The image the last draw brought and what its map answered, held for one pass. A pass
+		 * records hundreds of draws and most of them bring the image the draw before did, so the
+		 * two doors are asked once per image rather than once per draw. Dropped at
+		 * {@link #resolve}, which is the one place a stale answer cannot cross.
+		 */
+		private GpuTextureView servedFor;
+		private GpuTextureView served;
+		private boolean servedKnown;
+
+		Sampled(String name, PbrMap material, boolean albedo, SamplerPlan.Binding binding,
+				ColorTargets.PackSource source) {
+			this.name = name;
+			this.material = material;
+			this.albedo = albedo;
+			this.binding = binding;
+			this.source = source;
+		}
+
+		/** Whether the answer follows the DRAW's own image rather than the pass's. */
+		private boolean followsTheImage() {
+			return this.material != null || this.albedo;
+		}
+	}
+
+	private final Pass pass;
+	private final String path;
+
+	/** Labels for the debugger, built from the family so that two of them are never one name. */
+	private final Supplier<String> blockLabel;
+	private final Supplier<String> passLabel;
+	private final Supplier<String> shadowLabel;
+
+	/**
+	 * The attachments this pass adds to or takes instead of the game's target: every draw buffer
+	 * when {@link #ownsFirst}, every one but nought otherwise. Empty when there is nothing to gain.
+	 */
+	private final List<ChainPlan.Attachment> extra;
+
+	/**
+	 * Every colour attachment of a world pass, in order, settled once at load. Empty for a shadow
+	 * pass, which draws into the map and nothing else.
+	 * <p>
+	 * One list rather than two readings of one rule. The pipeline carries a state per element and
+	 * the descriptor names a view per element, and {@code RenderPass.setPipeline} refuses outright,
+	 * in the middle of the world, the moment the two counts or the two formats stop agreeing.
+	 */
+	private final List<Slot> slots;
+
+	/**
+	 * Which {@code shadowcolor} each output of a shadow pass lands in, in output order. Empty for
+	 * every pass drawn from the camera.
+	 * <p>
+	 * The rule is {@link DrawBuffers#shadowColours}, which is Iris's. What is decided here is the
+	 * length: no more attachments than the fragment stage declares outputs.
+	 * <p>
+	 * <strong>That cut is a DIVERGENCE, and it is here because Vulkan and GL do not agree on what an
+	 * attachment no fragment writes holds.</strong> Vulkan leaves it undefined for the whole draw;
+	 * the GL these packs were written against leaves it standing, and what a pack reads out of an
+	 * untouched shadow buffer is the white a coloured shadow multiplies by. Four packs of the corpus
+	 * ship a shadow program with one output and no directive at all - BSL, Bliss, Body Camera and
+	 * Sildur's - so the pair Iris opens for them would attach a second buffer nothing writes.
+	 * <p>
+	 * What it costs is measured and it is nothing today: of those four, only Bliss reads
+	 * {@code shadowcolor1} at all, at {@code shaders/dimensions/final.fsh:114}, behind
+	 * {@code DEBUG_VIEW == debug_SHADOWMAP} which its own {@code lib/settings.glsl:784} leaves off.
+	 * So no pack of the corpus can tell the two apart, and the reason for cutting is the rule and
+	 * not a picture anyone has seen.
+	 * <p>
+	 * The floor of one below is the same argument left unserved, and deliberately: a program that
+	 * writes NO output still has {@code shadowcolor0} attached, because a pass with no colour at all
+	 * is one the encoder takes on its depth while the pipeline substitutes a state of its own.
+	 * Mellow is that program, and nothing of Mellow reads a shadow colour back.
+	 */
+	private final List<Integer> shadowColours;
+
+	/** Whether draw buffer nought goes to the pack rather than to the game. The constructor says why. */
+	private final boolean ownsFirst;
+
+	/** Whether this pass writes the mask the scene seed is cut with. Opaque halves only. */
+	private final boolean covers;
+
+	/**
+	 * Whether this pass blends and lost draw buffer nought all the same, which is the one demotion
+	 * that says what it costs the BLEND rather than what it costs the colour. Kept as a field
+	 * because it is answered where {@code owns} is in scope and said where it is not.
+	 * <p>
+	 * <strong>It has no cause of its own, and that is worth saying rather than leaving a
+	 * reader to work out.</strong> Every blending pass drawn before the seed either writes the mask
+	 * or has an opaque sibling of its own family marking those pixels, so what is left here is a
+	 * pass that asked for a mask and could not be given one, which the constructor has already
+	 * warned about by name. The line it prints is kept because it says a different thing: not that
+	 * the colour goes to the game's target, which the warning says, but that the blend is made
+	 * against a target the world is not in.
+	 */
+	private final boolean demoted;
+	private final ColorTargets targets;
+	private final ShadowTargets shadow;
+	private final PackProgram.Loaded loaded;
+	private final PackValues values;
+	private final PackUniforms uniforms;
+	private final List<String> samplers;
+	private final List<String> storage;
+
+	/**
+	 * The same names in the same order, each carrying what the load settled about it and what the
+	 * pass open resolved for it. Read by the bind and by nothing else.
+	 */
+	private final Sampled[] bound;
+
+	/**
+	 * The two halves of {@link #bound}, split once: the names whose answer follows the draw's own
+	 * image, bound at every draw, and every other name, bound once per pass open. A bind used to
+	 * walk all of them at every draw to find the two to four that could move.
+	 */
+	private final Sampled[] following;
+	private final Sampled[] settledOnce;
+	private final RenderPipeline pipeline;
+	private final ShaderSource source;
+
+	/**
+	 * Pipelines drawing this program over a mesh laid out by somebody else, keyed by that layout.
+	 * A refusal is held as null, latched the way {@link #compile}'s is.
+	 */
+	private final Map<VertexFormat, RenderPipeline> reshaped = new HashMap<>();
+
+	/**
+	 * Whether this program reads {@code gl_TextureMatrix[0]} out of the game's own per draw
+	 * transforms, which is what puts a second bind group on the pipeline.
+	 *
+	 * @see dev.vulture.glsl.PackProgram.Loaded#readsGameTransforms
+	 */
+	private final boolean gameTransforms;
+
+	private MappableRingBuffer block;
+
+	/** The whole block as one slice, and the buffer it was cut from. See {@link #blockSlice}. */
+	private GpuBufferSlice blockSlice;
+
+	private GpuBuffer blockSliceOf;
+
+	private int blockSliceBytes;
+
+	/**
+	 * The device's one-texel constants, for a sprite the resource pack ships nothing for and for
+	 * every family drawn with no atlas at all. Shared across every program and surviving every
+	 * release, which is what keeps a rebuild from paying their clears again: see the class.
+	 */
+	private ConstantTextures constants;
+	private GpuTextureView atlas;
+
+	/** The matrix the game pushed for this pass, or null for the frame's camera. */
+	private Matrix4fc modelView;
+
+	/** The bob that placed this pass's geometry, or null for the frame's. Only the hand sets one. */
+	private Matrix4fc bob;
+
+	/** The volume this pass is drawn in, or null for the frame's. Only the hand sets one. */
+	private Matrix4fc projection;
+
+	/** The colour the game modulates this pass by, or null for white. */
+	private Vector4fc passColour;
+	private GpuSampler atlasSampler;
+	private boolean announced;
+	private boolean drew;
+	private boolean broken;
+	private boolean compiled;
+
+	/** Whether the colour image this program stores into was already said to be unwritable. */
+	private boolean saidUnwritable;
+
+	/** The custom image views it asks for that the device cannot give, or null until asked. */
+	private List<String> unusableViews;
+
+	/**
+	 * The pipeline the pack-load worker built for this program, waiting for a render-thread
+	 * {@link #compile} to hand it to the device's cache, which is the one step the worker may not
+	 * take itself. Written and cleared under this program's monitor, on whichever side gets there
+	 * first.
+	 */
+	private AheadCompiler.Ahead ahead;
+
+	/**
+	 * Set by {@link #discardAhead()} when the chain released before anything drew this program:
+	 * from then on the worker destroys what it built instead of storing it, since no compile of a
+	 * released chain will ever come to adopt it.
+	 */
+	private boolean discarded;
+
+	/**
+	 * The attachments of this pass some sampler of the program also names, on the same half, each
+	 * with whether it is served a copy taken before the world's translucents. Only a name the
+	 * program samples on a pass drawn after the deferred stage is; every other one is served one
+	 * pixel, and {@link TargetCopies} says why the two passes differ.
+	 */
+	private final Map<ChainPlan.Attachment, Boolean> readWhileWritten;
+
+	/** Reused while a descriptor is built: Sodium asks for one per region, not once a frame. */
+	private final List<GpuTextureView> attachedViews = new ArrayList<>();
+	private final List<GpuTextureView> shadowViews = new ArrayList<>();
+
+	/**
+	 * The area of the last descriptor built, and the size it was built for.
+	 * <p>
+	 * Held for the same reason the view lists above are: one is asked for per region and the value
+	 * moves only when the window does. The size is carried beside it rather than the area being
+	 * dropped on a resize, because nothing here is told of one; the map's own is a square and moves
+	 * when the player scales it.
+	 */
+	private RenderPass.RenderArea area;
+	private int areaWidth;
+	private int areaHeight;
+	private RenderPass.RenderArea shadowArea;
+	private int shadowAreaSize;
+
+	GeometryProgram(Pass pass, PackProgram.Loaded loaded, PackValues values, int load,
+			VertexFormat format, List<ChainPlan.Attachment> writes, ColorTargets targets,
+			boolean chainRuns) {
+		this.pass = pass;
+		this.path = loaded.path();
+		this.gameTransforms = loaded.readsGameTransforms();
+		this.blockLabel = () -> "Vulture " + pass.family() + " OfGlobals";
+		String passName = "Vulture " + pass.family();
+		String shadowName = "Vulture shadow " + pass.family();
+		this.passLabel = () -> passName;
+		this.shadowLabel = () -> shadowName;
+		TranslatedUnit.Notes notes = loaded.program().stages().get(ProgramStage.FRAGMENT).notes();
+		int outputs = notes.fragmentOutputs();
+
+		// Draw buffer nought goes to the pack, on all three halves of the world, and the whole cost
+		// of that is that somebody else has to stop painting over it.
+		//
+		// The translucent half has needed it from the start. It is drawn AFTER the seed has run, so
+		// the pack's own colour target already holds the opaque world, and that is exactly what a
+		// gbuffers_water expects to blend onto. Sent to the game's target instead, the water is
+		// drawn and then thrown away: the final overwrites that target with the image the chain
+		// composed out of a colortex the water never reached.
+		//
+		// Keeping every opaque half on the game's target and reaching the pack's colortex through
+		// the seed is one conversion too many. What a gbuffers program puts in draw
+		// buffer nought is not a colour but whatever the pack packed there, and the game's target is
+		// eight bits a channel: Bliss packs two values into each channel of a sixteen bit colortex1,
+		// and the trip through the game's target quantised its albedo away entirely, leaving the
+		// encoded normal to be read back as the albedo. So the opaque halves write their target
+		// outright, and the coverage mask below is what keeps the seed off the pixels they wrote.
+		// The entities came last of them, and only once the mask carried a DEPTH: while it was a
+		// flag, the cut compared the world's depth with one taken before a single feature was drawn,
+		// and a mob standing in front of a block moved that depth by construction, so no mask it
+		// wrote could have kept the seed off it.
+		//
+		// Everything that lands back on the game's target, and it is a list of reasons rather than a
+		// count. When the chain is not running there is no final to bring a colortex to the screen,
+		// so anything sent there would simply vanish; when the plan had no answer there is nowhere
+		// else to send it; when a half that ASKED for a mask could not be given one, the seed would
+		// repaint the whole target and take the geometry with it; when a half never asked for one,
+		// which is the weather alone, the seed carries it in by design; and the
+		// last is what the statement after next is about, a blending pass drawn before the seed with
+		// nothing marking the pixels it blends onto. Either way the pass draws where Sodium would
+		// have, which is also what keeps the pipeline's one state the pass's.
+		//
+		// Whether the mask was really written is the translation's answer and not a second reading
+		// of the same rule: the stage that could not be given one says so, and an engine that
+		// decided for itself would be attaching an image nothing fills.
+		boolean owns = chainRuns && !writes.isEmpty();
+		this.covers = pass.covers() && covers(notes, writes.size(), chainRuns);
+		// A blending pass may take draw buffer nought outright only where the seed will not repaint
+		// the pixels it blended onto, and blending is not that question: it was read as though it
+		// were, and every family answered the same either way until the hand arrived.
+		//
+		// Three ways the seed is kept off. The pass is drawn AFTER the seed, which is the world's
+		// water, the weather, the clouds, the translucent particles, the blending half of the
+		// entities and the hand's own water pass. It writes the mask itself, which is what covers
+		// above answers, and which the hand's solid pass now does with the rest of the door. Or the
+		// family draws opaque pieces of its own over the same pixels, which is the sky alone and
+		// which claimed carries, with the two places it does not hold named where that field is
+		// declared.
+		//
+		// The hand came last of the three roads and by the second, and what had made it impossible
+		// there was the flag. The cut then asked whether the depth had moved closer since a copy
+		// taken before the game's features, and the hand is drawn with its clip depth squeezed into
+		// the band 0.4375 to 0.5625 (render/HandDraw.java:93,382), which is not the depth of anything
+		// it stands in front of: every hand pixel answered that yes, whatever mask was written there.
+		// The mask carries the depth now, so a hand row writes that same squeezed value and the cut
+		// compares it with itself.
+		//
+		// AND IT IS WHERE IRIS HAS IT. Iris binds every gbuffers program to a framebuffer over the
+		// pack's own declared draw buffers, the hand included
+		// (pipeline/IrisRenderingPipeline.java:686-687; the four keys its hand passes ask for are at
+		// pipeline/IrisPipelines.java:192,204,216), so its hand colour is written to the pack's
+		// target and never leaves it. Three things were paid for the trip through the game's target
+		// while this pass was still making it, and they are what the mask buys back. The trip through
+		// eight bits a channel, which is the quantisation the Bliss paragraph above measured on the
+		// terrain. The blend, which happened against the game's target: with the chain running the
+		// world is in the PACK's target, so a hand pixel of alpha under one blended against the clear
+		// rather than against what stands behind it. And a row that writes no depth with nothing of
+		// its own pass writing depth under it - a held banner's pattern is the reachable one
+		// (BANNER_PATTERN, RenderPipelines.java:318) - which the cut discarded outright, the mask and
+		// the world's depth both holding what the geometry behind the hand left.
+		// The far terrain owns its first draw buffer whichever half it falls on, and it is the one
+		// family that owns it without a mask and without being drawn after the seed. Iris binds its
+		// dh programs to a framebuffer over the pack's own declared draw buffers, exactly as it
+		// binds every gbuffers program (compat/dh/DHCompatInternal.java:92 building
+		// createDHFramebuffer over the terrain source), so the pack's colour never makes the trip
+		// through the game's target there. And the seed cannot be this family's road at all: the
+		// pack's sky claims the whole horizon with a depth of its own - the disc's, and the cone's
+		// below it - which stands nearer than any far terrain, so the cut refuses the transport and
+		// what the seed target keeps where the far terrain stands is the sky. What keeps the seed
+		// OFF the pixels this family writes is that same claim, the world's depth holding the far
+		// plane there: a game feature really drawn in front still comes in over it, its depth being
+		// nearer than the sky's claim.
+		this.ownsFirst = owns && (this.covers || pass.afterDeferred()
+				|| (pass.blended() && pass.claimed()) || pass.distantVolume());
+		// The demotion just above and none of the ones before it, which is why owns and the side are
+		// both in it: without owns this would answer yes for every blending pass in a place where
+		// the chain does not run or the plan had no attachments to give, and then say of the water,
+		// the clouds and the weather that they are drawn before a seed they are drawn after - or
+		// before a seed that is never painted at all. Nothing tests the shadow map here because
+		// nothing needs to: no pass drawn from the light carries a blend of its own, whatever a
+		// pack's own directive later puts on its attachments.
+		this.demoted = owns && !this.ownsFirst && pass.blended() && !pass.afterDeferred();
+		this.extra = this.ownsFirst
+				? List.copyOf(writes)
+				: writes.size() < 2 ? List.of() : List.copyOf(writes.subList(1, writes.size()));
+		this.slots = pass.shadow() ? List.of() : attachments(targets, outputs);
+		// Never fewer than one, whatever the fragment stage declares. Mellow's shadow program writes
+		// no output at all - its whole body is one discard test, so the count is nought - and a pass
+		// with no colour attachment is one the encoder accepts on the strength of its depth while
+		// the pipeline substitutes a state of its own, which is the mismatch this file refuses by
+		// name elsewhere. It draws into the map and into nought, exactly as it would without this rule.
+		//
+		// And never more than a pipeline holds states for. The builder writes them into an array of
+		// that length, so one rank past it is an index out of bounds where the program is built
+		// rather than a refusal that names it. A directive can reach it: the indices run together
+		// and DRAWBUFFERS:000000000 parses.
+		this.shadowColours = pass.shadow()
+				? DrawBuffers.shadowColours(
+						loaded.program().stages().get(ProgramStage.FRAGMENT).drawBuffers(),
+						targets.shadow().colourCeiling()).stream()
+						.limit(Math.clamp(outputs, 1, ColorTargetState.MAX_COLOR_TARGETS))
+						.toList()
+				: List.of();
+
+		// Said here rather than in announce(), because it is a property of the text and not of a
+		// frame, and because what it costs is invisible: the pass then draws exactly as it did
+		// before the mask existed, and it is Bliss's albedo that pays for it.
+		if (owns && pass.covers() && !this.covers) {
+			// Split by cause, and the split is not where the predicate above suggests. The
+			// translation refuses to place a mask at eight outputs, which is the same eight a
+			// pipeline carries, so a stage that is full and a stage that could not be given one are
+			// the same case and both belong below. What is left on this side is a pack writing more
+			// draw buffers than its fragment stage declares outputs, and the numbers describe that
+			// and nothing else.
+			if (notes.coverage() == 1) {
+				// Present tense, and it is worse than a lost mask: the translation was asked for one
+				// by the family and placed it one rank above the outputs, so the fragment writes it
+				// at a rank this attachment list fills with a colour target of the pack. Nothing
+				// downgrades on that side, and what the pack meant to write there is written over.
+				Vulture.logger().warn("{} writes {} draw buffers where the {} pass declares {} "
+						+ "fragment outputs, so the coverage mask sits at a rank one of those draw "
+						+ "buffers holds and is written over it: draw buffer nought stays on the "
+						+ "game's target and the scene seed keeps painting the whole of it", this.path,
+						writes.size(), pass.name(), outputs);
+			} else {
+				Vulture.logger().warn("{} could not be given a coverage mask by the translation, so "
+						+ "draw buffer nought of the {} pass stays on the game's target and the scene "
+						+ "seed keeps painting the whole of it", this.path, pass.name());
+			}
+		}
+
+		this.targets = targets;
+		this.shadow = targets.shadow();
+		this.loaded = loaded;
+		this.values = values;
+		// A shadow pass is drawn from the light, so the six fixed function names answer the shadow
+		// pair. Everything else in the table is the frame's and is shared with the world.
+		this.uniforms = new PackUniforms(loaded.program().uniforms(),
+				pass.shadow() ? values.shadowGeometryCatalog() : values.geometryCatalog());
+		this.samplers = loaded.program().samplers().stream().map(TranslatedUnit.Uniform::name).toList();
+		this.storage = loaded.storageBlocks().stream()
+				.distinct()
+				.filter(StorageBuffers::named)
+				.toList();
+		// Which map a name asks for, and whether it is the albedo, are questions about the NAME and
+		// about the plan the load built, so they are asked here once for the life of the program.
+		this.bound = this.samplers.stream()
+				.map(name -> {
+					SamplerPlan.Binding binding = loaded.samplers().binding(name);
+					return new Sampled(name, material(name), ATLAS.contains(name), binding,
+							binding.kind() == SamplerPlan.Kind.PACK_TEXTURE
+									? targets.packSource(TextureStage.GBUFFERS, name)
+									: null);
+				})
+				.toArray(Sampled[]::new);
+		this.following = Arrays.stream(this.bound).filter(Sampled::followsTheImage)
+				.toArray(Sampled[]::new);
+		this.settledOnce = Arrays.stream(this.bound).filter(one -> !one.followsTheImage())
+				.toArray(Sampled[]::new);
+		this.readWhileWritten = readWhileWritten(targets);
+
+		String vertex = loaded.program().stages().get(ProgramStage.VERTEX).text();
+		// The pass is in the name and not only the path, because two passes are usually served by
+		// the same file and their text still differs: the cutout half carries a discard the solid
+		// half does not. The device caches a shader module under its identifier, so one name for two
+		// texts would hand the second whatever the first compiled to, and the picture would be a
+		// picture with the discard silently gone.
+		String stem = "pack/" + load + "/" + pass.name() + "/" + this.path;
+		Identifier vertexId = Identifier.fromNamespaceAndPath(pass.namespace(), stem + "/vertex");
+		Identifier fragmentId = Identifier.fromNamespaceAndPath(pass.namespace(), stem + "/fragment");
+
+		BindGroupLayout.Builder bindings = BindGroupLayout.builder()
+				.withUniform(UNIFORM_BLOCK, UniformType.UNIFORM_BUFFER);
+		// The second block, for the one family whose geometry arrives in pieces that do not share a
+		// value. In the same group as ours rather than in a group of its own: what the game builds a
+		// second group for is a layout of ITS own, bound by the names it spells, and this one is this
+		// engine's from end to end.
+		if (pass.perDraw() != null) {
+			bindings.withUniform(pass.perDraw(), UniformType.UNIFORM_BUFFER);
+		}
+
+		this.samplers.forEach(name -> GraphicsApi.withSampler(bindings, name));
+		this.storage.forEach(name -> bindings.withUniform(name, UniformType.UNIFORM_BUFFER));
+
+		// Everything but the shaders, the bind group, the attachments and the two lines below is
+		// Sodium's own, taken from ShaderChunkRenderer.createShader: the pass this is bound into was
+		// opened for that pipeline and a difference of topology would be a difference nobody declared.
+		RenderPipeline.Builder builder = RenderPipeline.builder()
+				.withLocation(Identifier.fromNamespaceAndPath(pass.namespace(), "pipeline/" + stem))
+				.withVertexShader(vertexId)
+				.withFragmentShader(fragmentId)
+				.withBindGroupLayout(bindings.build())
+				.withPrimitiveTopology(pass.topology())
+				.withCull(pass.cull());
+
+		// The region offset Sodium pushes at every draw of a chunk layer. One game hands it to the
+		// pipelines whose name says sodium, the other has each pipeline declare the room it takes;
+		// GraphicsApi answers for both, and the family whose geometry is not Sodium's takes none.
+		if (pass.namespace().contains("sodium")) {
+			GraphicsApi.withSodiumPushConstants(builder);
+		}
+
+		// A second group, and it is the game's own rather than one built here: the pass binds its
+		// contents by name, so the names have to be the ones it binds. Only the clouds have one.
+		if (pass.bindings() != null) {
+			builder.withBindGroupLayout(pass.bindings());
+		}
+
+		// And the game's per draw transforms, for a program that reads a texture matrix out of them.
+		// The game's own object again, and for the same reason: what is bound into it is bound by the
+		// name the layout carries, so a copy built here would have to spell DynamicTransforms anyway.
+		if (this.gameTransforms) {
+			builder.withBindGroupLayout(BindGroupLayouts.DYNAMIC_TRANSFORMS);
+		}
+
+		// No binding at all where the family binds no mesh, which is the clouds and only them: their
+		// geometry is three bytes a face in a texel buffer and a vertex identifier, so a binding of
+		// nought elements would name a buffer the pass never sets.
+		if (format != null) {
+			builder.withVertexBinding(0, format);
+		}
+
+		// Left unset where the family answers null, which is not the same as setting the default one:
+		// the builder hands a null state through to the pipeline, and that is a pass which neither
+		// tests nor writes a depth. It is what the game's own sky is built with.
+		if (pass.depth() != null) {
+			builder.withDepthStencilState(pass.depth());
+		}
+
+		// One state per attachment, and dynamic rendering wants the two counts equal.
+		// By slot and never by append: the builder holds the states in an array and the argumentless
+		// form writes slot nought every time, so three calls would leave one state and a pipeline
+		// the pass refuses to bind, by name and in the middle of the world.
+		if (pass.shadow()) {
+			// One state per shadowcolor the program's own draw buffers name, in their order, which
+			// is also the rank a per buffer blend directive on this program lands on. The format is
+			// each buffer's own and not a constant: Mellow asks for R8 on nought, and a state naming
+			// four channels against a one channel attachment is the pipeline refusing to bind.
+			for (int slot = 0; slot < this.shadowColours.size(); slot++) {
+				builder.withColorTargetState(slot,
+						state(slot, targets.shadowFormat(this.shadowColours.get(slot))));
+			}
+		} else {
+			for (int slot = 0; slot < this.slots.size(); slot++) {
+				Slot one = this.slots.get(slot);
+				switch (one.bound()) {
+					// Held as a null state, which the backend turns into a colour write mask of
+					// nought while every neighbour carries WRITE_ALL (VulkanRenderPipeline:182-189).
+					// So a pass that covers its outputs hands the device an attachment array whose
+					// elements already differ, blend functions or no blend functions, and has since
+					// long before any of them were read by rank.
+					case UNUSED -> builder.withUnusedColorTargetState(slot);
+					// The mask is written outright and never blended, whatever the pack asked for its
+					// own targets: what it carries is the depth the fragment left, and a depth mixed
+					// with the one behind it is the depth of nothing at all.
+					case COVERAGE -> builder.withColorTargetState(slot, new ColorTargetState(
+							Optional.empty(), one.format(), ColorTargetState.WRITE_ALL));
+					default -> builder.withColorTargetState(slot, state(slot, one.format()));
+				}
+			}
+		}
+
+		this.pipeline = part(builder);
+
+		// Filed against the pipeline and not the program, because the pipeline is what the
+		// descriptor walk can see when it has to answer for a name.
+		ShadowCompare.note(this.pipeline, this.path, loaded);
+
+		// Same filing, same reason: the compile road has the pipeline in hand and nothing else. And
+		// the same refusal the storage block below takes, on the one road that answers no: a pack
+		// ships a geometry stage the device cannot run and that cannot be folded away. The fragment
+		// stage is asked for here rather than read beside the vertex one because a fold rewrites it,
+		// which is also why the source is only built once the pipeline exists.
+		String fragment = GeometryStage.fragment(this.pipeline, this.path, loaded);
+		if (fragment == null) {
+			this.broken = true;
+		}
+
+		this.source = GraphicsApi.source((id, type) -> {
+			if (type == ShaderType.FRAGMENT) {
+				return fragmentId.equals(id) ? fragment : null;
+			}
+
+			return vertexId.equals(id) ? vertex : null;
+		});
+
+		// A storage block this engine has no bufferObject for is the one refusal that does not
+		// announce itself. An unbindable sampler stops the pipeline from being built and this class
+		// already falls back on that; a storage block compiles, never enters a bind group, and
+		// leaves the descriptor on the binding the pack wrote, which is a draw against nothing.
+		// The chain refuses one by name and so does this, so that the world keeps the game's own
+		// shader instead. Complementary's blockDataBuffer is served, and stays off this list.
+		List<String> storage = loaded.storageBlocks().stream()
+				.distinct()
+				.filter(name -> !StorageBuffers.named(name))
+				.toList();
+		if (!storage.isEmpty()) {
+			this.broken = true;
+			Vulture.logger().error("{} declares the storage block {}, which nothing binds, so the "
+					+ "{} pass keeps the game's own shader", this.path, String.join(", ", storage),
+					pass.name());
+		}
+	}
+
+	/**
+	 * The colour attachments of a world pass, in the order both the pipeline and the descriptor walk
+	 * them.
+	 * <p>
+	 * Nought is the game's own target and carries its format; the rest carry the format their colour
+	 * target was really allocated as, which is not always the one the pack asked for.
+	 *
+	 * @param outputs how many outputs the fragment stage declares, which is where the mask goes and
+	 *                not where the pack's draw buffers end. See {@link Bound#UNUSED}
+	 */
+	private List<Slot> attachments(ColorTargets targets, int outputs) {
+		List<Slot> built = new ArrayList<>();
+		if (!this.ownsFirst) {
+			built.add(new Slot(Bound.GAME, null, GpuFormat.RGBA8_UNORM));
+		}
+
+		for (ChainPlan.Attachment attachment : this.extra) {
+			built.add(new Slot(Bound.PACK, attachment, targets.format(attachment.target())));
+		}
+
+		if (this.covers) {
+			while (built.size() < outputs) {
+				built.add(new Slot(Bound.UNUSED, null, null));
+			}
+
+			built.add(new Slot(Bound.COVERAGE, null, targets.coverageFormat()));
+		}
+
+		return List.copyOf(built);
+	}
+
+	/**
+	 * What the pack asked to blend this one attachment with, falling back to what the pass wants
+	 * when it asked nothing.
+	 * <p>
+	 * The per buffer form, {@code blend.<program>.<buffer>}, is read here by the RANK the target
+	 * holds among the program's draw buffers, which is the rank this slot holds: the pipeline is
+	 * built over the pack's draw buffers in their own order, and the one slot that is not the
+	 * pack's own is draw buffer nought demoted onto the game's target, which is where that draw
+	 * buffer's colour goes. A pass drawn from the light ranks the same way over the shadowcolor
+	 * buffers its program declared. Iris resolves both the same way, the camera's at
+	 * {@code ShaderCreator.java:155-160} and the light's at {@code :358-363}, and applies the whole
+	 * program function before either ({@code ExtendedShader.java:244-250}), which is the order the
+	 * plan already folded them in.
+	 * <p>
+	 * <strong>Where the device cannot part its attachments the whole program answer stands on all
+	 * of them.</strong> Two attachments of one Vulkan pipeline may carry two blend states only
+	 * under {@code independentBlend}, so {@link BufferBlending} is asked first and the plan's
+	 * rankless answer is what a device without it gets, which is the function this pass carried
+	 * before the ranks were read at all. That function is the whole of what the fallback keeps back.
+	 * It does not hand such a device an identical array, and it never did: an unused slot is held as
+	 * a null state and the backend gives that one a colour write mask of nought beside its
+	 * neighbours' {@code WRITE_ALL} ({@code VulkanRenderPipeline:182-189}), so a pass covering its
+	 * outputs was parting its attachments there already. What the device gets back is what it had.
+	 * <p>
+	 * It is a fallback and never a refusal: the pipeline builder throws on two states that disagree,
+	 * so a pack whose directives part its targets would otherwise not be built at all, and a program
+	 * that is not built is a pass the pack does not draw.
+	 * <p>
+	 * The whole program form is what the corpus writes on the translucent chunk pass, and it is
+	 * often not what the pass would have chosen: Reverie, Noble and Photon ask for no blending at
+	 * all on their water, which is the opposite of it, and Bliss gives a function whose alpha half
+	 * differs from the one assumed.
+	 *
+	 * @param rank the slot's place among the draw buffers of the program being built, which is what
+	 *             a per buffer directive names its target by
+	 */
+	private ColorTargetState state(int rank, GpuFormat format) {
+		BlendMode asked = BufferBlending.served()
+				? this.targets.blend(this.loaded.path(), rank)
+				: this.targets.blend(this.loaded.path());
+
+		return new ColorTargetState(BlendFunctions.of(asked, this.pass.blend()), format,
+				ColorTargetState.WRITE_ALL);
+	}
+
+	/**
+	 * The build itself, with the game's refusal of two colour targets naming different blend
+	 * functions lifted for the length of it and for this thread alone.
+	 * <p>
+	 * The refusal stands in the builder every pipeline of the process is built through, so
+	 * {@code RenderPipelineBuilderMixin} cannot lift it on the device's answer alone: the wrap it
+	 * carries runs for the game's own pipelines and every other mod's, and none of those asked for
+	 * anything. The mark raised here is what the mixin reads beside that answer, which makes the
+	 * lift as wide as this engine's builds on a device that granted {@code independentBlend} and no
+	 * wider. Both of ours go through here, this class being the only place two attachments of one of
+	 * our pipelines can come out with different functions.
+	 * <p>
+	 * On the thread because the builds are not all on one: the pack-load worker builds the six
+	 * families ahead of their first draw while the render thread builds what a first draw asks for
+	 * and what {@link #reshapeAs} rebuilds inside another mod's draw.
+	 */
+	private static RenderPipeline part(RenderPipeline.Builder builder) {
+		BufferBlending.building(true);
+		try {
+			return builder.build();
+		} finally {
+			BufferBlending.building(false);
+		}
+	}
+
+	/**
+	 * Everything that has to happen outside a render pass: the pipeline compiled, the buffers made,
+	 * the constants cleared, and this frame's block written.
+	 * <p>
+	 * Called where Sodium asks for its shader, which is before it opens its pass. Creating a texture
+	 * or a buffer records a barrier into the very command buffer a pass would be recording into, and
+	 * a clear refuses outright while one is open.
+	 *
+	 * @param atlas the block atlas of the pass being drawn, kept for the bind
+	 * @return the pipeline to draw with, or null to leave the game's own shader alone
+	 */
+	RenderPipeline prepare(GpuDevice device, GpuTextureView atlas) {
+		return prepare(device, atlas, null, null, null, null);
+	}
+
+	/**
+	 * The same, for a pass the game draws with a model view, a colour or a volume of its own.
+	 *
+	 * @param modelView  the matrix the game pushed for this pass, or null for the frame's camera.
+	 *                   Kept until the block is written rather than applied here: it is one value of
+	 *                   the block among the rest, and the block is written a few lines below
+	 * @param bob        the left factor that placed this pass's geometry, or null for the frame's.
+	 *                   The hand is the one family that sets it, and it sets it because it is drawn
+	 *                   under a projection built here rather than under the level's;
+	 *                   {@code ViewMatrices.passBob} says what the frame's would cost it
+	 * @param projection the volume this pass is drawn in, or null for the frame's. The hand is the
+	 *                   one family that sets it, and it is not a nudge of the frame's but a matrix
+	 *                   of its own; {@link dev.vulture.uniform.ViewSource#passProjection} says why
+	 */
+	RenderPipeline prepare(GpuDevice device, GpuTextureView atlas, Matrix4fc modelView,
+			Matrix4fc bob, Vector4fc passColour, Matrix4fc projection) {
+		this.modelView = modelView;
+		this.bob = bob;
+		this.passColour = passColour;
+		this.projection = projection;
+		if (this.broken) {
+			return null;
+		}
+
+		// Refused rather than drawn somewhere else. A shadow program handed back with no map to
+		// draw into would be bound into the pass the renderer opens for itself, which is the game's
+		// own target, and the pack's shadow output would land on the screen.
+		if (this.pass.shadow() && this.shadow.depth() == null) {
+			return null;
+		}
+
+		// Creating a texture or clearing one records into the command buffer a pass would be
+		// recording into. The hold has to end first; after that this program's block exists and
+		// the next prepare of it can run while the next geometry program keeps that pass open.
+		if (this.block == null || !ConstantTextures.ready()) {
+			GeometryHold.flush(() -> "a program building or clearing its block");
+		}
+
+		if (!compile(device)) {
+			return null;
+		}
+
+		// Asked once, here where the program is prepared, so that a view the device cannot give is
+		// a program refused rather than a descriptor refused while the pass records.
+		if (this.unusableViews == null) {
+			this.unusableViews = StorageImages.unusableViews(this.samplers);
+			if (!this.unusableViews.isEmpty()) {
+				Vulture.logger().warn("{} reads {} through a view this device cannot sample and "
+						+ "store in that format, so the game's own shader draws this pass", this.path,
+						this.unusableViews);
+			}
+		}
+
+		if (!this.unusableViews.isEmpty()) {
+			return null;
+		}
+
+		this.atlas = atlas;
+		ensureConstants(device);
+		if (this.block == null) {
+			this.block = new MappableRingBuffer(this.blockLabel,
+					GpuBuffer.USAGE_UNIFORM | GpuBuffer.USAGE_MAP_WRITE, blockBytes());
+		}
+
+		// After the constants and never before them: what a name with no image is answered with is a
+		// view of one of those textures, and this is the call that settles those answers again
+		// after a release.
+		resolve();
+		Sampled unwritable = Arrays.stream(this.bound)
+				.filter(one -> one.binding.kind() == SamplerPlan.Kind.COLOUR_IMAGE && one.view == null)
+				.findFirst().orElse(null);
+		if (unwritable != null) {
+			if (!this.saidUnwritable) {
+				this.saidUnwritable = true;
+				Vulture.logger().warn("{} stores into {}, which was not created writable: this "
+						+ "device makes no storage image of its format, or only a vertex stage "
+						+ "names it, so the game's own shader draws this pass", this.path,
+						unwritable.name);
+			}
+
+			return null;
+		}
+
+		announce();
+		writeBlock();
+
+		return this.pipeline;
+	}
+
+	/**
+	 * Compiles the pipeline into the device cache, with no atlas, no block and no log line.
+	 * <p>
+	 * {@link #prepare} still does the rest at the first real draw. {@code precompilePipeline} is a
+	 * computeIfAbsent: after a resource reload emptied the cache this compiles again, and while the
+	 * cache holds it this is a lookup.
+	 *
+	 * @return false when the program will never be drawn
+	 */
+	synchronized boolean compile(GpuDevice device) {
+		if (this.broken) {
+			return false;
+		}
+
+		// NOT short-circuited on the flag below, which only says shaderc has been paid once.
+		// Every resource reload empties the device cache under a running session, and what
+		// lowers that flag is the chain noticing its own head recompiled, which happens later in
+		// the frame than the sky, the first thing the world draws. A program trusting the flag
+		// hands back a pipeline the cache no longer holds, and setPipeline compiles it from the
+		// game's shader sources, which carry no line of this pack: an invalid pipeline, and the
+		// frame throws by name in the middle of the sky. The call below is a computeIfAbsent, so
+		// it costs a lookup for as long as the cache holds the key.
+
+		// What the worker finished is handed to the cache here, on the render thread, and the
+		// precompile below finds it as a lookup. A cache that already holds the key kept a copy
+		// somebody compiled meanwhile, so ours dies instead, never having been bound anywhere.
+		AheadCompiler.Ahead ready = this.ahead;
+		if (ready != null) {
+			this.ahead = null;
+			if (!ready.adopt(device, this.pipeline)) {
+				ready.destroy();
+			}
+		}
+
+		CompiledRenderPipeline compiled = GraphicsApi.compile(device, this.pipeline, this.source);
+		if (!GraphicsApi.valid(compiled)) {
+			// Handing back an invalid pipeline throws inside setPipeline, in the middle of Sodium's
+			// own pass, which reads as a Sodium failure. Refused here instead, once.
+			this.broken = true;
+			// The PASS and not "the terrain", which it said from the day only the terrain came through
+			// here, and not the family either: the family is one word for all twenty entity pieces,
+			// so it would not say which failed. The same words as the storage block refusal above,
+			// because the two latch the same flag and a reader meeting either has the same question.
+			Vulture.logger().error("{} did not compile, so the {} pass keeps the game's own shader",
+					this.path, this.pass.name());
+
+			return false;
+		}
+
+		this.compiled = true;
+
+		return true;
+	}
+
+	/**
+	 * The same program, compiled to read a mesh laid out by somebody else.
+	 * <p>
+	 * A draw a mod records into a pass this engine opened arrives with a vertex layout of the mod's
+	 * own, and a pipeline reads its buffer through the layout it was built with: binding
+	 * {@link #prepare}'s answer over such a mesh would read every attribute at the wrong offset.
+	 * The variant is this program's pipeline with the caller's layout on binding nought, every
+	 * STATE of the pipeline kept, and the comparison note refiled beside it: the answers keyed on
+	 * the pipeline OBJECT rather than read off it do not travel through a rebuild on their own,
+	 * and {@code ShadowCompare} is one, so {@link #reshapeAs} files the variant where it files the
+	 * base. It sits under a location of its own so the device caches the two apart. The shaders
+	 * do not move, so the layout is refused unless it leads with the attributes this program
+	 * names, which {@link #rebuild} sets out.
+	 * <p>
+	 * Recompiled through {@code precompilePipeline} on every call, for the reason {@link #compile}
+	 * gives: a resource reload empties the device cache, and the call is a lookup while the cache
+	 * holds the key.
+	 *
+	 * @param layout the layout of the caller's mesh, on binding nought
+	 * @return the pipeline to bind over that mesh, or null when it refused to compile
+	 */
+	RenderPipeline reshape(GpuDevice device, VertexFormat layout) {
+		// The lock compile() takes, for the flag they share: a worker warming this program ahead
+		// writes broken under it, and this runs on the render thread while it does.
+		synchronized (this) {
+			if (this.broken) {
+				return null;
+			}
+
+			VertexFormat own = this.pipeline.getVertexFormatBinding(0);
+			if (layout.equals(own)) {
+				return this.pipeline;
+			}
+
+			RenderPipeline variant;
+			if (this.reshaped.containsKey(layout)) {
+				variant = this.reshaped.get(layout);
+			} else {
+				variant = rebuild(layout, own);
+				this.reshaped.put(layout, variant);
+			}
+
+			if (variant == null) {
+				return null;
+			}
+
+			RuntimeException thrown = null;
+			boolean valid;
+			try {
+				valid = GraphicsApi.valid(GraphicsApi.compile(device, variant, this.source));
+			} catch (GpuDeviceLossException e) {
+				throw e;
+			} catch (RuntimeException e) {
+				// A stage the driver refuses throws out of precompilePipeline rather than coming back
+				// invalid, which is what MoltenVK does with one Metal will not build, and the caller
+				// is a pipeline being set on a pass, outside every catch of the frame. It is the same
+				// refusal, so it takes the same latch.
+				thrown = e;
+				valid = false;
+			}
+
+			if (!valid) {
+				// Latched like compile()'s refusal, and for its reason: retrying would pay shaderc
+				// every draw for the same answer, and the caller has a fallback to hand the draw to.
+				this.reshaped.put(layout, null);
+				Vulture.logger().error("{} did not compile over a mesh layout brought by another "
+						+ "mod, so the {} pass draws that mesh through its own layout", this.path,
+						this.pass.name(), thrown);
+
+				return null;
+			}
+
+			return variant;
+		}
+	}
+
+	/**
+	 * Builds the variant, or hands back null with one line where the layout cannot carry this
+	 * program.
+	 * <p>
+	 * <strong>The layout has to lead with this program's own attributes, by name and in
+	 * order.</strong> The pipeline numbers a location for every element of the layout while the
+	 * shader numbers one for every element it declares, so an undeclared element sitting before a
+	 * declared one pulls the two counts apart and the shader reads the wrong attribute, silently.
+	 * Elements past the program's own are safe: their locations fall beyond every one the shader
+	 * asks for.
+	 * <p>
+	 * The build itself is guarded too: the builder refuses by throw, over sixteen attributes among
+	 * other things, and this is called from inside another mod's draw, where a throw would be the
+	 * very crash this door exists to close.
+	 */
+	private RenderPipeline rebuild(VertexFormat layout, VertexFormat own) {
+		List<VertexFormatElement> lead = own.getElements();
+		List<VertexFormatElement> given = layout.getElements();
+		boolean leads = given.size() >= lead.size();
+		for (int index = 0; leads && index < lead.size(); index++) {
+			leads = lead.get(index).name().equals(given.get(index).name());
+		}
+
+		if (!leads) {
+			Vulture.logger().warn("A mesh brought by another mod does not lead with the attributes "
+					+ "the {} pass reads, so its draws keep the pass pipeline's own layout: attribute "
+					+ "locations are numbered over every element of a layout, and a stranger before "
+					+ "a known one would make the shader read the wrong attribute without a word",
+					this.pass.name());
+
+			return null;
+		}
+
+		try {
+			return reshapeAs(layout, this.reshaped.size());
+		} catch (RuntimeException e) {
+			Vulture.logger().error("The " + this.pass.name() + " pass could not rebuild its "
+					+ "pipeline over a mesh layout brought by another mod, so those draws keep the "
+					+ "pipeline's own layout", e);
+
+			return null;
+		}
+	}
+
+	/**
+	 * The pipeline above with one layout swapped, which is a rebuild: the game's pipelines are
+	 * immutable and the builder is the public door. Every state is read off the built pipeline
+	 * rather than off this class's fields, so the two cannot drift.
+	 */
+	private RenderPipeline reshapeAs(VertexFormat layout, int index) {
+		RenderPipeline.Builder builder = RenderPipeline.builder()
+				.withLocation(this.pipeline.getLocation().withSuffix("/reshaped/" + index))
+				.withVertexShader(GraphicsApi.vertexShader(this.pipeline))
+				.withFragmentShader(GraphicsApi.fragmentShader(this.pipeline))
+				.withCull(this.pipeline.isCull())
+				.withPrimitiveTopology(this.pipeline.getPrimitiveTopology())
+				.withVertexBinding(0, layout);
+		this.pipeline.getBindGroupLayouts().forEach(builder::withBindGroupLayout);
+		GraphicsApi.copyPushConstants(builder, this.pipeline);
+		if (this.pipeline.getDepthStencilState() != null) {
+			builder.withDepthStencilState(this.pipeline.getDepthStencilState());
+		}
+
+		// Null is how the builder holds an unused slot, so null is copied as unused; the count the
+		// pipeline carries beside the array is rebuilt by walking every slot in order.
+		List<@Nullable ColorTargetState> states = GraphicsApi.colorTargets(this.pipeline);
+		for (int slot = 0; slot < states.size(); slot++) {
+			ColorTargetState state = states.get(slot);
+			if (state == null) {
+				builder.withUnusedColorTargetState(slot);
+			} else {
+				builder.withColorTargetState(slot, state);
+			}
+		}
+
+		RenderPipeline built = part(builder);
+
+		// The comparison note is keyed on the pipeline object, not read off its states, so it is
+		// the one answer a rebuild does not carry by itself. Left unfiled, the descriptor walk
+		// answers no for every compared name of this program and the variant's depth-reference
+		// lookups run on an ordinary sampler, undefined and silent.
+		ShadowCompare.noteBeside(built, this.pipeline);
+		GeometryStage.noteBeside(built, this.pipeline);
+
+		return built;
+	}
+
+	/** Whether {@link #compile} has already paid shaderc for this pipeline. */
+	boolean compiled() {
+		return this.compiled || this.broken;
+	}
+
+	/**
+	 * A resource reload emptied the device cache, so the next {@link #compile} has to pay again.
+	 */
+	void forgetCompiled() {
+		this.compiled = false;
+	}
+
+	/**
+	 * Builds this program's compiled pipeline on the pack-load worker, so the first draw finds the
+	 * half second of shaderc already paid. {@link AheadCompiler} says how each game does that off
+	 * the render thread; what the worker may not do is file the result where the render thread
+	 * looks, and {@link #compile} does that half, adopting the object built here.
+	 * <p>
+	 * A compile the pack's GLSL refuses stores nothing and says so in one line, because a refusal
+	 * only this path reproduces would otherwise never be seen at all; the first draw then retries
+	 * on the device's own path, which latches {@link #broken} and prints the authoritative one.
+	 *
+	 * @param compiler the worker's own, never shared with another task
+	 * @return true when a compiled pipeline now waits for {@link #compile} to adopt it
+	 */
+	boolean warmAhead(AheadCompiler compiler) {
+		synchronized (this) {
+			if (this.compiled || this.broken || this.discarded || this.ahead != null) {
+				return false;
+			}
+		}
+
+		AheadCompiler.Ahead built;
+		try {
+			built = compiler.build(this.pipeline, this.source);
+		} catch (AheadCompiler.Refused e) {
+			// The first draw retries on the device's own path, which latches broken and prints
+			// the pack's defect properly. Said here as well because a refusal the device path
+			// does NOT reproduce would otherwise never be seen at all.
+			Vulture.logger().info("{} stays for its first draw: {}", this.path, e.getMessage());
+
+			return false;
+		}
+
+		synchronized (this) {
+			if (this.compiled || this.broken || this.discarded) {
+				built.destroy();
+
+				return false;
+			}
+
+			this.ahead = built;
+		}
+
+		return true;
+	}
+
+	/**
+	 * The chain released before anything drew this program, so no {@link #compile} will ever come
+	 * for what the worker prepared. What already waits is destroyed on the spot, which is safe for
+	 * an object nothing ever bound; what the worker is still building is destroyed by the worker
+	 * itself when it finds this flag.
+	 */
+	synchronized void discardAhead() {
+		this.discarded = true;
+		if (this.ahead != null) {
+			this.ahead.destroy();
+			this.ahead = null;
+		}
+	}
+
+	/**
+	 * Binds this program's block and every sampler it declares, inside the pass the family has just
+	 * opened.
+	 * <p>
+	 * Every name the layout carries has to be bound or the draw throws on the first one missing, so
+	 * a name this step has no answer for gets one pixel rather than being left out. What stands
+	 * behind the rest, the pack's own targets among them, was settled by {@link #resolve}.
+	 * <p>
+	 * <strong>Only the names that follow the draw's own image are worked out here.</strong> The rest
+	 * were settled by {@link #resolve}, at the one point of a pass that stands outside it, and this
+	 * walks them in order out of an array rather than asking for each of them by name.
+	 * <p>
+	 * <strong>And only those are WRITTEN here, past the first bind of a pass.</strong> A pack's
+	 * geometry program declares ten to twenty five names of which two to four move with the draw,
+	 * and the pass holds what it was told until it closes, so the rest were a pair allocated and a
+	 * map entry replaced by its own value, once for every draw of the frame. {@link #settledIn}
+	 * carries what makes that safe.
+	 */
+	@SuppressWarnings("ReferenceEquality")
+	void bind(RenderPass pass) {
+		// Once, and it is the one thing that tells a pass that draws from a pass that only compiled:
+		// announce() says a program was prepared, which happens whether or not the renderer goes on
+		// to record a single command against it.
+		if (!this.drew) {
+			this.drew = true;
+
+			// The image goes on this line and not on the one announce() prints, which is the only
+			// place it can go: the atlas belongs to the DRAW for two of the three families, so at
+			// the moment the program is announced this field holds nothing yet. Said for whoever
+			// reads the atlas and for nobody else, a pass with no such name having no image to name.
+			Vulture.logger().info("The {} pass records its first draw with {}{}",
+					this.pass.name(), this.path,
+					this.samplers.stream().anyMatch(ATLAS::contains)
+							? ", reading " + GameImages.name(this.atlas) + " where it asks for the atlas"
+							: "");
+		}
+
+		pass.setUniform(UNIFORM_BLOCK, blockSlice());
+		StorageBuffers.bind(pass, this.storage);
+
+		// The rest are already standing in this pass, put there by this program's own last bind into
+		// it, and writing them again would allocate a pair and put back what the map already holds.
+		// {@link #settledIn} says what can undo that and why nothing else can.
+		boolean settle = settledIn != pass || settled != this;
+		settledIn = pass;
+		settled = this;
+
+		for (Sampled one : this.following) {
+			GraphicsApi.bindTexture(pass, one.name, imageView(one), imageSampler(one));
+		}
+
+		if (settle) {
+			for (Sampled one : this.settledOnce) {
+				GraphicsApi.bindTexture(pass, one.name, one.view, one.state);
+			}
+		}
+	}
+
+	/**
+	 * Settles, for every name this program declares, the view and the sampler state a draw that
+	 * brought no image of its own is answered with.
+	 * <p>
+	 * <strong>Called from {@link #prepare} and nowhere else, and that is what says how long any of
+	 * this is held: exactly one pass.</strong> Prepare stands after the device's constants exist,
+	 * after the colour targets have been opened for the frame, and before the pass this
+	 * pair is bound into exists, and every family reaches it again before it opens the next one. So
+	 * there is no frontier for a stale answer to cross. A pack switch and a resource reload both go
+	 * through {@link #release}, which drops these answers with the rest of the program's state, the
+	 * one-texel constants outliving it by design; F3+T empties
+	 * the device's pipeline cache, and prepare recompiles and settles this again on the next pass
+	 * either way; and a program is only ever bound into a pass its own prepare handed the pipeline
+	 * back for.
+	 * <p>
+	 * What that leaves out is exactly the draw's own image and the maps stitched to match it, which
+	 * {@link #imageView} and {@link #imageSampler} answer over the top of what is settled here: one
+	 * pipeline draws every mob on screen and each of them brings its own skin.
+	 */
+	private void resolve() {
+		// Whatever this program left standing in a pass is no longer what it would write now, so the
+		// next bind writes the lot again. release() clears the same two, and not because a released
+		// program is unreachable: TerrainDraw is the one family that keeps its program map across a
+		// release, so its static bind can reach a program that has never come back through here.
+		settledIn = null;
+		settled = null;
+		boolean labPbr = PbrAtlases.labPbr();
+		for (Sampled one : this.bound) {
+			one.interpolates = one.material != null && one.material.interpolates(labPbr);
+			one.view = passView(one);
+			one.state = passSampler(one);
+			one.servedKnown = false;
+			one.servedFor = null;
+			one.served = null;
+		}
+	}
+
+	/**
+	 * The image the draw about to be recorded brought, for the albedo and for the maps that follow
+	 * it, falling back on what the pass settled where it brought none.
+	 */
+	private GpuTextureView imageView(Sampled one) {
+		if (one.material != null) {
+			// The map that follows THIS pass's own image, which is how the block atlas, the particle
+			// atlas and every entity texture answer for themselves without this step knowing which of
+			// them it is drawing. Iris resolves it from the bound albedo for the same reason
+			// (pipeline/IrisRenderingPipeline.java:849-871).
+			//
+			// Two doors and not one, because the two shapes of image are read differently: a stitched
+			// atlas has its maps stitched to match it, and a texture of its own has them beside it
+			// under its own name. Iris keeps the same pair and picks between them by the class of the
+			// bound texture (pbr/loader/PBRTextureLoaderRegistry.java:15-16); here the atlas door
+			// answers only for an image it was built against, so asking it first picks the same one.
+			if (!one.servedKnown || one.servedFor != this.atlas) {
+				GpuTextureView served = PbrAtlases.view(this.atlas, one.material);
+				if (served == null) {
+					served = PbrTextures.view(this.atlas, one.material);
+				}
+
+				one.servedFor = this.atlas;
+				one.served = served;
+				one.servedKnown = true;
+			}
+
+			return one.served == null ? one.view : one.served;
+		}
+
+		// One pixel where the pass has no atlas of its own, which is every cloud and the sky's own
+		// disc: a name bound to nothing at all throws at the bind. The sky's textured elements do
+		// have one, handed to them per draw by SkyProgram.texture.
+		//
+		// WHITE and not black, which is Iris's answer for the same case and is the one that leaves a
+		// picture. A pack multiplies the atlas into its albedo, so white is the neutral of what it is
+		// about to do and black is the value that erases the geometry: three packs of the corpus
+		// sample this name from their cloud stage, and with a black pixel behind it their clouds come
+		// out invisible. Nothing of the sky reads it - Body Camera declares the name in its skybasic
+		// and never samples it - so the sky sees no difference either way.
+		return this.atlas == null ? one.view : this.atlas;
+	}
+
+	/**
+	 * The sampler the game configured for the image this draw brought, where that image is read
+	 * through it, and what the pass settled everywhere else.
+	 * <p>
+	 * A map is read at the albedo's own texture coordinate whichever door served it, so anything read
+	 * differently would be read at a different place than the albedo beside it. The one exception is
+	 * the specular map under labPBR, and {@link #passSampler} says what that costs.
+	 */
+	private GpuSampler imageSampler(Sampled one) {
+		if (this.atlasSampler == null) {
+			return one.state;
+		}
+
+		return one.material == null || one.interpolates ? this.atlasSampler : one.state;
+	}
+
+	/**
+	 * What a name is answered with where the draw brought no image of its own, which for every name
+	 * but the albedo and its maps is the whole answer.
+	 * <p>
+	 * The albedo is not handled here at all and falls through to the plan below, which is where it
+	 * has always fallen when the game handed no sampler with the image: a name of the pack's own is
+	 * filtered as the pack asked for it, and taking over the albedo's name does not change that.
+	 */
+	private GpuSampler passSampler(Sampled one) {
+		String name = one.name;
+		if (one.material != null) {
+			// The albedo's own sampler is what imageSampler hands back over this, because a
+			// map is read at the albedo's own texture coordinate whichever door served it, so anything
+			// read differently would be read at a different place than the albedo beside it. What that
+			// means is not the same on the two doors: an atlas's maps ARE the atlas, the same size and
+			// the same chain with every sprite in the same slot, where a plain texture's cover the same
+			// whole range at a resolution of their own and carry no chain at all. A mipmapped sampler
+			// on the second is harmless rather than overlooked: the view carries one level, so the read
+			// is bounded by the image.
+			//
+			// Except the specular map under labPBR, where a filter that blends two texels of it
+			// produces a material that is in neither of them. Iris asks the same question here
+			// (pipeline/IrisRenderingPipeline.java:860-867) and answers it with
+			// GlSampler.MIPPED_NEAREST_NEAREST, which is NEAREST inside a level AND between levels.
+			// That map lands here rather than on the albedo's sampler, and so does every map on a pass
+			// the game handed no sampler for.
+			//
+			// THIS ONLY GETS HALF OF IT, and the half it misses is an obstacle of the API rather
+			// than a preference. What comes back here is nearest inside a level and LINEAR between
+			// them: the backend sets the mip mode from the sampler's maximum lod alone,
+			// VulkanGpuSampler:47 taking LINEAR for anything above a quarter, and the cache offers
+			// no way to ask for the other one - a sampler built with no mipmaps caps the lod at that
+			// quarter and gives up the chain entirely, which is worse. Making one by hand does not
+			// help either, GpuDevice.createSampler reaching the same constructor.
+			// What it costs: on a distant surface, where two levels are blended, the thresholds are
+			// crossed after all. Close up, where a level is read whole, they are not.
+			return RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST, true);
+		}
+
+		if (LIGHTMAP.equals(name)) {
+			return RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR);
+		}
+
+		// Nothing about this one reaches the read, which is a texelFetch and takes no sampler state
+		// at all. It is bound because a name declared in the module has to be, and NEAREST is what
+		// says so: a filter here would be a flash halfway to the tint if anything ever sampled it.
+		if (OVERLAY.equals(name)) {
+			return RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST);
+		}
+
+		// The noise image tiles and everything else clamps, the same rule the chain follows.
+		//
+		// A COLOUR TARGET is never read past level nought here, even where it carries a chain, and
+		// this is not a gap left open. Nothing fills such a chain for a geometry program: it is
+		// filled right before the full screen pass that reads it, and a terrain pass draws inside
+		// the one Sodium opened, where no transfer may be recorded. A sampler that let these reads
+		// climb would hand them levels nothing has written, which is undefined memory rather than a
+		// coarser image.
+		//
+		// Nothing asks for it either, and that was measured rather than assumed: across the eight
+		// packs there are fifty reads at a lod other than nought and not one of them is in a
+		// geometry file. Four of them do declare colortexNMipmapEnabled on a gbuffers program,
+		// Bliss on gaux1 the loudest, and none of those programs ever reads the target at a lod. So
+		// the directive is theirs to declare and dead on their side, and the cost of honouring it
+		// here would be a risk taken for nobody.
+		//
+		// The SHADOW MAP is the one exception, and it is one because of when its chain is filled:
+		// at the tail of the stage that drew the map, outside every pass, so it stands for the
+		// whole frame that reads it and a geometry program is inside that frame like anything else.
+		// The map itself answers, as it answers for the filter, so that the three roads that bind
+		// it read it one way.
+		SamplerPlan.Kind kind = one.binding.kind();
+		if (one.source != null && this.targets.packView(one.source.image()) != null) {
+			// A file of the pack's own is filtered and addressed as the pack asked, in the .mcmeta
+			// beside it, and the name it took over has nothing to say about either.
+			return PackPass.sampler(one.source.repeat(), one.source.filter(), one.source.mipmaps());
+		}
+
+		return PackPass.sampler(kind, filter(name), mipmapped(name, kind));
+	}
+
+	/**
+	 * The sampler this pack's terrain reads the block atlas through, mipmapped and carrying the
+	 * player's anisotropy, and NEAREST where the game's own is LINEAR. {@link TerrainSampler} is
+	 * where it is built and why: what an interpolated filter decides on cutout foliage is the
+	 * silhouette rather than the colour. Mipmaps are not the thing that changed and are still what
+	 * keeps a block atlas from shimmering at distance and bleeding between sprites at their edges.
+	 */
+	void sampler(GpuSampler sampler) {
+		this.atlasSampler = sampler;
+	}
+
+	/**
+	 * The image a pass draws with, where the pass has one of its own rather than the block atlas
+	 * {@link #prepare} was handed. Set before the bind and never during it.
+	 */
+	void atlas(GpuTextureView view) {
+		this.atlas = view;
+	}
+
+	/** Whether the pipeline a pass has bound is this program's. */
+	@SuppressWarnings("ReferenceEquality")
+	boolean owns(RenderPipeline bound) {
+		return this.pipeline == bound;
+	}
+
+	/** Whether this program can still be served, which everything built on it has to agree with. */
+	boolean servable() {
+		return !this.broken;
+	}
+
+	/**
+	 * Whether this pass really marks the pixels it wrote, which for an opaque pass is the same
+	 * question as whether it writes the pack's own colour target at all: the constructor ties the
+	 * two together and says why they cannot be separated.
+	 * <p>
+	 * Asked from outside because a pass that claims a pixel against the scene seed takes it away
+	 * from every pass whose picture reaches the pack's target through that seed, and the only one
+	 * who can say whether a pass is in that position is the pass itself.
+	 */
+	boolean covers() {
+		return this.covers;
+	}
+
+	/**
+	 * Whether a pass that asks for the coverage mask would really be given one, before there is a
+	 * program to ask. The constructor is one of the two callers and takes its own answer from here,
+	 * so the rule has one home.
+	 * <p>
+	 * <strong>The other caller has to know it a step earlier than the program exists</strong>, and
+	 * that is the whole reason this is not a field: {@link EntityDraw} settles where a serving file's
+	 * outputs go before it builds anything, and what it settles differs on this answer. A piece given
+	 * the mask writes the pack's target outright and owes the scene seed nothing; a piece that asked
+	 * for one and could not be given one falls back on the game's target and reaches the pack through
+	 * that seed, which is what makes the seed's own target its business again.
+	 * <p>
+	 * Three of the four terms are the translation's and one is the frame's. The stage says whether it
+	 * was really given a mask, {@code coverage} being one where the epilogue placed it; the mask sits
+	 * one rank above every output the stage declares, so a pack writing more draw buffers than it
+	 * declares outputs would have it land on a rank one of those draw buffers holds, and a stage
+	 * already at the eight a pipeline carries has no rank left for it. And with no attachment at all
+	 * there is nothing to keep the seed off, the pass drawing into the game's target as it always
+	 * did.
+	 *
+	 * @param attachments how many draw buffers the plan gives this pass, which is zero where it had
+	 *                    no answer for it. The chain is asked separately and not read off this
+	 *                    count: with the chain switched off the plan still hands its list over, and
+	 *                    what is missing is the final that would have brought a colortex to the
+	 *                    screen
+	 */
+	static boolean covers(TranslatedUnit.Notes notes, int attachments, boolean chainRuns) {
+		return chainRuns && attachments > 0 && notes.coverage() == 1
+				&& attachments <= notes.fragmentOutputs()
+				&& notes.fragmentOutputs() < ColorTargetState.MAX_COLOR_TARGETS;
+	}
+
+	/**
+	 * The render pass this program wants opened, or null to leave the chunk renderer's own alone.
+	 * <p>
+	 * Null is the ordinary answer and not a failure: a pass that gained nothing over the one Sodium
+	 * would have opened wants exactly that one, and building an identical one of our own would only
+	 * be a way of getting it wrong later. It is also the answer while the targets are still being
+	 * allocated, which is the first frame or two and the frames after a resize.
+	 *
+	 * @param colour the colour view the renderer was going to draw into, which is attachment nought
+	 *               only where the pack's own targets do not take it
+	 * @param depth  the depth view it was going to use, kept as it is: the terrain has to test
+	 *               against the sky the game already drew, and everything the game draws afterwards
+	 *               has to test against the terrain
+	 */
+	RenderPassDescriptor descriptor(GpuTextureView colour, GpuTextureView depth) {
+		// The same refusal prepare makes, or the two part company: with the pipeline refused,
+		// Sodium keeps its own shader, which declares one target state, and steering its pass onto
+		// a many target descriptor is refused at setPipeline in the middle of Sodium's own draw.
+		if (this.broken) {
+			return null;
+		}
+
+		if (this.pass.shadow()) {
+			return shadowDescriptor();
+		}
+
+		if (plain()) {
+			if (this.targets.hasPendingClears()) {
+				this.targets.flushPending(RenderSystem.getDevice().createCommandEncoder());
+			}
+
+			return null;
+		}
+
+		this.attachedViews.clear();
+		for (Slot slot : this.slots) {
+			if (slot.bound() == Bound.UNUSED) {
+				this.attachedViews.add(null);
+				continue;
+			}
+
+			GpuTextureView view = view(slot, colour);
+			if (view == null) {
+				// The targets are not there yet, or not there any more. Sodium's own pass draws this
+				// frame rather than nothing at all, and the next frame tries again.
+				return null;
+			}
+
+			this.attachedViews.add(view);
+		}
+
+		PassDescriptor descriptor = PassDescriptor.create(this.passLabel);
+		for (GpuTextureView view : this.attachedViews) {
+			if (view == null) {
+				descriptor.withUnusedColorAttachment();
+				continue;
+			}
+
+			descriptor.withColorAttachment(view, this.targets.takeClear(view));
+		}
+
+		if (this.targets.hasPendingClears()) {
+			this.targets.flushPending(RenderSystem.getDevice().createCommandEncoder());
+		}
+
+		// Never left out: the encoder refuses a descriptor without one outright, and it refuses it
+		// at the first draw rather than at load time. The size is the screen's, and stays the
+		// screen's now that attachment nought may be a target of the pack's: a scaled colour target
+		// is dropped before it gets here, and the game's depth is attached whatever else is.
+		descriptor.withRenderArea(area(this.targets.screenWidth(), this.targets.screenHeight()));
+
+		return (depth == null ? descriptor : descriptor.withDepthAttachment(depth)).build();
+	}
+
+	/**
+	 * Whether this pass gains nothing over the one the game was going to open: one attachment, the
+	 * game's own target, at its own format.
+	 * <p>
+	 * Asked from outside by whoever opens the pass itself rather than steering one the game opened,
+	 * and it is the question that tells the two nulls of {@link #descriptor} apart. One of them means
+	 * this, and the pass to open is the plain one; the other means the colour targets are not there
+	 * yet, and then there is no pass to open at all, because the pipeline carries a state per
+	 * attachment the descriptor would have named and binding it into a single attachment pass throws
+	 * by name in the middle of the world.
+	 */
+	boolean plain() {
+		return this.slots.size() == 1 && this.slots.get(0).bound() == Bound.GAME;
+	}
+
+	/**
+	 * Whether the draw about to be recorded owes this program the game's own transforms, which the
+	 * door that has them binds itself.
+	 * <p>
+	 * Answered here and bound there because the buffer belongs to the DRAW: one run of draws is one
+	 * uniform block of this engine's, and two breezes in the same run hold two texture matrices.
+	 */
+	boolean readsGameTransforms() {
+		return this.gameTransforms;
+	}
+
+	/**
+	 * The image one attachment is really drawn into, or null when it is not there yet.
+	 *
+	 * @param colour the colour view the renderer was going to draw into, which is the only image of
+	 *               this pass that is not ours to look up
+	 */
+	private GpuTextureView view(Slot slot, GpuTextureView colour) {
+		return switch (slot.bound()) {
+			case GAME -> colour;
+			case PACK -> this.targets.view(slot.target().target(), slot.target().side());
+			case COVERAGE -> this.targets.coverage();
+			case UNUSED -> null;
+		};
+	}
+
+	/**
+	 * The pass the shadow map is drawn into, which shares nothing with the one the renderer opened:
+	 * neither its attachments, which are ours, nor its area, which is the map's own square and not
+	 * the screen's. Null while the map is not there, and then nothing is drawn at all rather than
+	 * the shadow programs writing over the world.
+	 */
+	private RenderPassDescriptor shadowDescriptor() {
+		// The one-level view and not the sampled one: a pack that asked for a chain gets a map of
+		// several levels, and Vulkan attaches exactly one.
+		GpuTextureView depth = this.shadow.depthAttachment();
+		if (depth == null) {
+			return null;
+		}
+
+		this.shadowViews.clear();
+		for (int index : this.shadowColours) {
+			// One attachment per state the pipeline carries, and in the same order. Every index in
+			// the list is one the plan read for this same program through this same rule, so an
+			// image for it was allocated with the depth and this is null only where the depth above
+			// is. The test is kept all the same because the two failures are not equal: a pass short
+			// of an attachment the pipeline names is setPipeline refusing in the middle of the
+			// world, where a null descriptor out of this method is the shadow stage not opening at
+			// all.
+			GpuTextureView colour = this.shadow.colour(index);
+			if (colour == null) {
+				return null;
+			}
+
+			this.shadowViews.add(colour);
+		}
+
+		PassDescriptor descriptor = PassDescriptor.create(this.shadowLabel);
+		int at = 0;
+		for (int index : this.shadowColours) {
+			descriptor.withColorAttachment(this.shadowViews.get(at), this.shadow.takeColourClear(index));
+			at++;
+		}
+
+		descriptor.withDepthAttachment(depth, this.shadow.takeDepthClear())
+				.withRenderArea(shadowArea());
+		this.shadow.flushPending(RenderSystem.getDevice().createCommandEncoder());
+		return descriptor.build();
+	}
+
+	/**
+	 * The area a descriptor covers, built again only where the window has moved since the last one.
+	 * <p>
+	 * The value is the same on every region of a frame and on every frame between two resizes, and
+	 * the object is read by the descriptor and kept by nobody else.
+	 */
+	private RenderPass.RenderArea area(int width, int height) {
+		if (this.area == null || width != this.areaWidth || height != this.areaHeight) {
+			this.areaWidth = width;
+			this.areaHeight = height;
+			this.area = new RenderPass.RenderArea(0, 0, width, height);
+		}
+
+		return this.area;
+	}
+
+	/** The same for the map's own square, which moves when the player scales it and not otherwise. */
+	private RenderPass.RenderArea shadowArea() {
+		int size = this.shadow.resolution();
+		if (this.shadowArea == null || size != this.shadowAreaSize) {
+			this.shadowAreaSize = size;
+			this.shadowArea = new RenderPass.RenderArea(0, 0, size, size);
+		}
+
+		return this.shadowArea;
+	}
+
+	/** Rotates the ring buffer. Called once the frame's terrain draw has been recorded. */
+	void rotate() {
+		if (this.block != null) {
+			this.block.rotate();
+		}
+	}
+
+	/** This program's block as {@code name = value} text, for the decoded dump. */
+	String decoded(WorldState world) {
+		TextSink sink = new TextSink();
+		this.uniforms.write(sink, world);
+
+		return sink.text();
+	}
+
+	String path() {
+		return this.path;
+	}
+
+	/**
+	 * How the dump names this program, which has to tell two passes of one file apart. The pass is
+	 * last and bare so that the line the dump is pointed at can be the pass rather than the file.
+	 */
+	String label() {
+		return this.path + " " + this.pass.name();
+	}
+
+	void release() {
+		if (this.block != null) {
+			this.block.close();
+			this.block = null;
+		}
+
+		// With the ring and not after it: a slice outliving the buffer it names is memory that reads
+		// as valid.
+		this.blockSlice = null;
+		this.blockSliceOf = null;
+
+		// The reference is dropped, the textures are not: they are the device's, not this
+		// program's, and re-clearing them once per program was about ninety of the standalone
+		// clears a reload frame paid.
+		this.constants = null;
+
+		// Dropped with the textures they name rather than left standing. Nothing binds a released
+		// program before it is prepared again, and prepare settles these afresh, so this only shortens
+		// the life of a reference; a view of a destroyed texture is not a thing to keep a field on.
+		for (Sampled one : this.bound) {
+			one.view = null;
+			one.state = null;
+			one.servedFor = null;
+			one.served = null;
+			one.servedKnown = false;
+		}
+
+		// Let go of the pass and the program the same way, and for the same reason as the views
+		// above: these two are the one place a closed RenderPass and a released program stay
+		// reachable, and they would otherwise stand until some program's next bind. Only when it
+		// is this program standing there, another one's settling being none of our business.
+		if (settled == this) {
+			settled = null;
+			settledIn = null;
+		}
+	}
+
+	/**
+	 * Which of the two material maps a name asks for, or null for every other name and for a name
+	 * the pack has taken over.
+	 * <p>
+	 * The pack wins, and Iris does that on one of its two roads and not on the other. The one that
+	 * serves the terrain wraps the sampler holder in
+	 * {@code ProgramSamplers.customTextureSamplerInterceptor} before the level samplers are added at
+	 * all ({@code gl/program/ProgramSamplers.java:50-56} from
+	 * {@code pipeline/IrisRenderingPipeline.java:379} and {@code :584}), so a
+	 * {@code texture.gbuffers.normals} line takes the name from underneath them. The one that serves
+	 * the entities, the particles, the sky and the hand hands over the raw holder instead
+	 * ({@code IrisRenderingPipeline.java:762}), and there the line does not take it. Iris disagrees
+	 * with itself, so this follows the half that gives the pack what it asked for.
+	 * <p>
+	 * Nothing in the corpus writes such a line, measured across the eight packs' properties files, so
+	 * this decides nothing today. It is here because the day it decides something, the wrong answer
+	 * is a pack reading the block atlas's relief where it asked for a file of its own.
+	 */
+	private PbrMap material(String sampler) {
+		PbrMap named = PbrMap.named(sampler);
+		if (named == null) {
+			return null;
+		}
+
+		return this.loaded.samplers().binding(sampler).kind() == SamplerPlan.Kind.PACK_TEXTURE
+				? null
+				: named;
+	}
+
+	private int blockBytes() {
+		return Math.max(16, this.uniforms.size());
+	}
+
+	/**
+	 * The whole of this program's uniform block, as the one slice that names it.
+	 * <p>
+	 * Both its arguments are fixed for as long as the ring hands back the same buffer: the offset is
+	 * nought and the length is the block's own size, which is what the ring was built against. Built
+	 * again at every bind, it was one object per entity submitted and per Sodium region drawn, twice
+	 * over on a frame with a shadow map. Kept beside the buffer it was cut from, it is one a frame:
+	 * the ring turns once, at the close of the frame, and a turn is the only thing that can make the
+	 * old one name the wrong memory.
+	 * <p>
+	 * {@link #release} drops it with the ring, so a slice never outlives the buffer under it.
+	 */
+	private GpuBufferSlice blockSlice() {
+		GpuBuffer buffer = this.block.currentBuffer();
+		if (PassTimings.keepRedoneWork()) {
+			PassTimings.censusSlice();
+
+			return buffer.slice(0, blockBytes());
+		}
+
+		int bytes = blockBytes();
+		// The length as well as the buffer, though only the buffer can move today: the block's size
+		// is settled at translation and a translation goes through release, which drops the ring.
+		// Comparing it costs one integer and takes a silent wrong answer off the table if that ever
+		// stops being true.
+		if (this.blockSlice == null || this.blockSliceOf != buffer || this.blockSliceBytes != bytes) {
+			PassTimings.censusSlice();
+			this.blockSlice = buffer.slice(0, bytes);
+			this.blockSliceOf = buffer;
+			this.blockSliceBytes = bytes;
+		}
+
+		return this.blockSlice;
+	}
+
+	private void writeBlock() {
+		// Before the block and never once for the run: the two conventions alternate inside one
+		// frame now that the shadow map is ours and the game's targets are not, and what a vertex
+		// stage does with its clip depth on the way out comes from this pair.
+		this.values.convention(this.pass.shadow() ? ClipSpace.FORWARD : ClipSpace.REVERSED);
+		this.values.modelView(this.modelView, this.bob);
+		this.values.projection(this.projection);
+		this.values.passColour(this.passColour);
+		this.values.passAlphaTest(this.loaded.alphaTest().reference());
+		this.values.renderStage(this.pass.stage());
+
+		try (GpuBufferSlice.MappedView view = this.block.currentBuffer().map(false, true)) {
+			ByteBuffer data = view.data();
+			data.position(0);
+			this.uniforms.write(Std140Builder.intoBuffer(data), this.values.world());
+		}
+	}
+
+	private void ensureConstants(GpuDevice device) {
+		this.constants = ConstantTextures.of(device);
+	}
+
+	/**
+	 * The image a name reads where the draw brought none of its own, which is the whole answer for
+	 * every name but the albedo and the maps stitched to match it.
+	 * <p>
+	 * Everything reached from here comes off the plan the load built, the colour targets, the shadow
+	 * pair or the game's own two images, and none of those can be replaced between two draws of one
+	 * pass: allocating or reallocating any of them records a barrier, which the encoder refuses while
+	 * a pass is open, so the frame's answer is already settled by the time {@link #resolve} asks.
+	 */
+	private GpuTextureView passView(Sampled one) {
+		String sampler = one.name;
+		if (one.material != null) {
+			// One texel of what the absence of this map means, for a sprite the resource pack ships
+			// nothing for and for every family drawn with no image at all. What is drawn over it when
+			// the draw does bring one is in imageView.
+			return this.constants.flat(one.material);
+		}
+
+		if (one.albedo) {
+			// One pixel where the pass has no atlas of its own, which is every cloud and the sky's
+			// own disc: a name bound to nothing at all throws at the bind. imageView says why it is
+			// white and not black.
+			return this.constants.white();
+		}
+
+		if (OVERLAY.equals(sampler)) {
+			// The image the hit flash and the damage tint are read out of, sixteen by sixteen and
+			// built once at start up. It is read by a texelFetch at the coordinate the mesh carries,
+			// so unlike every other name here the fallback is not a colour that means something: a
+			// single texel is out of bounds at that coordinate and what comes back is undefined. The
+			// fallback is there because a name declared in the module has to be bound at all, and the
+			// branch is unreachable while there is a client to draw from - the game holds this in a
+			// field of its own, built with the renderer and never replaced.
+			Minecraft minecraft = Minecraft.getInstance();
+			GpuTextureView overlay = minecraft == null
+					? null : minecraft.gameRenderer.overlayTexture().getTextureView();
+
+			return overlay == null ? this.constants.black() : overlay;
+		}
+
+		if (LIGHTMAP.equals(sampler)) {
+			// One white texel for a piece the game draws at full light, which is the other half of what
+			// the vertex head did with the light map names and is read off the same field so that the
+			// two cannot part company (PackProgram.Loaded.fullbright). Iris binds its own white pixel
+			// here (samplers/IrisSamplers.java:202-206). White is what leaves the piece alone: a pack
+			// multiplies its albedo by what it reads out of this image, and every texel of the game's
+			// own is darker than one except at the brightest level.
+			if (this.loaded.fullbright()) {
+				return this.constants.white();
+			}
+
+			Minecraft minecraft = Minecraft.getInstance();
+			GpuTextureView lightmap = minecraft == null ? null : minecraft.gameRenderer.lightmap();
+
+			return lightmap == null ? this.constants.white() : lightmap;
+		}
+
+		SamplerPlan.Binding binding = one.binding;
+
+		// White and not black for a depth that stays a constant, and the reason is the image rather
+		// than a taste: what a depth lookup reads is already in the pack's own window, where one is
+		// the far plane. Black would put the whole world against the camera. PackPass answers the
+		// same way, and the two have to move together.
+		return switch (binding.kind()) {
+			case COLORTEX -> colortex(binding);
+			case DEPTH -> depth(sampler);
+			case SHADOW_DEPTH -> shadowDepth(binding.sampler());
+			case SHADOW_COLOUR -> shadowColour(binding.index());
+			case NOISE -> this.targets.noise();
+			// Every geometry program is drawn in the gbuffers stage, the shadow passes included,
+			// which is the one thing a texture.STAGE.NAME override needs to know. Mellow moves
+			// noisetex there and nowhere else, so this is not a case the chain also covers.
+			case PACK_TEXTURE -> packTexture(one);
+			case DISTANT_DEPTH -> distantDepth();
+			// Null where the target cannot be stored into: prepare refuses the program then,
+			// the layout typing this name as a storage image that no placeholder can stand for.
+			case COLOUR_IMAGE -> colourImage(binding);
+			default -> this.constants.black();
+		};
+	}
+
+	/** The writable view of a colour target stored into as {@code colorimgN}, or null for none. */
+	private GpuTextureView colourImage(SamplerPlan.Binding binding) {
+		TargetSurface surface = this.targets.surface(binding.index(), binding.side());
+
+		return surface == null || !surface.storage() ? null : surface.storageView();
+	}
+
+	/** The pack's own file behind a name, or black when it took the name over and nothing was read. */
+	private GpuTextureView packTexture(Sampled one) {
+		GpuTextureView supplied = one.source == null ? null : this.targets.packView(one.source.image());
+
+		return supplied == null ? this.constants.black() : supplied;
+	}
+
+	/**
+	 * The shadow map, or the far plane where there is none.
+	 * <p>
+	 * The far plane, for the reason {@link #depth(String)} answers white: a {@code shadowtex}
+	 * lookup is never rewritten, so what is stored is what the pack reads, and the map stores the
+	 * forward window where one is the far plane. A shadow lookup that finds nothing has to say
+	 * "nothing between here and the light". It is the depth-format texel and not the RGBA white,
+	 * because the name may be read through a comparison sampler, which is only defined against a
+	 * depth image; read plainly its red channel answers the one the white texel did, and the red
+	 * channel is what a depth read takes.
+	 * <p>
+	 * A shadow pass reads the far plane whatever the map holds: the image it would read is an
+	 * attachment of the very pass it is drawn in, and sampling an attachment is a thing Vulkan
+	 * gives no meaning to.
+	 */
+	private GpuTextureView shadowDepth(String sampler) {
+		if (this.pass.shadow()) {
+			return this.constants.farPlane();
+		}
+
+		// shadowtex1 is the map without the translucents and shadowtex0 the map with them. Serving
+		// one image to both is what makes a pack's coloured shadow branch dead code: it asks whether
+		// a point is occluded in nought and clear in one, and one image can never answer yes. Which
+		// of the two the bare "shadow" names depends on the whole list this program declared, so the
+		// plan answers rather than the name.
+		GpuTextureView map = this.loaded.samplers().withoutTranslucents(sampler)
+				? this.shadow.depthWithoutTranslucents()
+				: this.shadow.depth();
+
+		return map == null ? this.constants.farPlane() : map;
+	}
+
+	/** A shadow colour target, on the same two rules as the depth above. */
+	private GpuTextureView shadowColour(int index) {
+		if (this.pass.shadow()) {
+			return this.constants.white();
+		}
+
+		GpuTextureView view = this.shadow.colour(index);
+
+		return view == null ? this.constants.white() : view;
+	}
+
+	/**
+	 * What a depth sampler reads, which depends on which side of the frame this pass stands.
+	 * <p>
+	 * The translucent pass gets the opaque world's image for depthtex0 and depthtex1 alike. At that
+	 * point of the frame the two are one depth, the opaque world's, and that image is exactly it; the
+	 * live depth cannot be the answer for either of them, being an attachment of this very pass, and
+	 * sampling an attachment is a thing Vulkan gives no meaning to. This is what BSL's water fog and
+	 * refraction read.
+	 * <p>
+	 * The solid and cutout passes get the same image as depthtex1 and the constant as depthtex0.
+	 * They draw before the image of THIS frame is taken, so what the name holds at their moment is
+	 * the frame before's opaque world, and that is what Iris hands them too: its copy is refreshed
+	 * at {@code beginTranslucents}, one step behind the solid hand
+	 * ({@code mixin/MixinLevelRenderer.java:269-274},
+	 * {@code pipeline/IrisRenderingPipeline.java:1051-1063}), so every gbuffers program drawn ahead
+	 * of that step reads the frame before's copy under that name
+	 * ({@code samplers/IrisSamplers.java:223}). The shadow pass, drawn at the end of the frame here,
+	 * reads this frame's image under the same rule, which is the one Iris's shadow pass reads at the
+	 * head of the next. depthtex0 is the live depth there ({@code samplers/IrisSamplers.java:221}),
+	 * which on the world passes is this pass's own attachment and cannot be sampled, so that one
+	 * stays the far plane: a divergence on the attachment alone, with nothing older than this frame
+	 * ever dressed as the live depth. The shadow pass is left on the far plane with it rather than
+	 * served apart, and there the two engines agree: Iris draws its map at the head of the frame,
+	 * where the game has just cleared its depth, so the live name reads the far plane under it too.
+	 * <p>
+	 * <strong>depthtex2 is asked before that test and not inside it.</strong> It is the one copy
+	 * taken in the middle of the world rather than at the edge of a half:
+	 * {@link PackChain#markPreHandDepth} fills it one line before the hand's solid pass is drawn, so
+	 * {@code gbuffers_hand}, the program it is taken for, stands on the near side of the test and
+	 * would read the far plane if the test came first. No stale image comes in by the same door: the
+	 * copy is forgotten at the end of every frame, so a pass drawn BEFORE the moment it is taken
+	 * finds nothing and falls through to the paragraphs above.
+	 * <p>
+	 * <strong>That is a gap against Iris, it is older than this class's third image, and nothing
+	 * here pays for it.</strong> Iris binds {@code depthtex2} to a texture that always exists, off
+	 * the one table every terrain, gbuffers and shadow program is built with
+	 * ({@code samplers/IrisSamplers.java:220-226}, reached from
+	 * {@code pipeline/IrisRenderingPipeline.java:380} and {@code :763}), and refills it once a frame
+	 * whether a hand is drawn or not, its {@code beginHand} standing ahead of the guards that decide
+	 * that ({@code mixin/MixinLevelRenderer.java:279-280} against
+	 * {@code pathways/HandRenderer.java:95-98}). A program drawn before that moment reads the copy of
+	 * the PREVIOUS frame there and one everywhere here, "nothing in front".
+	 * <p>
+	 * <strong>It is not a contournement and it is not written up as one.</strong> Nothing in 26.2
+	 * forbids taking the copy on every frame the chain runs; what argues against it is cost, since
+	 * this backend has to convert the reversed z and {@link PackDepth#takePreHand} is therefore a
+	 * full screen draw where Iris moves depth to depth. That is a preference, so it does not make a
+	 * divergence admissible, and the honest name for it is an unpaid gap.
+	 * <p>
+	 * What holds it at that: a pass drawn before the copy is taken falls through to the opaque
+	 * image below, the frame before's world WITH the hand in it, where Iris hands the frame
+	 * before's world without it; the two differ by the hand alone, and the name is read to see past
+	 * that very hand, so the fall through is nearer than the far plane and still not the answer. And
+	 * no pack of the eight measured reads the name from a program drawn there - the readers are BSL's two
+	 * composites, Bliss's deferred, and Sildur's two deferreds, its composite and its final, with no
+	 * gbuffers and no shadow program among them; two more files of Bliss declare the sampler and
+	 * never fetch it. Iris's own table carries a comment asking whether those programs should be
+	 * served the name at all.
+	 */
+	private GpuTextureView depth(String sampler) {
+		if (SamplerPlan.preHandCopy(sampler)) {
+			GpuTextureView preHand = this.targets.depth().preHand();
+			if (preHand != null) {
+				return preHand;
+			}
+		}
+
+		// The two copies read the opaque image wherever it exists, the frame before's ahead of the
+		// take and this frame's behind it; the live name only once the pass stands behind the
+		// deferred stage, where the two are one depth.
+		if (this.pass.afterDeferred() || SamplerPlan.depthCopy(sampler)) {
+			GpuTextureView opaque = this.targets.depth().opaque();
+			if (opaque != null) {
+				return opaque;
+			}
+		}
+
+		return this.constants.white();
+	}
+
+	/**
+	 * What a {@code dhDepthTex} sampler reads, on the same two rules the world's depth follows.
+	 * <p>
+	 * The translucent passes get the image taken before the far terrain's own water half, which at
+	 * that point of the frame is the whole of what has been drawn into it; the solid and cutout
+	 * passes stay on the far plane, because the only image in existence at their moment holds the
+	 * previous frame's, and no distinction between the three names arrives before the copy with the
+	 * water does, which is the composites' and {@link PackPass}'s to serve.
+	 * <p>
+	 * <strong>That second half is a divergence, written out.</strong> What Iris does: it binds the
+	 * live image on every gbuffers and shadow program alike ({@code samplers/IrisSamplers.java:
+	 * 109-110}), and by the time an opaque gbuffers program draws, DH's opaque LODs are already in
+	 * it. What stops that here: the image a pack reads is a converted copy rather than the live
+	 * attachment, and the only copy in existence when the solid passes draw is the previous
+	 * frame's, which is not what Iris hands there either, its live image already holding this
+	 * frame's opaque LODs; the world's depth above has no such gap, the frame before's copy being
+	 * exactly what Iris gives. What it costs: an opaque
+	 * geometry program reading {@code dhDepthTex} sees no far terrain, where under Iris it sees the
+	 * opaque LODs; no program of the eight-pack corpus makes that read, the readers being deferreds
+	 * and composites throughout.
+	 * <p>
+	 * The far plane is also the whole answer while the pack is not drawing the far terrain. A
+	 * session without Distant Horizons, or a frame its rendering switch is off on, has no image
+	 * taken and reads white here exactly as it always did; a frame with the far terrain there and
+	 * nothing of it in view has the image, filled with the far plane by
+	 * {@link PackDepth#takeDistantNothing}. Either way every Distant Horizons branch of the pack
+	 * stays shut.
+	 */
+	private GpuTextureView distantDepth() {
+		if (this.pass.afterDeferred()) {
+			GpuTextureView distant = this.targets.depth().distantOpaque();
+			if (distant != null) {
+				return distant;
+			}
+		}
+
+		return this.constants.white();
+	}
+
+	/**
+	 * Which of this pass's attachments some sampler of the program names on the same half, and
+	 * whether each is served the copy, settled once: both lists are the plan's and neither moves
+	 * while the pack is loaded. Said in the log here, once per program, because the answer decides
+	 * what the draw reads.
+	 * <p>
+	 * A pass drawn after the deferred stage asks for the copy {@link TargetCopies} takes ahead of
+	 * it, which is the picture the reference's framebuffer holds when it is read there. A pass drawn
+	 * before it keeps the one pixel: what stands in the target at that moment is the frame's clear
+	 * or the pass's own siblings at work, and no copy taken at one moment stands in for either. So
+	 * does a read of the first four targets on any pass, which the reference binds to no geometry
+	 * program at all ({@link TargetCopies#FIRST_SAMPLED}).
+	 * <p>
+	 * Only a name the program's stages sample asks for the copy. A pack's shared header declares
+	 * targets most of its programs never read, Complementary's colortex4, colortex6 and colortex12
+	 * among them, and each one asked is copied at full size twice a frame. A name that is only
+	 * declared is still answered with the one pixel and never with the target: a layout can carry
+	 * every declared name, {@code -Dvulture.declaredSamplers} puts them all back, and one image
+	 * cannot be an attachment and a texture of one pass. Sampled is read off the text with every
+	 * {@code #if} standing, so a read in a branch the compiler drops still asks.
+	 */
+	private Map<ChainPlan.Attachment, Boolean> readWhileWritten(ColorTargets targets) {
+		Set<String> sampled = this.loaded.program().sampled();
+		Map<ChainPlan.Attachment, Boolean> collided = new HashMap<>();
+		for (ChainPlan.Attachment attachment : this.extra) {
+			if (collided.containsKey(attachment)) {
+				continue;
+			}
+
+			boolean named = false;
+			boolean read = false;
+			for (Sampled one : this.bound) {
+				SamplerPlan.Binding binding = one.binding;
+				if (binding.kind() == SamplerPlan.Kind.COLORTEX
+						&& binding.index() == attachment.target()
+						&& binding.side() == attachment.side()) {
+					// Two names can answer one target, gaux1 and colortex4, and a read of either counts.
+					named = true;
+					read |= sampled.contains(one.name);
+				}
+			}
+
+			if (!named) {
+				continue;
+			}
+
+			boolean copied = read && this.pass.afterDeferred()
+					&& attachment.target() >= TargetCopies.FIRST_SAMPLED;
+			collided.put(attachment, copied);
+			if (copied) {
+				targets.copies().ask(attachment.target(), attachment.side());
+			}
+
+			// A name only declared draws the same whatever answers it, so it is not worth a line.
+			// Once per program path: the entity family builds one of these per element it serves.
+			if (!read
+					|| !targets.copies().firstMention(this.path, attachment.target(), attachment.side())) {
+				continue;
+			}
+
+			if (copied) {
+				Vulture.logger().info("{} reads {} on the half it writes, so it is served a copy "
+						+ "taken ahead of the pass, which is what the target holds when the "
+						+ "reference reads it there", this.path,
+						TargetName.canonical(attachment.target()));
+			} else if (attachment.target() < TargetCopies.FIRST_SAMPLED) {
+				Vulture.logger().warn("{} reads {} on the half it writes, so it is answered with "
+						+ "one pixel: one image cannot be both an attachment and a texture of one "
+						+ "pass, and the reference binds none of the first four targets to a "
+						+ "geometry program", this.path, TargetName.canonical(attachment.target()));
+			} else {
+				Vulture.logger().warn("{} reads {} on the half it writes, so it is answered with "
+						+ "one pixel: one image cannot be both an attachment and a texture of one "
+						+ "pass, and a pass drawn before the deferred stage has no picture a copy "
+						+ "could stand in for", this.path, TargetName.canonical(attachment.target()));
+			}
+		}
+
+		return Map.copyOf(collided);
+	}
+
+	/** Whether this name answers a target this pass writes, whatever it is answered with. */
+	private boolean collides(SamplerPlan.Binding binding) {
+		return binding.kind() == SamplerPlan.Kind.COLORTEX && this.readWhileWritten.containsKey(
+				new ChainPlan.Attachment(binding.index(), binding.side()));
+	}
+
+	/** Whether this name is answered with the copy rather than with the target itself. */
+	private boolean copied(SamplerPlan.Binding binding) {
+		return binding.kind() == SamplerPlan.Kind.COLORTEX && this.readWhileWritten.getOrDefault(
+				new ChainPlan.Attachment(binding.index(), binding.side()), false);
+	}
+
+	/**
+	 * A colour target of the pack, on the half the plan reads it from; the copy taken ahead of
+	 * this pass where it writes that half itself; or black.
+	 * <p>
+	 * Black covers three cases and two of them are temporary. The targets may not be allocated
+	 * yet, which is the first frame or two, and the copy may not have been taken yet, which is the
+	 * same frames. And the half being read may be a half this very pass is writing on a pass drawn
+	 * before the deferred stage: one image cannot be an attachment and a sampled texture of the
+	 * same pass, and no copy taken at one moment stands in for a target the pass's own siblings
+	 * are filling, so the read is refused rather than left to mean whatever the driver decides
+	 * that frame; and so is a read of the first four targets, which the reference binds to no
+	 * geometry program, and a name the program declares on a target it writes and never samples.
+	 * {@link #readWhileWritten} said which at the load.
+	 */
+	private GpuTextureView colortex(SamplerPlan.Binding binding) {
+		if (collides(binding)) {
+			GpuTextureView copy = copied(binding)
+					? this.targets.copies().view(binding.index(), binding.side())
+					: null;
+
+			return copy == null ? this.constants.black() : copy;
+		}
+
+		GpuTextureView view = this.targets.view(binding.index(), binding.side());
+
+		return view == null ? this.constants.black() : view;
+	}
+
+	/**
+	 * A sampler's name with what it is really bound to, the half included. The half is the thing to
+	 * read: a colour target read on the wrong one holds a clear colour, which is a picture that
+	 * looks like a feature nobody turned on.
+	 */
+	private String describe(String sampler) {
+		SamplerPlan.Binding binding = this.loaded.samplers().binding(sampler);
+		if (binding.kind() != SamplerPlan.Kind.COLORTEX) {
+			return sampler;
+		}
+
+		return sampler + "=" + TargetName.canonical(binding.index()) + " " + binding.side()
+				+ (copied(binding) ? " copy" : "");
+	}
+
+	/**
+	 * Whether the plan answers this name with an image rather than with one pixel. A colour target
+	 * counts even when it is empty at this point of the frame: it is the pack's own image and what
+	 * it holds is a question about the order of the frame, not about the binding. The two depth
+	 * copies count on every pass, the opaque image answering them wherever it exists, the frame
+	 * before's ahead of the take; the live name counts on the translucent pass alone, where that
+	 * same image answers it.
+	 * <p>
+	 * The plan's answer and not a frame's, and that is the whole of what it is for: this feeds a line
+	 * said once at the load, where no frame has run. A screen too big to allocate a depth image at
+	 * leaves the depth names here on the constant and says so at the moment it happens, in
+	 * {@link PackDepth}, which is where a reader has to go to know what a frame really did.
+	 */
+	private boolean readsATexture(String sampler) {
+		// Asked of the pack first, on the same order the bind above follows: a name the pack supplied
+		// a file for is that file, and whether it is a real image is a question about the file.
+		if (material(sampler) == null && PbrMap.named(sampler) != null) {
+			return this.targets.packTexture(TextureStage.GBUFFERS, sampler) != null;
+		}
+
+		PbrMap material = material(sampler);
+		if (material != null) {
+			// The session's answer and deliberately not this pass's, which is the one thing here that
+			// cannot be asked once. This program may be drawn with several images in one frame, and
+			// the atlas field holds none of them yet at the moment this line is printed: the shadow
+			// stage prepares its three chunk programs with no image in hand, and the sky, the
+			// particles, the weather and the entities are all handed theirs per draw, after the
+			// prepare. Asked of the pass, the line printed the answer for whichever image happened to
+			// be in the field, once, for the session.
+			//
+			// So it says what a latched line can say without lying: whether anything fills the name
+			// at all. Which atlases really answer is said exactly, one line each, as they are built.
+			return PbrAtlases.supplies(material);
+		}
+
+		SamplerPlan.Binding binding = this.loaded.samplers().binding(sampler);
+		SamplerPlan.Kind kind = binding.kind();
+
+		// A file of the pack's own counts when the file is there, on the same call the bind makes:
+		// what packTexture answers is what the draw reads. Left out of this list, Reverie's eight
+		// lookup tables and Complementary's cloud-water were all reported as one pixel on every
+		// geometry program while the draw was reading them, and the line sent a whole session
+		// after a black picture whose cause was elsewhere.
+		if (kind == SamplerPlan.Kind.PACK_TEXTURE) {
+			return this.targets.packTexture(TextureStage.GBUFFERS, sampler) != null;
+		}
+
+		return ATLAS.contains(sampler) || LIGHTMAP.equals(sampler) || OVERLAY.equals(sampler)
+				// A target this pass writes counts only where the copy answers it; the pixel stands
+				// in everywhere else, and the load has already said why.
+				|| (kind == SamplerPlan.Kind.COLORTEX && (!collides(binding) || copied(binding)))
+				|| kind == SamplerPlan.Kind.CUSTOM_IMAGE
+				|| kind == SamplerPlan.Kind.NOISE
+				|| (kind == SamplerPlan.Kind.DEPTH
+						&& (this.pass.afterDeferred() || SamplerPlan.depthCopy(sampler)))
+				// The map exists from the first frame, but a pass that draws it reads its own
+				// attachment and is answered with a constant like everything else that collides.
+				|| (!this.pass.shadow() && kind == SamplerPlan.Kind.SHADOW_DEPTH
+						&& this.shadow.depth() != null)
+				|| (!this.pass.shadow() && kind == SamplerPlan.Kind.SHADOW_COLOUR
+						&& this.shadow.colour(binding.index()) != null);
+	}
+
+	/** A name answered per frame, an image or the far plane, which is not one nothing fills. */
+	private boolean readsTheDistantDepth(String sampler) {
+		return this.loaded.samplers().binding(sampler).kind() == SamplerPlan.Kind.DISTANT_DEPTH;
+	}
+
+	/**
+	 * Whether a lookup on this name may climb past level nought, which only the shadow map's depth
+	 * pair ever may here. The map answers, and it answers no while the pack asked for no chain or
+	 * while nothing has filled one.
+	 */
+	private boolean mipmapped(String sampler, SamplerPlan.Kind kind) {
+		return kind == SamplerPlan.Kind.SHADOW_DEPTH && this.targets.shadow()
+				.depthMipmapped(this.loaded.samplers().withoutTranslucents(sampler));
+	}
+
+	private FilterMode filter(String sampler) {
+		if (LIGHTMAP.equals(sampler)) {
+			return FilterMode.LINEAR;
+		}
+
+		// A colour target is filtered as the chain filters it, LINEAR wherever the format allows it,
+		// so that a name reads the same here and one pass later.
+		SamplerPlan.Binding binding = this.loaded.samplers().binding(sampler);
+		if (binding.kind() == SamplerPlan.Kind.COLORTEX) {
+			return this.targets.filter(binding.index());
+		}
+
+		// The noise image is a continuous field, not a lookup table: a pack derives water normals
+		// and cloud shapes from it and counts on the interpolation. Iris binds it LINEAR_REPEAT,
+		// and reading it NEAREST shatters every one of those surfaces into facets. A shadow colour
+		// is continuous in the same way, carrying the light that came through glass and water
+		// across a penumbra, and it stays LINEAR whatever the pack declares: OptiFine filters it
+		// linearly unless the pack writes shadowcolorNNearest, while Iris parses that name and
+		// binds the buffer through GlSampler.LINEAR regardless (IrisSamplers.java:156-176). Reading
+		// it as the pack asked would diverge from the engine packs are tuned against.
+		//
+		// The shadow DEPTH is LINEAR too, and the reason a reader reaches for to keep it NEAREST
+		// does not hold: where the compare mode is on, a sampler averages the RESULTS of the
+		// four tests and never the depths, so nothing is ever compared against a surface that exists
+		// nowhere. Iris filters this LINEAR unless the pack asks otherwise, its SamplingSettings
+		// starting at nearest=false and shadowtexNearest with its per-index spellings turning that
+		// round (shadows/ShadowRenderer.java:267-280), and adds GL_COMPARE_REF_TO_TEXTURE on top
+		// only where the pack writes shadowHardwareFiltering. Those names are read, and LINEAR is
+		// what a pack that writes none of them gets, which is not all of them: Pegasus declares
+		// the depth pair NEAREST. The manual PCF loops packs write are the
+		// whole point either way, since every tap of such a loop rides on this filter. The map
+		// itself is asked rather than this line deciding, which is what makes the answer PackPass's
+		// as well, it binding the same name for the full screen passes: the two halves of one frame
+		// reading one map through two filters is a difference nothing would ever explain.
+		// A custom image follows its format, and it is asked of one place for the same reason the
+		// shadow map is: a volume read one way here and another from a composite is a difference
+		// nothing would ever explain. PackPass.customImageFilter is that place.
+		return switch (binding.kind()) {
+			case NOISE, SHADOW_COLOUR -> FilterMode.LINEAR;
+			case SHADOW_DEPTH -> this.targets.shadow()
+					.depthFilter(this.loaded.samplers().withoutTranslucents(sampler));
+			case CUSTOM_IMAGE -> PackPass.customImageFilter(sampler);
+			default -> FilterMode.NEAREST;
+		};
+	}
+
+	/**
+	 * Said once, and grouped by what it costs the picture. Some names are constants, every sampler
+	 * but two reads one pixel, a pass that wanted an alpha test may not have got one, and a fragment
+	 * stage may declare more outputs than the one attachment Sodium's pass carries. None of them
+	 * shows as an error and all of them change the image.
+	 */
+	private void announce() {
+		if (this.announced) {
+			return;
+		}
+
+		this.announced = true;
+		TranslatedUnit fragment = this.loaded.program().stages().get(ProgramStage.FRAGMENT);
+		int outputs = fragment.notes().fragmentOutputs();
+		// The render stage is in the line rather than left silent, because nothing else can say it:
+		// what a pack does with it is a branch inside its own code, so a pass told the wrong one
+		// draws something that looks like a picture, and this module has no harness to catch that.
+		Vulture.logger().info("Drawing the {} {} pass with {} of {} at render stage {}, {} uniforms "
+				+ "and {} samplers", this.pass.name(), this.pass.family(), this.path,
+				this.loaded.packName(), this.pass.stage(), this.loaded.program().uniforms().size(),
+				this.samplers.size());
+
+		// A cutout stage without its discard draws a leaf as a cube, which reads as the pack being
+		// wrong rather than as a translation that could not place a statement.
+		AlphaTest alphaTest = this.loaded.alphaTest();
+		if (alphaTest.tests() && fragment.notes().alphaEpilogue() == 0) {
+			Vulture.logger().warn("This pass discards at {} {} and the program could not be given the "
+					+ "test, so nothing beyond the pack's own discards is thrown away",
+					alphaTest.function(), alphaTest.reference());
+		}
+
+		// Split by what the mesh really answers. Only names the mesh has no element for are a gap;
+		// the chunk mesh now answers four of them and the entity mesh two, while the glint's answers
+		// none, which is why this comes off the PASS rather than off the family.
+		List<String> constants = this.loaded.program().synthesized().keySet().stream()
+				.filter(name -> !this.pass.answered().contains(name))
+				.toList();
+		if (!constants.isEmpty()) {
+			Vulture.logger().warn("The {} mesh carries none of these, so they are answered with a "
+					+ "constant and what this program computes from them is wrong: {}",
+					this.pass.family(), constants);
+		}
+
+		List<String> real = this.samplers.stream()
+				.filter(this::readsATexture)
+				.map(this::describe)
+				.toList();
+		// Kept out of the line below rather than counted in it, because that line is about a gap and
+		// this is not one: these names are filled exactly on the frames the pack draws the far
+		// terrain, and PackChain says once for the whole chain what they carry.
+		List<String> distant = this.samplers.stream().filter(this::readsTheDistantDepth).toList();
+		List<String> flat = this.samplers.stream()
+				.filter(name -> !readsATexture(name) && !readsTheDistantDepth(name))
+				.toList();
+		Vulture.logger().info("{} samplers of this program read a real texture: {}", real.size(), real);
+		if (!distant.isEmpty()) {
+			Vulture.logger().info("{} read the far terrain's own depth on the frames this pack draws "
+					+ "it, and the far plane on the rest: {}", distant.size(), distant);
+		}
+
+		if (!flat.isEmpty()) {
+			// What is left is what nothing fills for this pass: the shadow map, the live depth on
+			// the passes that draw ahead of the deferred stage, and the two material maps
+			// wherever the RESOURCE pack ships no file beside the sprites of this pass's atlas. The
+			// last of the three is the one a reader can act on, and it is not a shader pack's doing.
+			Vulture.logger().warn("{} read one pixel, because nothing fills them yet: {}",
+					flat.size(), flat);
+		}
+
+		if (this.pass.shadow()) {
+			Vulture.logger().info("It draws into the shadow map, {}x{}, storing the forward depth "
+					+ "window, and into {}", this.shadow.resolution(), this.shadow.resolution(),
+					this.shadowColours.stream()
+							.map(index -> "shadowcolor" + index)
+							.collect(Collectors.joining(", ")));
+			if (outputs > this.shadowColours.size()) {
+				Vulture.logger().warn("{} declares {} fragment outputs and its draw buffers name {} "
+						+ "of the light's colour targets, so the outputs past the {} are written "
+						+ "nowhere", this.path, outputs, this.shadowColours.size(),
+						this.shadowColours.size());
+			}
+
+			// Said apart, because it is a different thing and the count above cannot show it: a
+			// directive naming a target past the ceiling is thrown away WHOLE, so the program draws
+			// into the pair instead of into what it asked for.
+			List<Integer> declared = fragment.drawBuffers();
+			int ceiling = this.shadow.colourCeiling();
+			if (declared.stream().anyMatch(index -> index >= ceiling)) {
+				Vulture.logger().warn("{} asks for {}, and this pack may draw the light into {} "
+						+ "colour targets, so the whole list is set aside and the first {} are drawn "
+						+ "into instead, as the reference does with it. A pack reaches the eight by "
+						+ "declaring HIGHER_SHADOWCOLOR", this.path, declared, ceiling,
+						this.shadowColours.size());
+			}
+		} else if (this.ownsFirst) {
+			// Nought included, and the log says the sides because they are the whole fix: a write on
+			// the half the composites do not read is geometry that vanishes without a word from
+			// anyone.
+			Vulture.logger().info("Its draw buffers all reach the pack's own targets, nought "
+					+ "included: {}",
+					this.extra.stream()
+							.map(one -> TargetName.canonical(one.target()) + " " + one.side())
+							.toList());
+			if (this.covers) {
+				// The pair to read this against is the seed's own line: this one says the mask is
+				// written, that one says it is honoured.
+				Vulture.logger().info("It also writes the coverage mask, so nothing paints the game's "
+						+ "own picture back over what this pass wrote");
+			}
+		} else if (this.extra.isEmpty()) {
+			// Draw buffer nought is not named here on purpose: it goes to the game's own target,
+			// which is where it has always gone and where the seed reads it back from.
+			if (outputs > 1) {
+				Vulture.logger().warn("{} declares {} fragment outputs and writes one draw buffer, so "
+						+ "all but the first are written nowhere", this.path, outputs);
+			}
+		} else {
+			Vulture.logger().info("Its other draw buffers reach the pack's own targets: {}",
+					this.extra.stream()
+							.map(one -> TargetName.canonical(one.target()) + " " + one.side())
+							.toList());
+		}
+
+		// Said outside the chain above, and it is a second line about one cause rather than a line
+		// about a second cause: what lands here asked for a mask and was not given one, which the
+		// constructor has already named. What this adds is the half the warning does not carry, and
+		// it is the half a blending pass pays twice: the blend is made against the game's target
+		// instead of against the world, so a pixel of alpha under one is tinted by a clear rather
+		// than by what stands behind it, and a row that writes no depth is discarded outright by the
+		// seed's cut. Neither shows up as an error and neither is visible in a silent log.
+		if (this.demoted) {
+			Vulture.logger().info("It blends and draw buffer nought still goes to the game's own "
+					+ "target: this pass is drawn before the scene seed and nothing marks the pixels "
+					+ "it blends onto, so the seed would paint the game's picture back over them");
+		}
+
+		// Said because nothing on screen would. A pack declaring sampler2DShadow asks the hardware
+		// to compare and hand back a filtered fraction; blaze3d's GpuSampler carries no comparison
+		// at all, so the map's own names are bound under the comparison sampler this engine makes
+		// in Vulkan's terms, and anything else compared is made in the shader instead: four texels
+		// gathered, four steps, and the same bilinear blend the hardware would have applied.
+		//
+		// Asked of the notes and not of the samplers: on the arithmetic road the type has been
+		// rewritten to the ordinary one and there is nothing left to recognise.
+		List<String> hardware = this.loaded.program().stages().values().stream()
+				.flatMap(unit -> unit.notes().hardwareCompared().stream())
+				.distinct()
+				.toList();
+		if (!hardware.isEmpty()) {
+			Vulture.logger().info("{} asked the hardware to compare {}, which the binding carries "
+					+ "as a comparison sampler", this.path, hardware);
+		}
+
+		List<String> compared = this.loaded.program().stages().values().stream()
+				.flatMap(unit -> unit.notes().comparedSamplers().stream())
+				.distinct()
+				.filter(name -> !hardware.contains(name))
+				.toList();
+		if (!compared.isEmpty()) {
+			Vulture.logger().info("{} asked the hardware to compare {}, which this binding does not "
+					+ "carry, so the comparison is made in the shader over the four texels the "
+					+ "hardware would have blended", this.path, compared);
+		}
+
+		PackValues.Gaps gaps = this.values.classify(this.uniforms.unsupplied());
+		if (!gaps.engine().isEmpty()) {
+			Vulture.logger().warn("{} reads {} values written as zeroes: {}", this.path,
+					gaps.engine().size(), gaps.engine());
+		}
+
+		// Said apart from those, and at info: the pack reads these under Iris as well and gets the
+		// same nought there, so they are nobody's debt and a warning would read as one.
+		if (!gaps.nobody().isEmpty()) {
+			Vulture.logger().info("{} reads {} values no engine answers, Iris included, so they are "
+					+ "zeroes there too: {}", this.path, gaps.nobody().size(), gaps.nobody());
+		}
+
+		// Underneath that, and it is not the same list: these are members a source really answered,
+		// with something that is not the value. They count as supplied wherever a count is taken,
+		// which is the whole reason for naming them, and a full screen pass has named them since the
+		// block existed while a geometry pass named none.
+		//
+		// One list for every pass, and that is a change this lot earned: the names that were a
+		// placeholder on the entity mesh alone are made on the mesh now, each out of an element of
+		// its own, so no name is a stand-in in one pass and a value in another.
+		PackValues.standIns(this.loaded.program().uniforms().stream()
+						.map(TranslatedUnit.Uniform::name)
+						.toList())
+				.forEach((reason, names) -> Vulture.logger().warn("{} reads {} values answered with "
+						+ "a stand-in rather than with the value, {}, which count as supplied "
+						+ "everywhere else, because {}", this.path, names.size(), names, reason));
+	}
+}
